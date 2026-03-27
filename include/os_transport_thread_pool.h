@@ -62,8 +62,12 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
  * @param user_data 回调透传数据
  * @return 任务ID（0=失败）
  */
-uint64_t thread_pool_submit_task(ThreadPoolHandle handle, uint32_t request_id, int (*task_func)(void *arg),
-                                 void *task_arg, TaskCompleteCb complete_cb, void *user_data);
+uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
+                                 uint32_t request_id,
+                                 int (*task_func)(void *arg),
+                                 void *task_arg,
+                                 TaskCompleteCb complete_cb,
+                                 void *user_data);
 
 /**
  * @brief 批量提交任务（所有任务入同一个worker线程，保证执行顺序）
@@ -76,8 +80,12 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle, uint32_t request_id, i
  * @param batch_user_data 批量任务全部完成回调透传数据
  * @return 任务ID数组（长度=task_count，NULL=失败，用户需自行释放）
  */
-uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle, ThreadPoolTask *tasks, uint32_t task_count,
-                                         TaskCompleteCb complete_cb, void *user_data, TaskCompleteCb batch_complete_cb,
+uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
+                                         ThreadPoolTask *tasks,
+                                         uint32_t task_count,
+                                         TaskCompleteCb complete_cb,
+                                         void *user_data,
+                                         TaskCompleteCb batch_complete_cb,
                                          void *batch_user_data);
 
 /**

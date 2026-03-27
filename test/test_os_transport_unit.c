@@ -84,9 +84,12 @@ int thread_pool_start(ThreadPoolHandle handle)
     return 0;
 }
 
-uint64_t thread_pool_submit_task(ThreadPoolHandle handle, uint32_t request_id,
-                                 int (*task_func)(void *arg), void *task_arg,
-                                 TaskCompleteCb complete_cb, void *user_data)
+uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
+                                 uint32_t request_id,
+                                 int (*task_func)(void *arg),
+                                 void *task_arg,
+                                 TaskCompleteCb complete_cb,
+                                 void *user_data)
 {
     (void)handle;
     (void)request_id;
@@ -97,9 +100,12 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle, uint32_t request_id,
     return 1;
 }
 
-uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle, ThreadPoolTask *tasks,
-                                         uint32_t task_count, TaskCompleteCb complete_cb,
-                                         void *user_data, TaskCompleteCb batch_complete_cb,
+uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
+                                         ThreadPoolTask *tasks,
+                                         uint32_t task_count,
+                                         TaskCompleteCb complete_cb,
+                                         void *user_data,
+                                         TaskCompleteCb batch_complete_cb,
                                          void *batch_user_data)
 {
     (void)complete_cb;
@@ -159,8 +165,7 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_
     return g_mock_urma_write_status;
 }
 
-int cudaMemcpyAsync(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind,
-                    cudaStream_t stream)
+int cudaMemcpyAsync(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind, cudaStream_t stream)
 {
     g_mock_cuda_memcpy_calls++;
     g_mock_cuda_last_dst = dst;
@@ -193,8 +198,10 @@ static task_sync_t *create_sync_with_tasks(uint32_t task_num, int request_comple
 }
 
 /* Build valid arguments for send-path API tests. */
-static void build_valid_send_args(os_transport_handle_t *ost_handle, urma_jetty_info_t *jetty_info,
-                                  struct buffer_info *local_src, struct buffer_info *remote_dst)
+static void build_valid_send_args(os_transport_handle_t *ost_handle,
+                                  urma_jetty_info_t *jetty_info,
+                                  struct buffer_info *local_src,
+                                  struct buffer_info *remote_dst)
 {
     memset(ost_handle, 0, sizeof(*ost_handle));
     memset(jetty_info, 0, sizeof(*jetty_info));
@@ -327,18 +334,15 @@ static void test_update_and_validate_and_build(void)
     handle.thread_pool = &pool;
 
     g_inited = 0;
-    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) ==
-           -1);
+    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == -1);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle) == -1);
 
     g_inited = 1;
-    assert(validate_send_input(NULL, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) ==
-           -1);
+    assert(validate_send_input(NULL, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == -1);
     assert(validate_send_input(&handle, NULL, &local_src, &remote_dst, 1, &sync_handle) == -1);
     assert(validate_send_input(&handle, &jetty_info, NULL, &remote_dst, 1, &sync_handle) == -1);
     assert(validate_send_input(&handle, &jetty_info, &local_src, NULL, 1, &sync_handle) == -1);
-    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 0, &sync_handle) ==
-           -1);
+    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 0, &sync_handle) == -1);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, NULL) == -1);
 
     assert(validate_recv_input(NULL, &local_src, &device_dst, 1, &sync_handle) == -1);
@@ -362,8 +366,7 @@ static void test_update_and_validate_and_build(void)
     assert(write_info.flag.value == 0);
     assert(write_info.user_ctx_server == 123);
     assert(write_info.user_ctx_client == 456);
-    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) ==
-           0);
+    assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == 0);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle) == 0);
 
     g_inited = 0;
@@ -617,32 +620,32 @@ static void test_construct_and_bind_functions(void)
     urma_info.write_info.user_ctx_server = 88;
     urma_info.recv_info.request_id = 99;
 
-    assert(construct_and_register_worker_task(NULL, chunks_send, 2, SEND_TASK,
-                                              dummy_task_func, urma_info, &sync) == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, NULL, 2, SEND_TASK,
-                                              dummy_task_func, urma_info, &sync) == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK,
-                                              dummy_task_func, urma_info, NULL) == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 0, SEND_TASK,
-                                              dummy_task_func, urma_info, &sync) == (uint32_t)-1);
+    assert(construct_and_register_worker_task(NULL, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+           == (uint32_t)-1);
+    assert(construct_and_register_worker_task(&ost_handle, NULL, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+           == (uint32_t)-1);
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, NULL)
+           == (uint32_t)-1);
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 0, SEND_TASK, dummy_task_func, urma_info, &sync)
+           == (uint32_t)-1);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, NULL_TASK,
-                                              dummy_task_func, urma_info, &sync) == (uint32_t)-1);
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, NULL_TASK, dummy_task_func, urma_info, &sync)
+           == (uint32_t)-1);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK,
-                                              dummy_task_func, urma_info, &sync) == 0);
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+           == 0);
     assert(sync != NULL);
     free_sync_owned_resources(sync);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_recv, 1, RECV_TASK,
-                                              dummy_task_func, urma_info, &sync) == 0);
+    assert(construct_and_register_worker_task(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync)
+           == 0);
     assert(sync != NULL);
     free_sync_owned_resources(sync);
 
-    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK,
-                                          dummy_task_func, urma_info, NULL) == -1);
-    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK,
-                                          dummy_task_func, urma_info, &sync) == 0);
+    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, NULL)
+           == -1);
+    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync)
+           == 0);
     assert(sync->chunks == chunks_recv);
     sync->chunks = NULL;
     free_sync_owned_resources(sync);
@@ -754,32 +757,33 @@ static void test_init_destroy_and_send_recv_api(void)
     build_valid_send_args(&send_handle, &jetty_info, &local_src, &remote_dst);
     g_inited = 0;
     sync = (task_sync_t *)0xBAD;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync) == (uint32_t)-1);
+    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync)
+           == (uint32_t)-1);
 
     g_inited = 1;
     g_mock_urma_write_status = URMA_SUCCESS;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE, 1, 2, &sync) == 0);
+    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync) == 0);
 
     g_mock_urma_write_status = -1;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE, 1, 2, &sync) == (uint32_t)-1);
+    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync)
+           == (uint32_t)-1);
 
     reset_mocks();
     g_inited = 1;
     g_mock_submit_fail = 1;
     sync = NULL;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync) == (uint32_t)-1);
+    assert(
+        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync)
+        == (uint32_t)-1);
     assert(sync == NULL);
 
     reset_mocks();
     g_inited = 1;
     g_mock_urma_write_status = -1;
     sync = (task_sync_t *)0xAAAA;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync) == (uint32_t)-1);
+    assert(
+        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync)
+        == (uint32_t)-1);
     assert(sync != NULL);
     assert(wait_and_free_sync(&send_handle, sync) == (uint32_t)-1);
     sync = NULL;
@@ -787,8 +791,9 @@ static void test_init_destroy_and_send_recv_api(void)
     reset_mocks();
     g_inited = 1;
     sync = NULL;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst,
-                             DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync) == 0);
+    assert(
+        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync)
+        == 0);
     assert(sync != NULL);
     /* API behavior test only: avoid asserting chunk ownership contract here. */
     sync->chunks = NULL;
@@ -846,9 +851,9 @@ static void test_wait_and_free_sync(void)
     assert(g_mock_cancel_last_request_id == 202);
 }
 
-#define RUN_TEST(fn) \
-    do {             \
-        fn();        \
+#define RUN_TEST(fn)                                                                                                   \
+    do {                                                                                                               \
+        fn();                                                                                                          \
     } while (0)
 
 int main(void)

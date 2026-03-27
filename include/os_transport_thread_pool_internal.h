@@ -81,9 +81,9 @@ typedef struct {
 } ThreadPoolUrmaInfo;
 
 #define REQ_HASH_SIZE 1024
-#define EPOLL_TIME 100
-#define POLL_SIZE 10
-#define POLL_TRY_CNT 10
+#define EPOLL_TIME    100
+#define POLL_SIZE     10
+#define POLL_TRY_CNT  10
 
 /**
  * @brief 线程池内部结构
@@ -121,7 +121,8 @@ typedef enum { LOG_LEVEL_DEBUG = 0, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LOG_LEVEL_ER
 #define GLOBAL_LOG_LEVEL LOG_LEVEL_DEBUG
 #endif
 
-static inline int log_level_to_syslog_priority(LogLevel level) {
+static inline int log_level_to_syslog_priority(LogLevel level)
+{
     switch (level) {
     case LOG_LEVEL_DEBUG:
         return OST_SYSLOG_PRIO_DEBUG;
@@ -136,9 +137,13 @@ static inline int log_level_to_syslog_priority(LogLevel level) {
     }
 }
 
-static inline void init_syslog_logger_once(void) { openlog("os_transport", LOG_PID | LOG_NDELAY, LOG_USER); }
+static inline void init_syslog_logger_once(void)
+{
+    openlog("os_transport", LOG_PID | LOG_NDELAY, LOG_USER);
+}
 
-static inline void log_to_syslog(LogLevel level, const char *file, int line, const char *fmt, ...) {
+static inline void log_to_syslog(LogLevel level, const char *file, int line, const char *fmt, ...)
+{
     static pthread_once_t log_init_once = PTHREAD_ONCE_INIT;
     pthread_once(&log_init_once, init_syslog_logger_once);
 
@@ -161,8 +166,8 @@ static inline void log_to_syslog(LogLevel level, const char *file, int line, con
 
 // 快捷日志宏
 #define OST_LOG_DEBUG(fmt, ...) OST_LOG(LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
-#define OST_LOG_INFO(fmt, ...) OST_LOG(LOG_LEVEL_INFO, fmt, ##__VA_ARGS__)
-#define OST_LOG_WARN(fmt, ...) OST_LOG(LOG_LEVEL_WARN, fmt, ##__VA_ARGS__)
+#define OST_LOG_INFO(fmt, ...)  OST_LOG(LOG_LEVEL_INFO, fmt, ##__VA_ARGS__)
+#define OST_LOG_WARN(fmt, ...)  OST_LOG(LOG_LEVEL_WARN, fmt, ##__VA_ARGS__)
 #define OST_LOG_ERROR(fmt, ...) OST_LOG(LOG_LEVEL_ERROR, fmt, ##__VA_ARGS__)
 
 #endif // OS_TRANSPORT_THREAD_POOL_INTERNAL_H

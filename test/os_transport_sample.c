@@ -49,25 +49,25 @@
  *    - server_sock_thread_main: 接收连接、处理 TCP 控制请求并执行 os_transport_send。
  */
 
-#define PAGE_SHIFT 12
-#define PAGE_SIZE (0x1 << PAGE_SHIFT) // 4KB
-#define MEM_SIZE 0x40000000           // 1GB
-#define MAX_CLIENT_CNT 10
+#define PAGE_SHIFT       12
+#define PAGE_SIZE        (0x1 << PAGE_SHIFT) // 4KB
+#define MEM_SIZE         0x40000000          // 1GB
+#define MAX_CLIENT_CNT   10
 #define MAX_POLL_JFC_CNT 10
-#define SLEEP_TIME (100 * 1000) /* Sleep for 100 ms */
-#define TIMEOUT (-1) /* infinity */
-#define MSG_SIZE 160
-#define DEFAULT_PORT 13857
-#define PROC_FILE_NAME 32
+#define SLEEP_TIME       (100 * 1000) /* Sleep for 100 ms */
+#define TIMEOUT          (-1)         /* infinity */
+#define MSG_SIZE         160
+#define DEFAULT_PORT     13857
+#define PROC_FILE_NAME   32
 /* At most 8 outstanding WQEs can be posted in JFR with size of 256 */
-#define RECV_BATCH_CNT 8
-#define JETTY_SIZE 256
-#define CR_NUM_A_ROUND 2 /* include a send and a recv */
+#define RECV_BATCH_CNT     8
+#define JETTY_SIZE         256
+#define CR_NUM_A_ROUND     2 /* include a send and a recv */
 #define SERVER_SEND_OFFSET 0
 #define CLIENT_DATA_OFFSET (2 * MSG_SIZE)
-#define TEST_CLIENT_KEY 0x13572468U
-#define TEST_SERVER_KEY 0x24681357U
-#define TEST_PAYLOAD "os_transport_data_from_server"
+#define TEST_CLIENT_KEY    0x13572468U
+#define TEST_SERVER_KEY    0x24681357U
+#define TEST_PAYLOAD       "os_transport_data_from_server"
 /* #define SIMU 1 */
 
 sem_t semaphore;
@@ -81,7 +81,7 @@ typedef struct argument {
     unsigned int trans_mode;
     bool multi_path;
     unsigned int tp_type;
-    bool cs_coexist;      /* Client and server share the same process */
+    bool cs_coexist; /* Client and server share the same process */
 } argument_t;
 
 typedef struct seg_jetty_info {
@@ -182,7 +182,7 @@ static int get_eid_index(urma_device_t *dev)
         return -1;
     }
     for (int i = 0; eid_list != NULL && i < eid_cnt; i++) {
-        printf("device_name :%s (eid%d: "EID_FMT").\n", dev->name, eid_list[i].eid_index, EID_ARGS(eid_list[i].eid));
+        printf("device_name :%s (eid%d: " EID_FMT ").\n", dev->name, eid_list[i].eid_index, EID_ARGS(eid_list[i].eid));
     }
     if (eid_cnt > 0) {
         eid_index = eid_list[0].eid_index;
@@ -194,30 +194,30 @@ static int get_eid_index(urma_device_t *dev)
 static urma_transport_mode_t args_to_trans_mode(const argument_t *args)
 {
     switch (args->trans_mode) {
-        case 0:
-            return URMA_TM_RM;
-        case 1:
-            return URMA_TM_RC;
-        case 2:
-            return URMA_TM_UM;
-        case 3:
-            return URMA_TM_RC;
-        default:
-            return URMA_TM_RM;
+    case 0:
+        return URMA_TM_RM;
+    case 1:
+        return URMA_TM_RC;
+    case 2:
+        return URMA_TM_UM;
+    case 3:
+        return URMA_TM_RC;
+    default:
+        return URMA_TM_RM;
     };
 }
 
 static urma_transport_mode_t args_to_tp_type(const argument_t *args)
 {
     switch (args->tp_type) {
-        case 0:
-            return URMA_RTP;
-        case 1:
-            return URMA_CTP;
-        case 2:
-            return URMA_UTP;
-        default:
-            return URMA_RTP;
+    case 0:
+        return URMA_RTP;
+    case 1:
+        return URMA_CTP;
+    case 2:
+        return URMA_UTP;
+    default:
+        return URMA_RTP;
     };
 }
 
@@ -281,42 +281,36 @@ static context_t *init_context(const argument_t *args)
         goto DEL_JFC;
     }
 
-    urma_jfr_cfg_t jfr_cfg = {
-        .depth = JETTY_SIZE,
-        .flag.bs.tag_matching = URMA_NO_TAG_MATCHING,
-        .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
-        .trans_mode = args_to_trans_mode(args),
-        .min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER,
-        .jfc = ctx->jfc,
-        .token_value = ctx->token,
-        .id = 0,
-        .max_sge = 1
-    };
+    urma_jfr_cfg_t jfr_cfg = {.depth = JETTY_SIZE,
+                              .flag.bs.tag_matching = URMA_NO_TAG_MATCHING,
+                              .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
+                              .trans_mode = args_to_trans_mode(args),
+                              .min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER,
+                              .jfc = ctx->jfc,
+                              .token_value = ctx->token,
+                              .id = 0,
+                              .max_sge = 1};
     ctx->jfr = urma_create_jfr(ctx->urma_ctx, &jfr_cfg);
     if (ctx->jfr == NULL) {
         fprintf(stderr, "Failed to create jfr\n");
         goto DEL_JFC;
     }
 
-    urma_jfs_cfg_t jfs_cfg = {
-        .depth = JETTY_SIZE,
-        .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
-        .flag.bs.multi_path = args->multi_path ? 1 : 0,
-        .trans_mode = args_to_trans_mode(args),
-        .priority = URMA_MAX_PRIORITY, /* Highest priority */
-        .max_sge = 1,
-        .max_inline_data = 0,
-        .rnr_retry = URMA_TYPICAL_RNR_RETRY,
-        .err_timeout = URMA_TYPICAL_ERR_TIMEOUT,
-        .jfc = ctx->jfc,
-        .user_ctx = (uint64_t)NULL
-    };
-    urma_jetty_cfg_t jetty_cfg = {
-        .flag.bs.share_jfr = 1,
-        .jfs_cfg = jfs_cfg,
-        //.shared.jfc = ctx->jfc,
-        .shared.jfr = ctx->jfr
-    };
+    urma_jfs_cfg_t jfs_cfg = {.depth = JETTY_SIZE,
+                              .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
+                              .flag.bs.multi_path = args->multi_path ? 1 : 0,
+                              .trans_mode = args_to_trans_mode(args),
+                              .priority = URMA_MAX_PRIORITY, /* Highest priority */
+                              .max_sge = 1,
+                              .max_inline_data = 0,
+                              .rnr_retry = URMA_TYPICAL_RNR_RETRY,
+                              .err_timeout = URMA_TYPICAL_ERR_TIMEOUT,
+                              .jfc = ctx->jfc,
+                              .user_ctx = (uint64_t)NULL};
+    urma_jetty_cfg_t jetty_cfg = {.flag.bs.share_jfr = 1,
+                                  .jfs_cfg = jfs_cfg,
+                                  //.shared.jfc = ctx->jfc,
+                                  .shared.jfr = ctx->jfr};
     ctx->jetty = urma_create_jetty(ctx->urma_ctx, &jetty_cfg);
     if (ctx->jetty == NULL) {
         fprintf(stderr, "Failed to create jetty\n");
@@ -330,23 +324,19 @@ static context_t *init_context(const argument_t *args)
     }
     (void)memset(ctx->va, 0, MEM_SIZE);
 
-    urma_reg_seg_flag_t flag = {
-        .bs.token_policy = URMA_TOKEN_NONE,
-        .bs.cacheable = URMA_NON_CACHEABLE,
-        .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
-        .bs.token_id_valid = 0,
-        .bs.reserved = 0
-    };
+    urma_reg_seg_flag_t flag = {.bs.token_policy = URMA_TOKEN_NONE,
+                                .bs.cacheable = URMA_NON_CACHEABLE,
+                                .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
+                                .bs.token_id_valid = 0,
+                                .bs.reserved = 0};
 
-    urma_seg_cfg_t seg_cfg = {
-        .va = (uint64_t)ctx->va,
-        .len = MEM_SIZE,
-        .token_id = NULL,
-        .token_value = ctx->token,
-        .flag = flag,
-        .user_ctx = (uintptr_t)NULL,
-        .iova = 0
-    };
+    urma_seg_cfg_t seg_cfg = {.va = (uint64_t)ctx->va,
+                              .len = MEM_SIZE,
+                              .token_id = NULL,
+                              .token_value = ctx->token,
+                              .flag = flag,
+                              .user_ctx = (uintptr_t)NULL,
+                              .iova = 0};
 
     ctx->local_tseg = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (ctx->local_tseg == NULL) {
@@ -407,8 +397,8 @@ static void pack_seg_jetty_info(seg_jetty_info_t *info, context_t *ctx)
     info->seg_flag = ctx->local_tseg->seg.attr.value;
     info->seg_token_id = ctx->local_tseg->seg.token_id;
     info->jetty_id = ctx->jetty->jetty_id;
-    printf("seg: eid = "EID_FMT", uasid = 0x%x, va = 0x%lx\n", EID_ARGS(info->eid), info->uasid, info->seg_va);
-    printf("jetty: eid = "EID_FMT", uasid = 0x%x, id = %d\n", EID_ARGS(info->eid), info->uasid, info->jetty_id.id);
+    printf("seg: eid = " EID_FMT ", uasid = 0x%x, va = 0x%lx\n", EID_ARGS(info->eid), info->uasid, info->seg_va);
+    printf("jetty: eid = " EID_FMT ", uasid = 0x%x, id = %d\n", EID_ARGS(info->eid), info->uasid, info->jetty_id.id);
 }
 
 static void unpack_seg_jetty_info(seg_jetty_info_t *info, context_t *ctx)
@@ -549,8 +539,8 @@ static int init_os_transport(context_t *ctx, void **ost_handle)
     return 0;
 }
 
-static int send_tcp_ctrl_request(context_t *ctx, uint64_t client_dst_addr, uint32_t len,
-                                 uint32_t client_key, uint32_t server_key)
+static int
+send_tcp_ctrl_request(context_t *ctx, uint64_t client_dst_addr, uint32_t len, uint32_t client_key, uint32_t server_key)
 {
     ctrl_request_t req = {0};
     if (ctx == NULL || ctx->c.ctrl_fd < 0) {
@@ -591,15 +581,17 @@ static int client_connect(context_t *ctx, const argument_t *args)
 
     seg_jetty_info_t local = {0}, remote = {0};
     pack_seg_jetty_info(&local, ctx);
-    if (sock_sync_data(sockfd, sizeof(seg_jetty_info_t), (char*)&local, (char*)&remote)) {
+    if (sock_sync_data(sockfd, sizeof(seg_jetty_info_t), (char *)&local, (char *)&remote)) {
         fprintf(stderr, "Failed to exchange segment and jfr info\n");
     }
     unpack_seg_jetty_info(&remote, ctx);
 
-    printf("remote seg: eid = "EID_FMT", uasid = 0x%x, va = 0x%lx\n",
-        EID_ARGS(remote.eid), remote.uasid, remote.seg_va);
-    printf("remote jetty: eid = "EID_FMT", uasid = 0x%x id = %d\n",
-        EID_ARGS(remote.eid), remote.uasid, remote.jetty_id.id);
+    printf(
+        "remote seg: eid = " EID_FMT ", uasid = 0x%x, va = 0x%lx\n", EID_ARGS(remote.eid), remote.uasid, remote.seg_va);
+    printf("remote jetty: eid = " EID_FMT ", uasid = 0x%x id = %d\n",
+           EID_ARGS(remote.eid),
+           remote.uasid,
+           remote.jetty_id.id);
 
     char sync_msg;
     if (sock_sync_data(sockfd, 1, "S", &sync_msg)) {
@@ -616,16 +608,15 @@ static urma_target_jetty_t *sample_import_jetty(context_t *ctx, const struct arg
      * 导入对端 jetty：
      * - RC/RS 模式下需要 bind jetty，确保发送路径可用。
      */
-    urma_rjetty_t remote_jetty = {
-        .jetty_id = ctx->remote_jetty_id,
-        .trans_mode = args_to_trans_mode(args),
-        .type = URMA_JETTY,
-        .tp_type = args_to_tp_type(args),
-        .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
-        .flag.bs.share_tp = args->trans_mode == 3 ? 1 : 0
-    };
-    printf("import remote jetty: eid = "EID_FMT", id = %d\n",
-        EID_ARGS(remote_jetty.jetty_id.eid), remote_jetty.jetty_id.id);
+    urma_rjetty_t remote_jetty = {.jetty_id = ctx->remote_jetty_id,
+                                  .trans_mode = args_to_trans_mode(args),
+                                  .type = URMA_JETTY,
+                                  .tp_type = args_to_tp_type(args),
+                                  .flag.bs.order_type = args->trans_mode == 3 ? 1 : 0,
+                                  .flag.bs.share_tp = args->trans_mode == 3 ? 1 : 0};
+    printf("import remote jetty: eid = " EID_FMT ", id = %d\n",
+           EID_ARGS(remote_jetty.jetty_id.eid),
+           remote_jetty.jetty_id.id);
     urma_target_jetty_t *t_jetty = urma_import_jetty(ctx->urma_ctx, &remote_jetty, &ctx->token);
     if (t_jetty == NULL) {
         fprintf(stderr, "Failed to import jfr\n");
@@ -649,12 +640,10 @@ static void *server_sock_thread_main(void *arg)
     seg_jetty_info_t local = {0};
     ctrl_request_t req = {0};
     char sync_msg;
-    urma_import_seg_flag_t flag = {
-        .bs.cacheable = URMA_NON_CACHEABLE,
-        .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
-        .bs.mapping = URMA_SEG_NOMAP,
-        .bs.reserved = 0
-    };
+    urma_import_seg_flag_t flag = {.bs.cacheable = URMA_NON_CACHEABLE,
+                                   .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
+                                   .bs.mapping = URMA_SEG_NOMAP,
+                                   .bs.reserved = 0};
 
     pack_seg_jetty_info(&local, ctx);
     while (!ctx->s.server_stop && ctx->s.num_clients == 0) {
@@ -676,10 +665,14 @@ static void *server_sock_thread_main(void *arg)
         }
         unpack_seg_jetty_info(&remote, ctx);
 
-        printf("remote seg: eid = "EID_FMT", uasid = 0x%x, va = 0x%lx\n",
-               EID_ARGS(remote.eid), remote.uasid, remote.seg_va);
-        printf("remote jetty: eid = "EID_FMT", uasid = 0x%x id = %d\n",
-               EID_ARGS(remote.eid), remote.uasid, remote.jetty_id.id);
+        printf("remote seg: eid = " EID_FMT ", uasid = 0x%x, va = 0x%lx\n",
+               EID_ARGS(remote.eid),
+               remote.uasid,
+               remote.seg_va);
+        printf("remote jetty: eid = " EID_FMT ", uasid = 0x%x id = %d\n",
+               EID_ARGS(remote.eid),
+               remote.uasid,
+               remote.jetty_id.id);
 
         ctx->s.t_jetty[0] = sample_import_jetty(ctx, &ctx->args);
         if (ctx->s.t_jetty[0] == NULL) {
@@ -731,13 +724,13 @@ static void *server_sock_thread_main(void *arg)
         remote_dst.addr = req.client_dst_addr;
         remote_dst.tseg = ctx->s.import_tseg;
 
-        if (os_transport_send(ctx->s.ost_handle, &jetty_info, &local_src, &remote_dst, req.len,
-                              req.server_key, req.client_key, &sync) != 0) {
+        if (os_transport_send(
+                ctx->s.ost_handle, &jetty_info, &local_src, &remote_dst, req.len, req.server_key, req.client_key, &sync)
+            != 0) {
             fprintf(stderr, "Failed to call os_transport_send\n");
             break;
         }
-        if (sync != NULL &&
-            wait_and_free_sync(ctx->s.ost_handle, sync) != 0) {
+        if (sync != NULL && wait_and_free_sync(ctx->s.ost_handle, sync) != 0) {
             fprintf(stderr, "wait_and_free_sync failed on server\n");
             break;
         }
@@ -754,8 +747,8 @@ static int server_reply_to_client(context_t *ctx, urma_cr_t *cr)
 
     for (uint8_t i = 0; i < ctx->s.num_clients; i++) {
         t_jetty = ctx->s.t_jetty[i];
-        if (memcmp(&t_jetty->id.eid, &src_jetty_id.eid, sizeof(urma_eid_t)) == 0 &&
-            t_jetty->id.uasid == src_jetty_id.uasid) {
+        if (memcmp(&t_jetty->id.eid, &src_jetty_id.eid, sizeof(urma_eid_t)) == 0
+            && t_jetty->id.uasid == src_jetty_id.uasid) {
             break;
         }
     }
@@ -765,27 +758,16 @@ static int server_reply_to_client(context_t *ctx, urma_cr_t *cr)
     }
 
     uint64_t offset = cr->user_ctx;
-    urma_sge_t src_sge = {
-        .addr = (uint64_t)ctx->va + offset,
-        .len = MSG_SIZE,
-        .tseg = ctx->local_tseg
-    };
-    urma_sg_t sg = {
-        .sge = &src_sge,
-        .num_sge = 1
-    };
-    urma_send_wr_t send_wr = {
-        .src = sg
-    };
+    urma_sge_t src_sge = {.addr = (uint64_t)ctx->va + offset, .len = MSG_SIZE, .tseg = ctx->local_tseg};
+    urma_sg_t sg = {.sge = &src_sge, .num_sge = 1};
+    urma_send_wr_t send_wr = {.src = sg};
 
-    urma_jfs_wr_t jfs_wr = {
-        .opcode = URMA_OPC_SEND,
-        .flag.bs.complete_enable = 1,
-        .tjetty = t_jetty,
-        .user_ctx = offset,
-        .send = send_wr,
-        .next = NULL
-    };
+    urma_jfs_wr_t jfs_wr = {.opcode = URMA_OPC_SEND,
+                            .flag.bs.complete_enable = 1,
+                            .tjetty = t_jetty,
+                            .user_ctx = offset,
+                            .send = send_wr,
+                            .next = NULL};
     urma_jfs_wr_t *bad_jfs_wr = NULL;
 
     if (snprintf(ctx->va + offset, MSG_SIZE, "Send response from server %d", getpid()) == -1) {
@@ -875,7 +857,7 @@ static void *server_watch_thread_main(void *arg)
 
     while (ctx->s.server_stop == false) {
         sleep(1);
-        printf("segment msg: %s\n", (char*)ctx->va);
+        printf("segment msg: %s\n", (char *)ctx->va);
     }
     return NULL;
 }
@@ -970,12 +952,10 @@ int prepare_client(const struct argument *args, context_t *ctx)
         goto DEL_CTX;
     }
 
-    urma_import_seg_flag_t flag = {
-        .bs.cacheable = URMA_NON_CACHEABLE,
-        .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
-        .bs.mapping = URMA_SEG_NOMAP,
-        .bs.reserved = 0
-    };
+    urma_import_seg_flag_t flag = {.bs.cacheable = URMA_NON_CACHEABLE,
+                                   .bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC,
+                                   .bs.mapping = URMA_SEG_NOMAP,
+                                   .bs.reserved = 0};
 
     ctx->c.import_tseg = urma_import_seg(ctx->urma_ctx, &ctx->remote_seg, &ctx->token, 0, flag);
     if (ctx->c.import_tseg == NULL) {
@@ -1069,37 +1049,18 @@ static int client_write_read(context_t *ctx)
         return -1;
     }
 
-    urma_sge_t src_sge = {
-        .addr = (uint64_t)ctx->va,
-        .len = MSG_SIZE,
-        .tseg = ctx->local_tseg
-    };
-    urma_sge_t dst_sge = {
-        .addr = ctx->remote_seg.ubva.va,
-        .len = MSG_SIZE,
-        .tseg = ctx->c.import_tseg
-    };
-    urma_sg_t src_sg = {
-        .sge = &src_sge,
-        .num_sge = 1
-    };
-    urma_sg_t dst_sg = {
-        .sge = &dst_sge,
-        .num_sge = 1
-    };
-    urma_rw_wr_t rw = {
-        .src = src_sg,
-        .dst = dst_sg
-    };
-    urma_jfs_wr_t wr = {
-        .opcode = URMA_OPC_WRITE,
-        .flag.bs.complete_enable = 1,
-        .flag.bs.inline_flag = 0,
-        .tjetty = ctx->c.t_jetty,
-        .user_ctx = ctx->rid,
-        .rw = rw,
-        .next = NULL
-    };
+    urma_sge_t src_sge = {.addr = (uint64_t)ctx->va, .len = MSG_SIZE, .tseg = ctx->local_tseg};
+    urma_sge_t dst_sge = {.addr = ctx->remote_seg.ubva.va, .len = MSG_SIZE, .tseg = ctx->c.import_tseg};
+    urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
+    urma_sg_t dst_sg = {.sge = &dst_sge, .num_sge = 1};
+    urma_rw_wr_t rw = {.src = src_sg, .dst = dst_sg};
+    urma_jfs_wr_t wr = {.opcode = URMA_OPC_WRITE,
+                        .flag.bs.complete_enable = 1,
+                        .flag.bs.inline_flag = 0,
+                        .tjetty = ctx->c.t_jetty,
+                        .user_ctx = ctx->rid,
+                        .rw = rw,
+                        .next = NULL};
     urma_jfs_wr_t *bad_wr = NULL;
     if (urma_post_jetty_send_wr(ctx->jetty, &wr, &bad_wr) != URMA_SUCCESS) {
         fprintf(stderr, "Failed to post write\n");
@@ -1108,8 +1069,11 @@ static int client_write_read(context_t *ctx)
 
     urma_cr_t cr = {0};
     if (poll_jfc_wait(ctx, &cr) != 0 || cr.user_ctx != ctx->rid) {
-        fprintf(stderr, "Failed to poll jfc for write, cr_status:%d, ctx:%lu, rid:%lu,\n",
-            cr.status, cr.user_ctx, ctx->rid);
+        fprintf(stderr,
+                "Failed to poll jfc for write, cr_status:%d, ctx:%lu, rid:%lu,\n",
+                cr.status,
+                cr.user_ctx,
+                ctx->rid);
         return -1;
     }
 
@@ -1149,20 +1113,9 @@ static int client_send(context_t *ctx)
      */
     /* Post buffer to recv reponse from server */
     uint64_t offset = MSG_SIZE;
-    urma_sge_t src_sge = {
-        .addr = (uint64_t)ctx->va + offset,
-        .len = MSG_SIZE,
-        .tseg = ctx->local_tseg
-    };
-    urma_sg_t src_sg = {
-        .sge = &src_sge,
-        .num_sge = 1
-    };
-    urma_jfr_wr_t wr = {
-        .src = src_sg,
-        .user_ctx = offset,
-        .next = NULL
-    };
+    urma_sge_t src_sge = {.addr = (uint64_t)ctx->va + offset, .len = MSG_SIZE, .tseg = ctx->local_tseg};
+    urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
+    urma_jfr_wr_t wr = {.src = src_sg, .user_ctx = offset, .next = NULL};
     urma_jfr_wr_t *bad_wr = NULL;
     if (urma_post_jetty_recv_wr(ctx->jetty, &wr, &bad_wr) != URMA_SUCCESS) {
         fprintf(stderr, "Failed to post buffer to recv response");
@@ -1174,26 +1127,20 @@ static int client_send(context_t *ctx)
         return -1;
     }
     src_sge.addr = (uint64_t)ctx->va;
-    urma_send_wr_t send_wr = {
-        .src = src_sg,
-        .tseg = ctx->local_tseg
-    };
+    urma_send_wr_t send_wr = {.src = src_sg, .tseg = ctx->local_tseg};
 
-
-    urma_jfs_wr_t jfs_wr = {
-        .opcode = URMA_OPC_SEND,
-        .flag.bs.complete_enable = 1,
-        .tjetty = ctx->c.t_jetty,
-        .user_ctx = ctx->rid,
-        .send = send_wr,
-        .next = NULL
-    };
+    urma_jfs_wr_t jfs_wr = {.opcode = URMA_OPC_SEND,
+                            .flag.bs.complete_enable = 1,
+                            .tjetty = ctx->c.t_jetty,
+                            .user_ctx = ctx->rid,
+                            .send = send_wr,
+                            .next = NULL};
     urma_jfs_wr_t *bad_jfs_wr = NULL;
     if (urma_post_jetty_send_wr(ctx->jetty, &jfs_wr, &bad_jfs_wr) != URMA_SUCCESS) {
         fprintf(stderr, "Failed to send message\n");
         return -1;
     }
-    
+
     urma_cr_t cr;
     for (int i = 0; i < CR_NUM_A_ROUND; i++) {
         int cr_ret = poll_jfc_wait(ctx, &cr);
@@ -1312,17 +1259,15 @@ static int run_server(const struct argument *args)
     return 0;
 }
 
-static struct option g_long_options[] = {
-    {"trans-mode", required_argument, NULL, 'm'},
-    {"dev-name", required_argument, NULL, 'd'},
-    {"server-ip", required_argument, NULL, 'i'},
-    {"server-port", required_argument, NULL, 'p'},
-    {"tp-type", required_argument, NULL, 't'},
-    {"multi-path", required_argument, NULL, 'u'},
-    {"event-mode", no_argument, NULL, 'e'},
-    {"cs-coexist", no_argument, NULL, 'c'},
-    {NULL, 0, NULL, 0}
-};
+static struct option g_long_options[] = {{"trans-mode", required_argument, NULL, 'm'},
+                                         {"dev-name", required_argument, NULL, 'd'},
+                                         {"server-ip", required_argument, NULL, 'i'},
+                                         {"server-port", required_argument, NULL, 'p'},
+                                         {"tp-type", required_argument, NULL, 't'},
+                                         {"multi-path", required_argument, NULL, 'u'},
+                                         {"event-mode", no_argument, NULL, 'e'},
+                                         {"cs-coexist", no_argument, NULL, 'c'},
+                                         {NULL, 0, NULL, 0}};
 
 static void usage()
 {
@@ -1359,9 +1304,9 @@ static int validate_input_params(struct argument *args, bool tp_type_input_flag,
             fprintf(stderr, "Error: This combination of trans-mode and multi-path is invalid on bonding devices.\n");
             return -1;
         }
-        char* loopback = "127.0.0.1";
-        if (args->event_mode && args->server_ip != NULL &&
-        strncmp(args->server_ip, loopback, strlen(loopback)) == 0 && args->multi_path) {
+        char *loopback = "127.0.0.1";
+        if (args->event_mode && args->server_ip != NULL && strncmp(args->server_ip, loopback, strlen(loopback)) == 0
+            && args->multi_path) {
             fprintf(stderr, "Error: If using the -c option, bonding only supports RC + single_path in loopback.\n");
             return -1;
         }
@@ -1405,41 +1350,41 @@ int parse_arguments(int argc, char *argv[], struct argument *args)
         }
 
         switch (c) {
-            case 'm':
-                args->trans_mode = strtoul(optarg, NULL, 0);
-                break;
-            case 'd':
-                args->dev_name = strdup(optarg);
-                if (args->dev_name == NULL) {
-                    fprintf(stderr, "failed to allocate memory.\n");
-                }
-                break;
-            case 'i':
-                args->server_ip = strdup(optarg);
-                if (args->server_ip == NULL) {
-                    fprintf(stderr, "failed to allocate memory.\n");
-                }
-                break;
-            case 'p':
-                args->server_port = strtoul(optarg, NULL, 0);
-                break;
-            case 't':
-                args->tp_type = strtoul(optarg, NULL, 0);
-                tp_type_input_flag = true;
-                break;
-            case 'u':
-                args->multi_path = true;
-                multi_path_input_flag = true;
-                break;
-            case 'e':
-                args->event_mode = true;
-                break;
-            case 'c':
-                fprintf(stderr, "Error: -c/--cs-coexist is not supported in os_transport sample.\n");
-                return -1;
-            default:
-                usage();
-                return -1;
+        case 'm':
+            args->trans_mode = strtoul(optarg, NULL, 0);
+            break;
+        case 'd':
+            args->dev_name = strdup(optarg);
+            if (args->dev_name == NULL) {
+                fprintf(stderr, "failed to allocate memory.\n");
+            }
+            break;
+        case 'i':
+            args->server_ip = strdup(optarg);
+            if (args->server_ip == NULL) {
+                fprintf(stderr, "failed to allocate memory.\n");
+            }
+            break;
+        case 'p':
+            args->server_port = strtoul(optarg, NULL, 0);
+            break;
+        case 't':
+            args->tp_type = strtoul(optarg, NULL, 0);
+            tp_type_input_flag = true;
+            break;
+        case 'u':
+            args->multi_path = true;
+            multi_path_input_flag = true;
+            break;
+        case 'e':
+            args->event_mode = true;
+            break;
+        case 'c':
+            fprintf(stderr, "Error: -c/--cs-coexist is not supported in os_transport sample.\n");
+            return -1;
+        default:
+            usage();
+            return -1;
         }
     }
 
