@@ -22,19 +22,19 @@ typedef struct {
 } task_group_t;
 
 typedef struct chunk_info {
-    uint64_t src;   // 源缓冲区地址
-    uint64_t dst;   // 目标缓冲区地址
-    uint32_t len;   // 数据长度
+    uint64_t src; // 源缓冲区地址
+    uint64_t dst; // 目标缓冲区地址
+    uint32_t len; // 数据长度
 } chunk_info_t;
 
 struct task_sync {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    int request_completed;       // 该请求的所有task是否都已完成
-    uint64_t total_tasks;        // 任务组总任务数
-    uint64_t completed_tasks;    // 任务组已完成任务数
-    task_group_t *task_group;    // 任务组，由主线程统一释放
-    chunk_info_t *chunks;   // 本次请求关联的chunk数组，由主线程统一释放
+    int request_completed;    // 该请求的所有task是否都已完成
+    uint64_t total_tasks;     // 任务组总任务数
+    uint64_t completed_tasks; // 任务组已完成任务数
+    task_group_t *task_group; // 任务组，由主线程统一释放
+    chunk_info_t *chunks;     // 本次请求关联的chunk数组，由主线程统一释放
 };
 
 typedef struct os_transport_handle {
