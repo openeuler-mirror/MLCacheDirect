@@ -1,19 +1,19 @@
 #ifndef OS_TRANSPORT_THREAD_POOL_H
 #define OS_TRANSPORT_THREAD_POOL_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @brief 任务结构体
  */
 typedef struct {
-    uint64_t task_id;                 // 唯一任务ID
-    uint32_t request_id;              // 请求ID（相同批次任务此值相同）
-    int (*task_func)(void* arg);      // 任务执行函数
-    void* task_arg;                   // 任务参数（用户自行管理内存）
-    bool is_completed;                // 任务完成标记
-    bool free_task_self;              // 任务结构体是否由线程池释放
+    uint64_t task_id;            // 唯一任务ID
+    uint32_t request_id;         // 请求ID（相同批次任务此值相同）
+    int (*task_func)(void *arg); // 任务执行函数
+    void *task_arg;              // 任务参数（用户自行管理内存）
+    bool is_completed;           // 任务完成标记
+    bool free_task_self;         // 任务结构体是否由线程池释放
 } ThreadPoolTask;
 
 /**
@@ -22,12 +22,12 @@ typedef struct {
  * @param success 执行结果（true=成功，false=失败）
  * @param user_data 外部透传数据
  */
-typedef void (*TaskCompleteCb)(uint64_t task_id, bool success, void* user_data);
+typedef void (*TaskCompleteCb)(uint64_t task_id, bool success, void *user_data);
 
 /**
  * @brief 线程池句柄（隐藏内部实现）
  */
-typedef struct _ThreadPool* ThreadPoolHandle;
+typedef struct _ThreadPool *ThreadPoolHandle;
 
 /**
  * @brief 初始化线程池（1个asyncPoll + 64个Worker，仅初始化不运行）
@@ -45,6 +45,14 @@ ThreadPoolHandle thread_pool_init(uint32_t worker_queue_cap, uint32_t pending_qu
 int thread_pool_start(ThreadPoolHandle handle);
 
 /**
+ * @brief 基于req_id找到对应的worker上下文，并唤醒对应的worker线程
+ * @param handle 线程池句柄
+ * @param request_id request_id
+ * @return 0=成功，-1=失败
+ */
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id);
+
+/**
  * @brief 外部提交单个任务
  * @param handle 线程池句柄
  * @param request_id 请求ID
@@ -54,12 +62,8 @@ int thread_pool_start(ThreadPoolHandle handle);
  * @param user_data 回调透传数据
  * @return 任务ID（0=失败）
  */
-uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
-                                 uint32_t request_id,
-                                 int (*task_func)(void* arg),
-                                 void* task_arg,
-                                 TaskCompleteCb complete_cb,
-                                 void* user_data);
+uint64_t thread_pool_submit_task(ThreadPoolHandle handle, uint32_t request_id, int (*task_func)(void *arg),
+                                 void *task_arg, TaskCompleteCb complete_cb, void *user_data);
 
 /**
  * @brief 批量提交任务（所有任务入同一个worker线程，保证执行顺序）
@@ -72,14 +76,9 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
  * @param batch_user_data 批量任务全部完成回调透传数据
  * @return 任务ID数组（长度=task_count，NULL=失败，用户需自行释放）
  */
-uint64_t* thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
-                                         ThreadPoolTask* tasks,
-                                         uint32_t task_count,
-                                         TaskCompleteCb complete_cb,
-                                         void* user_data,
-                                         TaskCompleteCb batch_complete_cb,
-                                         void* batch_user_data);
-
+uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle, ThreadPoolTask *tasks, uint32_t task_count,
+                                         TaskCompleteCb complete_cb, void *user_data, TaskCompleteCb batch_complete_cb,
+                                         void *batch_user_data);
 
 /**
  * @brief 根据 request_id 销毁所有未执行的任务
