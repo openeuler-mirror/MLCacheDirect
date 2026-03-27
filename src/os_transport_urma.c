@@ -1,6 +1,7 @@
 #include "os_transport_internal.h"
 
-urma_status_t urma_write_with_notify(urma_write_info_t write_info, chunk_info_t *chunk_info) {
+urma_status_t urma_write_with_notify(urma_write_info_t write_info, chunk_info_t *chunk_info)
+{
     urma_sge_t src_sge = {
         .addr = chunk_info->src,
         .len = chunk_info->len,
@@ -36,7 +37,8 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, chunk_info_t 
         return URMA_FAIL;
 }
 
-urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, chunk_info_t *chunk_info) {
+urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, chunk_info_t *chunk_info)
+{
     urma_sge_t src_sge = {.addr = (uint64_t)chunk_info->src, .len = chunk_info->len, .tseg = recv_info.local_tseg};
     urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
     urma_jfr_wr_t wr = {.src = src_sg,

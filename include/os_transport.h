@@ -62,12 +62,21 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
 
 uint32_t os_transport_reg_jfc(urma_jfce_t *jfce, urma_jfc_t *jfc, void *handle);
 
-uint32_t os_transport_send(void *handle, urma_jetty_info_t *jetty_info, ost_buffer_info_t *local_src,
-                           ost_buffer_info_t *remote_dst, uint32_t len, uint32_t server_key, uint32_t client_key,
+uint32_t os_transport_send(void *handle,
+                           urma_jetty_info_t *jetty_info,
+                           ost_buffer_info_t *local_src,
+                           ost_buffer_info_t *remote_dst,
+                           uint32_t len,
+                           uint32_t server_key,
+                           uint32_t client_key,
                            task_sync_t **ret_sync_handle);
 
-uint32_t os_transport_recv(void *handle, ost_buffer_info_t *host_src, ost_device_info_t *device_dst, uint32_t len,
-                           uint32_t client_key, task_sync_t **ret_sync_handle);
+uint32_t os_transport_recv(void *handle,
+                           ost_buffer_info_t *host_src,
+                           ost_device_info_t *device_dst,
+                           uint32_t len,
+                           uint32_t client_key,
+                           task_sync_t **ret_sync_handle);
 
 int os_transport_wake_up_task(void *handle, void *cr_t);
 
