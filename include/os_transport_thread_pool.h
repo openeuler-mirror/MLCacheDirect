@@ -30,12 +30,12 @@ typedef void (*TaskCompleteCb)(uint64_t task_id, bool success, void *user_data);
 typedef struct _ThreadPool *ThreadPoolHandle;
 
 /**
- * @brief 初始化线程池（1个asyncPoll + 64个Worker，仅初始化不运行）
- * @param worker_queue_cap 单个Worker队列容量（建议≥2）
+ * @brief 初始化线程池（按配置创建Worker线程，仅初始化不运行）
+ * @param worker_thread_num Worker线程数量
  * @param pending_queue_cap 全局Pending队列初始容量（0=默认1024）（已弃用，保留兼容）
  * @return 线程池句柄（NULL=失败）
  */
-ThreadPoolHandle thread_pool_init(uint32_t worker_queue_cap, uint32_t pending_queue_cap);
+ThreadPoolHandle thread_pool_init(uint32_t worker_thread_num, uint32_t pending_queue_cap);
 
 /**
  * @brief 启动线程池（仅启动asyncPoll，Worker按需唤醒）

@@ -3,19 +3,10 @@
 
 #include "os_transport_thread_pool.h"
 #include "os_transport_urma.h"
+#include "os_transport_log_internal.h"
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <syslog.h>
-
-enum {
-    OST_SYSLOG_PRIO_DEBUG = LOG_DEBUG,
-    OST_SYSLOG_PRIO_INFO = LOG_INFO,
-    OST_SYSLOG_PRIO_WARNING = LOG_WARNING,
-    OST_SYSLOG_PRIO_ERR = LOG_ERR
-};
 
 typedef union {
     struct {
@@ -90,9 +81,10 @@ typedef struct {
  */
 struct _ThreadPool {
     // 线程基础配置
-    WorkerThread workers[64]; // 64个Worker线程
-    bool is_running;          // 线程池运行标记
-    bool is_destroying;       // 销毁标记
+    WorkerThread *workers; // Worker线程数组
+    uint32_t worker_count; // Worker线程数量
+    bool is_running;       // 线程池运行标记
+    bool is_destroying;    // 销毁标记
 
     // 任务ID生成
     uint64_t next_task_id;         // 下一个任务ID
@@ -112,62 +104,5 @@ struct _ThreadPool {
     RequestContext *req_hash[REQ_HASH_SIZE];
     pthread_mutex_t req_hash_mutex; // 保护哈希表
 };
-
-// 日志级别
-typedef enum { LOG_LEVEL_DEBUG = 0, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LOG_LEVEL_ERROR } LogLevel;
-
-// 全局日志级别控制（可通过编译宏/配置修改）
-#ifndef GLOBAL_LOG_LEVEL
-#define GLOBAL_LOG_LEVEL LOG_LEVEL_DEBUG
-#endif
-
-static inline int log_level_to_syslog_priority(LogLevel level)
-{
-    switch (level) {
-    case LOG_LEVEL_DEBUG:
-        return OST_SYSLOG_PRIO_DEBUG;
-    case LOG_LEVEL_INFO:
-        return OST_SYSLOG_PRIO_INFO;
-    case LOG_LEVEL_WARN:
-        return OST_SYSLOG_PRIO_WARNING;
-    case LOG_LEVEL_ERROR:
-        return OST_SYSLOG_PRIO_ERR;
-    default:
-        return OST_SYSLOG_PRIO_INFO;
-    }
-}
-
-static inline void init_syslog_logger_once(void)
-{
-    openlog("os_transport", LOG_PID | LOG_NDELAY, LOG_USER);
-}
-
-static inline void log_to_syslog(LogLevel level, const char *file, int line, const char *fmt, ...)
-{
-    static pthread_once_t log_init_once = PTHREAD_ONCE_INIT;
-    pthread_once(&log_init_once, init_syslog_logger_once);
-
-    char msg_buf[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
-    va_end(args);
-
-    syslog(log_level_to_syslog_priority(level), "[%s:%d] %s", file, line, msg_buf);
-}
-
-// 日志格式化输出宏
-#define OST_LOG(level, fmt, ...)                                                                                       \
-    do {                                                                                                               \
-        if (level >= GLOBAL_LOG_LEVEL) {                                                                               \
-            log_to_syslog(level, __FILE__, __LINE__, fmt, ##__VA_ARGS__);                                              \
-        }                                                                                                              \
-    } while (0)
-
-// 快捷日志宏
-#define OST_LOG_DEBUG(fmt, ...) OST_LOG(LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
-#define OST_LOG_INFO(fmt, ...)  OST_LOG(LOG_LEVEL_INFO, fmt, ##__VA_ARGS__)
-#define OST_LOG_WARN(fmt, ...)  OST_LOG(LOG_LEVEL_WARN, fmt, ##__VA_ARGS__)
-#define OST_LOG_ERROR(fmt, ...) OST_LOG(LOG_LEVEL_ERROR, fmt, ##__VA_ARGS__)
 
 #endif // OS_TRANSPORT_THREAD_POOL_INTERNAL_H

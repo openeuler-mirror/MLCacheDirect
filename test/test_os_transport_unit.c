@@ -66,9 +66,9 @@ static void reset_mocks(void)
     memset(&g_mock_cuda_last_stream, 0, sizeof(g_mock_cuda_last_stream));
 }
 
-ThreadPoolHandle thread_pool_init(uint32_t worker_queue_cap, uint32_t pending_queue_cap)
+ThreadPoolHandle thread_pool_init(uint32_t worker_thread_num, uint32_t pending_queue_cap)
 {
-    (void)worker_queue_cap;
+    (void)worker_thread_num;
     (void)pending_queue_cap;
     if (g_mock_pool_init_fail) {
         return NULL;
