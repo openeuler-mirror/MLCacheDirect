@@ -95,7 +95,7 @@ static void free_sync_owned_resources(task_sync_t *sync)
     free(sync);
 }
 
-uint32_t wait_for_task_complete(task_sync_t *sync_handle)
+static uint32_t wait_for_task_complete(task_sync_t *sync_handle)
 {
     if (!sync_handle) {
         return -1;
@@ -220,7 +220,7 @@ static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
     return write_info;
 }
 
-uint32_t common_split_chunks(
+static uint32_t common_split_chunks(
     uint64_t src_addr, uint64_t dst_addr, uint32_t len, chunk_info_t **ret_chunks, uint64_t *ret_chunk_num)
 {
     size_t remain_len = len;
@@ -252,11 +252,11 @@ uint32_t common_split_chunks(
 }
 
 // 发送数据时切分chunk
-uint32_t send_split_chunks(ost_buffer_info_t *local_src,
-                           ost_buffer_info_t *remote_dst,
-                           uint32_t len,
-                           chunk_info_t **ret_chunks,
-                           uint64_t *ret_chunk_num)
+static uint32_t send_split_chunks(ost_buffer_info_t *local_src,
+                                  ost_buffer_info_t *remote_dst,
+                                  uint32_t len,
+                                  chunk_info_t **ret_chunks,
+                                  uint64_t *ret_chunk_num)
 {
     uint64_t src_addr;
     uint64_t dst_addr;
@@ -275,11 +275,11 @@ uint32_t send_split_chunks(ost_buffer_info_t *local_src,
 }
 
 // 接收数据时切分chunk
-uint32_t recv_split_chunks(ost_buffer_info_t *host,
-                           ost_device_info_t *device,
-                           uint32_t len,
-                           chunk_info_t **ret_chunks,
-                           uint64_t *ret_chunk_num)
+static uint32_t recv_split_chunks(ost_buffer_info_t *host,
+                                  ost_device_info_t *device,
+                                  uint32_t len,
+                                  chunk_info_t **ret_chunks,
+                                  uint64_t *ret_chunk_num)
 {
     uint64_t src_addr;
     uint64_t dst_addr;
@@ -293,12 +293,12 @@ uint32_t recv_split_chunks(ost_buffer_info_t *host,
     return common_split_chunks(src_addr, dst_addr, len, ret_chunks, ret_chunk_num);
 }
 
-void construct_send_task_arg(send_task_arg_t *arg,
-                             urma_write_info_t write_info,
-                             chunk_info_t *chunk_info,
-                             uint64_t chunk_id,
-                             bool is_last_chunk,
-                             task_sync_t *sync)
+static void construct_send_task_arg(send_task_arg_t *arg,
+                                    urma_write_info_t write_info,
+                                    chunk_info_t *chunk_info,
+                                    uint64_t chunk_id,
+                                    bool is_last_chunk,
+                                    task_sync_t *sync)
 {
     // 显式构造每个位域字段，避免隐式保留旧值
     os_transport_user_data_t user_data_server = {0};
@@ -324,7 +324,7 @@ void construct_send_task_arg(send_task_arg_t *arg,
     arg->sync = sync;
 }
 
-void construct_recv_task_arg(
+static void construct_recv_task_arg(
     recv_task_arg_t *arg, urma_recv_info_t recv_info, chunk_info_t *chunk_info, bool is_last_chunk, task_sync_t *sync)
 {
     memset(arg, 0, sizeof(*arg));
@@ -335,7 +335,8 @@ void construct_recv_task_arg(
 }
 
 // 构建供worker取用的task信息
-ThreadPoolTask construct_worker_task(uint64_t task_id, uint32_t request_id, int (*task_func)(void *), void *task_arg)
+static ThreadPoolTask
+construct_worker_task(uint64_t task_id, uint32_t request_id, int (*task_func)(void *), void *task_arg)
 {
     ThreadPoolTask task;
     memset(&task, 0, sizeof(task));
@@ -348,7 +349,7 @@ ThreadPoolTask construct_worker_task(uint64_t task_id, uint32_t request_id, int 
     return task;
 }
 
-int do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
+static int do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
 {
     int ret = 0;
     ret = (int)urma_write_with_notify(write_info, chunk_info);
@@ -361,7 +362,7 @@ int do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_i
     return ret;
 }
 
-int do_recv_chunk_for_worker(urma_recv_info_t recv_info, chunk_info_t *chunk_info)
+static int do_recv_chunk_for_worker(urma_recv_info_t recv_info, chunk_info_t *chunk_info)
 {
     void *host_buf = (void *)(uintptr_t)chunk_info->src;
     void *device_buf = (void *)(uintptr_t)chunk_info->dst;
@@ -370,7 +371,7 @@ int do_recv_chunk_for_worker(urma_recv_info_t recv_info, chunk_info_t *chunk_inf
 }
 
 // worker线程执行的send任务函数，负责发送chunk
-int send_task_worker_func(void *arg)
+static int send_task_worker_func(void *arg)
 {
     int ret = 0;
 
@@ -381,7 +382,7 @@ int send_task_worker_func(void *arg)
 }
 
 // worker线程执行的recv任务函数，负责H2D操作
-int recv_task_worker_func(void *arg)
+static int recv_task_worker_func(void *arg)
 {
     int ret = 0;
     recv_task_arg_t *recv_task_arg = (recv_task_arg_t *)arg;
@@ -510,13 +511,13 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 }
 
 // 构造并注册所有task，sync_handle用于与主函数同步
-uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_handle,
-                                            chunk_info_t *chunks,
-                                            uint64_t chunk_num,
-                                            task_type_t type,
-                                            int (*task_func)(void *),
-                                            urma_info_t urma_info,
-                                            task_sync_t **sync_handle)
+static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_handle,
+                                                   chunk_info_t *chunks,
+                                                   uint64_t chunk_num,
+                                                   task_type_t type,
+                                                   int (*task_func)(void *),
+                                                   urma_info_t urma_info,
+                                                   task_sync_t **sync_handle)
 {
     task_sync_t *sync = NULL;
     int ret = -1;
