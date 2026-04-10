@@ -175,7 +175,7 @@ static WorkerThread *select_best_worker(ThreadPoolHandle pool)
 {
     WorkerThread *best = NULL;
     uint32_t min_load = UINT32_MAX;
-    for (int i = 0; i < 64; i++) {
+    for (uint32_t i = 0; i < pool->worker_count; i++) {
         WorkerThread *w = &pool->workers[i];
         pthread_mutex_lock(&w->mutex);
         uint32_t load = w->queue_size;
@@ -311,9 +311,15 @@ static void init_pool_sync(ThreadPoolHandle pool)
 }
 
 // 初始化 worker 基础结构
-static void init_workers_basic(ThreadPoolHandle pool)
+static bool init_workers_basic(ThreadPoolHandle pool)
 {
-    for (int i = 0; i < 64; i++) {
+    pool->workers = calloc(pool->worker_count, sizeof(WorkerThread));
+    if (!pool->workers) {
+        OST_LOG_ERROR("Failed to allocate worker array (worker_count=%u)", pool->worker_count);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < pool->worker_count; i++) {
         WorkerThread *w = &pool->workers[i];
         pthread_mutex_init(&w->mutex, NULL);
         pthread_cond_init(&w->cond_task, NULL);
@@ -324,6 +330,8 @@ static void init_workers_basic(ThreadPoolHandle pool)
         w->queue_size = 0;
         w->pending_req = 0;
     }
+
+    return true;
 }
 
 // 创建单个 worker 线程
@@ -347,7 +355,7 @@ static bool create_worker(ThreadPoolHandle pool, int idx)
 // 创建所有 worker 线程
 static bool create_all_workers(ThreadPoolHandle pool)
 {
-    for (int i = 0; i < 64; i++) {
+    for (uint32_t i = 0; i < pool->worker_count; i++) {
         if (!create_worker(pool, i)) {
             return false;
         }
@@ -372,7 +380,7 @@ static void shutdown_threads(ThreadPoolHandle pool)
     pool->is_destroying = true;
     pthread_mutex_unlock(&pool->global_mutex);
 
-    for (int i = 0; i < 64; i++) {
+    for (uint32_t i = 0; i < pool->worker_count; i++) {
         WorkerThread *w = &pool->workers[i];
         pthread_mutex_lock(&w->mutex);
         pthread_cond_signal(&w->cond_task);
@@ -400,9 +408,16 @@ static void destroy_worker(WorkerThread *w)
 // 销毁所有 worker
 static void destroy_all_workers(ThreadPoolHandle handle)
 {
-    for (int i = 0; i < 64; i++) {
+    if (!handle->workers) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < handle->worker_count; i++) {
         destroy_worker(&handle->workers[i]);
     }
+
+    free(handle->workers);
+    handle->workers = NULL;
 }
 
 // 销毁哈希表
@@ -419,17 +434,26 @@ static void destroy_hash_table(ThreadPoolHandle handle)
 }
 
 // 初始化线程池
-ThreadPoolHandle thread_pool_init(uint32_t worker_queue_cap, uint32_t pending_queue_cap)
+ThreadPoolHandle thread_pool_init(uint32_t worker_thread_num, uint32_t pending_queue_cap)
 {
     (void)pending_queue_cap;
-    (void)worker_queue_cap; // 链表不需要容量
+
+    if (worker_thread_num == 0) {
+        OST_LOG_ERROR("Invalid worker_thread_num: 0");
+        return NULL;
+    }
 
     ThreadPoolHandle pool = calloc(1, sizeof(struct _ThreadPool));
     if (!pool)
         return NULL;
 
     init_pool_sync(pool);
-    init_workers_basic(pool);
+    pool->worker_count = worker_thread_num;
+    if (!init_workers_basic(pool)) {
+        destroy_pool_sync(pool);
+        free(pool);
+        return NULL;
+    }
 
     memset(pool->req_hash, 0, sizeof(pool->req_hash));
     pool->next_task_id = 1;
@@ -441,7 +465,7 @@ ThreadPoolHandle thread_pool_init(uint32_t worker_queue_cap, uint32_t pending_qu
         return NULL;
     }
 
-    OST_LOG_INFO("Thread pool initialized");
+    OST_LOG_INFO("Thread pool initialized with %u workers", pool->worker_count);
     return pool;
 }
 
@@ -817,7 +841,7 @@ void thread_pool_destroy(ThreadPoolHandle handle)
 
     shutdown_threads(handle);
 
-    for (int i = 0; i < 64; i++) {
+    for (uint32_t i = 0; i < handle->worker_count; i++) {
         if (handle->workers[i].tid)
             pthread_join(handle->workers[i].tid, NULL);
     }

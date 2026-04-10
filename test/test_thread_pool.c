@@ -314,7 +314,7 @@ int main(void)
     // 初始化模拟事件队列
     mock_event_queue_init(64);
 
-    // 初始化线程池（链表不需要容量）
+    // 初始化线程池（2个worker）
     ThreadPoolHandle pool = thread_pool_init(2, 0);
     assert(pool != NULL);
 

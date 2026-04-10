@@ -90,9 +90,10 @@ typedef struct {
  */
 struct _ThreadPool {
     // 线程基础配置
-    WorkerThread workers[64]; // 64个Worker线程
-    bool is_running;          // 线程池运行标记
-    bool is_destroying;       // 销毁标记
+    WorkerThread *workers; // Worker线程数组
+    uint32_t worker_count; // Worker线程数量
+    bool is_running;       // 线程池运行标记
+    bool is_destroying;    // 销毁标记
 
     // 任务ID生成
     uint64_t next_task_id;         // 下一个任务ID

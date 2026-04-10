@@ -668,7 +668,7 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     g_inited = 1;
 
     // 初始化线程池
-    // worker_queue_cap: 每个Worker的任务队列容量; pending_queue_cap: 0表示使用默认值1024
+    // worker_thread_num: Worker线程数量; pending_queue_cap: 0表示使用默认值1024
     ost_handle->thread_pool = thread_pool_init(ost_cfg->worker_thread_num, 0);
     if (!ost_handle->thread_pool) {
         OST_LOG_ERROR("Failed: thread_pool_init returned NULL "
