@@ -20,7 +20,7 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, chunk_info_t 
             write_info.user_ctx_client.user_ctx, // 将client_key作为notify_data传入，方便worker线程回调时区分不同请求
         .dst = dst_sg};
     urma_jfs_wr_t wr = {
-        .opcode = URMA_OPC_WRITE_NOTIFY,
+        .opcode = URMA_OPC_WRITE_IMM,
         .flag.bs.complete_enable = 1,
         .flag.bs.inline_flag = 0,
         .tjetty = write_info.target_jfr,

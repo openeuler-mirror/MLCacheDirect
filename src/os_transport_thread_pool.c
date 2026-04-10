@@ -279,10 +279,12 @@ static void *worker_routine(void *arg)
     pthread_cond_signal(&worker->cond_task);
 
     while (1) {
-        while (worker->pending_req == 0 && !pool->is_destroying) {
+        while (!pool->is_destroying) {
             pthread_cond_wait(&worker->cond_task, &worker->mutex);
+            break;
         }
-        if (pool->is_destroying && worker->pending_req == 0) {
+        OST_LOG_INFO("Worker %d woke up, pending_req=%u", worker->worker_idx, worker->pending_req);
+        if (pool->is_destroying) {
             worker->state = WORKER_STATE_EXIT;
             pthread_mutex_unlock(&worker->mutex);
             break;
