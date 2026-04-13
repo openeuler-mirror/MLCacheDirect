@@ -1,0 +1,24 @@
+cc_import(
+    name = "urma_shared",
+    shared_library = "lib64/liburma.so",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "urma_headers",
+    hdrs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+    ]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "urma",
+    deps = [
+        ":urma_headers",
+        ":urma_shared",
+    ],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,15 @@
+# C99 standard
+build --conlyopt=-std=c99
+build --copt=-Wall
+build --copt=-Wextra
+build --copt=-fPIC
+build --copt=-Wno-implicit-function-declaration
+
+# Debug build
+build:debug --copt=-g3
+build:debug --copt=-O0
+build:debug --strip=never
+
+# Release build
+build:release --copt=-O2
+build:release --strip=always

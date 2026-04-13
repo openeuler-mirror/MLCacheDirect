@@ -1,0 +1,27 @@
+cc_import(
+    name = "cudart_shared",
+    shared_library = "lib64/libcudart.so",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cuda_headers",
+    hdrs = glob([
+        "include/**/*.h",
+        "include/**/*.hpp",
+        "include/**/*.cuh",
+        "include/**/*.inl",
+        "include/**/*.inc",
+    ]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cuda",
+    deps = [
+        ":cuda_headers",
+        ":cudart_shared",
+    ],
+    visibility = ["//visibility:public"],
+)
