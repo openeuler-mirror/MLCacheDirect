@@ -14,6 +14,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef void (*log_callback_t)(int level, const char* msg);
+int os_transport_log_reg(int level, log_callback_t cb);
+
 #define DEFAULT_CHUNK_SIZE (2 * 1024 * 1024) // 2MB
 
 typedef union {
