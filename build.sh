@@ -47,7 +47,8 @@ PKG_RELEASE="1"
 
 # 绝对路径（无空格）
 ROOT_DIR=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
-BUILD_DIR="${ROOT_DIR}/build-${ARCH}"  # 按架构分build目录，避免冲突
+BUILD_DIR="${ROOT_DIR}/build-${ARCH}"          # CMake 构建目录
+BAZEL_BUILD_DIR="${ROOT_DIR}/build-bazel-${ARCH}"  # Bazel 构建目录
 INSTALL_DIR="${BUILD_DIR}/install"
 OUTPUT_DIR="${ROOT_DIR}/output"
 
@@ -78,8 +79,8 @@ for dep in "${deps[@]}"; do
 done
 
 # ===================== 步骤2：清理旧文件 =====================
-echo -e "${YELLOW}[2/6] 清理旧编译文件（架构：${ARCH}）...${NC}"
-rm -rf "${BUILD_DIR}"
+echo -e "${YELLOW}[2/6] 清理旧编译和打包产物（架构：${ARCH}）...${NC}"
+rm -rf "${BUILD_DIR}" "${BAZEL_BUILD_DIR}" "${OUTPUT_DIR}"
 mkdir -p "${BUILD_DIR}" "${INSTALL_DIR}" "${OUTPUT_DIR}" || {
     echo -e "${RED}❌ 错误：创建目录失败 → ${BUILD_DIR}${NC}"
     exit 1

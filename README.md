@@ -1,2 +1,3 @@
-# OS_TRANSPORT
-# 编译命令：./build.sh
+# MLCACHEDIRECR
+# cmake编译命令：./build.sh
+# bazel编译命令：./build_bazel.sh
