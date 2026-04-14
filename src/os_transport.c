@@ -672,6 +672,10 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     // worker_thread_num: Worker线程数量; pending_queue_cap: 0表示使用默认值1024
     ost_handle->thread_pool = thread_pool_init(ost_cfg->worker_thread_num, 0);
     if (!ost_handle->thread_pool) {
+        if (ost_cfg->worker_thread_num == 0) {
+            OST_LOG_INFO("Return: worker_thread_num is 0");
+            return 0;
+        }
         OST_LOG_ERROR("Failed: thread_pool_init returned NULL "
                       "(worker_thread_num=%u).",
                       ost_cfg->worker_thread_num);

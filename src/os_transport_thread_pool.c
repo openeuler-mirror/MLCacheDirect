@@ -347,6 +347,11 @@ static bool create_worker(ThreadPoolHandle pool, int idx)
         pthread_mutex_unlock(&w->mutex);
         return false;
     }
+
+    char name[16] = {0};
+    (void)snprintf(name, sizeof(name), "ost_wkr_%d", idx);
+    (void)pthread_setname_np(w->tid, name);
+
     while (w->state == WORKER_STATE_INIT) {
         pthread_cond_wait(&w->cond_task, &w->mutex);
     }
