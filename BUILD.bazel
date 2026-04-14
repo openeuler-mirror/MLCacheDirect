@@ -23,6 +23,13 @@ cc_library(
 )
 
 cc_library(
+    name = "os_transport_prefixed_hdrs",
+    hdrs = glob(["include/*.h"]),
+    strip_include_prefix = "include",
+    include_prefix = "os-transport",
+)
+
+cc_library(
     name = "os_transport_lib",
     srcs = COMMON_SRCS,
     hdrs = glob(["include/*.h"]),
@@ -40,9 +47,16 @@ cc_library(
 
 cc_binary(
     name = "libos_transport.so",
+    srcs = COMMON_SRCS,
+    copts = COMMON_COPTS + ["-Iinclude"],
     linkshared = True,
     deps = [
-        ":os_transport_lib",
+        ":os_transport_hdrs",
+        "@local_cuda//:cuda",
+        "@local_urma//:urma",
+    ],
+    linkopts = [
+        "-lpthread",
     ],
 )
 
