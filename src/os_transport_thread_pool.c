@@ -117,6 +117,7 @@ static int internal_task_wrapper(void *arg)
                      ret);
     }
     free(itask);
+    OST_LOG_INFO("Task %lu completed", itask->task_id);
     return ret;
 }
 
@@ -738,6 +739,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     } else {
         insert_req_context(handle, new_ctx);
     }
+    OST_LOG_INFO("Task %lu (req=%u) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
     return task->task_id;
 }
 
@@ -961,6 +963,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
             handle, req_id, target_worker->worker_idx, task_count, batch_complete_cb, batch_user_data)) {
         OST_LOG_ERROR("Failed to update context for req %u", req_id);
     }
+    OST_LOG_INFO("Batch of %u tasks (req=%u) submitted to worker %d", task_count, req_id, target_worker->worker_idx);
     return task_ids;
 }
 
