@@ -170,6 +170,100 @@ static ThreadPoolTask *worker_queue_pop_by_req(WorkerThread *worker, uint32_t re
     return NULL;
 }
 
+// 向 worker 的待执行 request 队列追加 request_id（必须已持有 worker->mutex）
+static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id)
+{
+    PendingReqNode *node = malloc(sizeof(PendingReqNode));
+    if (!node)
+        return false;
+
+    node->request_id = req_id;
+    node->next = NULL;
+
+    if (worker->pending_req_tail) {
+        worker->pending_req_tail->next = node;
+    } else {
+        worker->pending_req_head = node;
+    }
+    worker->pending_req_tail = node;
+    worker->pending_req_count++;
+
+    OST_LOG_DEBUG("Worker %d enqueued pending req %u, pending req count now %u",
+                  worker->worker_idx,
+                  req_id,
+                  worker->pending_req_count);
+    return true;
+}
+
+// 从 worker 的待执行 request 队列取出一个 request_id（必须已持有 worker->mutex）
+static bool worker_pending_req_pop(WorkerThread *worker, uint32_t *req_id)
+{
+    PendingReqNode *node = worker->pending_req_head;
+    if (!node)
+        return false;
+
+    *req_id = node->request_id;
+    worker->pending_req_head = node->next;
+    if (!worker->pending_req_head) {
+        worker->pending_req_tail = NULL;
+    }
+    worker->pending_req_count--;
+
+    OST_LOG_DEBUG("Worker %d dequeued pending req %u, pending req count now %u",
+                  worker->worker_idx,
+                  *req_id,
+                  worker->pending_req_count);
+
+    free(node);
+    return true;
+}
+
+// 清理 worker 的待执行 request 队列（必须已持有 worker->mutex）
+static void worker_pending_req_clear(WorkerThread *worker)
+{
+    PendingReqNode *curr = worker->pending_req_head;
+    while (curr) {
+        PendingReqNode *next = curr->next;
+        free(curr);
+        curr = next;
+    }
+
+    worker->pending_req_head = NULL;
+    worker->pending_req_tail = NULL;
+    worker->pending_req_count = 0;
+}
+
+// 从 worker 的待执行 request 队列中删除指定 request_id（必须已持有 worker->mutex）
+static uint32_t worker_pending_req_remove_by_req(WorkerThread *worker, uint32_t req_id)
+{
+    PendingReqNode *prev = NULL;
+    PendingReqNode *curr = worker->pending_req_head;
+    uint32_t removed = 0;
+
+    while (curr) {
+        if (curr->request_id == req_id) {
+            PendingReqNode *to_free = curr;
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                worker->pending_req_head = curr->next;
+            }
+            curr = curr->next;
+            if (to_free == worker->pending_req_tail) {
+                worker->pending_req_tail = prev;
+            }
+            free(to_free);
+            removed++;
+        } else {
+            prev = curr;
+            curr = curr->next;
+        }
+    }
+
+    worker->pending_req_count -= removed;
+    return removed;
+}
+
 // 查找最佳 worker：优先空闲，否则选队列最短
 static WorkerThread *select_best_worker(ThreadPoolHandle pool)
 {
@@ -241,8 +335,6 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
 {
     ThreadPoolHandle pool = worker->pool;
 
-    worker->state = WORKER_STATE_BUSY;
-
     task->task_func(task->task_arg);
     task->is_completed = true;
 
@@ -264,7 +356,6 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
     }
 
     free(task);
-    worker->state = WORKER_STATE_IDLE;
 }
 
 // worker 线程主函数
@@ -279,23 +370,33 @@ static void *worker_routine(void *arg)
     pthread_cond_signal(&worker->cond_task);
 
     while (1) {
-        while (!pool->is_destroying) {
+        while (!pool->is_destroying && worker->pending_req_head == NULL) {
+            worker->state = WORKER_STATE_IDLE;
             pthread_cond_wait(&worker->cond_task, &worker->mutex);
-            break;
         }
-        OST_LOG_INFO("Worker %d woke up, pending_req=%u", worker->worker_idx, worker->pending_req);
+        OST_LOG_INFO("Worker %d woke up, pending req count=%u",
+                     worker->worker_idx,
+                     worker->pending_req_count);
         if (pool->is_destroying) {
             worker->state = WORKER_STATE_EXIT;
             pthread_mutex_unlock(&worker->mutex);
             break;
         }
 
-        uint32_t req_to_exec = worker->pending_req;
-        worker->pending_req = 0;
+        uint32_t req_to_exec;
+        if (!worker_pending_req_pop(worker, &req_to_exec)) {
+            worker->state = WORKER_STATE_IDLE;
+            continue;
+        }
 
         ThreadPoolTask *task = worker_queue_pop_by_req(worker, req_to_exec);
         if (task) {
+            worker->state = WORKER_STATE_BUSY;
+            pthread_mutex_unlock(&worker->mutex);
             worker_process_task(worker, task, req_to_exec);
+            pthread_mutex_lock(&worker->mutex);
+        } else {
+            worker->state = WORKER_STATE_IDLE;
         }
     }
     OST_LOG_INFO("Worker %d exiting", worker->worker_idx);
@@ -330,7 +431,8 @@ static bool init_workers_basic(ThreadPoolHandle pool)
         w->pool = pool;
         w->queue_head = w->queue_tail = NULL;
         w->queue_size = 0;
-        w->pending_req = 0;
+        w->pending_req_head = w->pending_req_tail = NULL;
+        w->pending_req_count = 0;
     }
 
     return true;
@@ -407,6 +509,7 @@ static void destroy_worker(WorkerThread *w)
         free(curr);
         curr = next;
     }
+    worker_pending_req_clear(w);
     pthread_mutex_unlock(&w->mutex);
     pthread_mutex_destroy(&w->mutex);
     pthread_cond_destroy(&w->cond_task);
@@ -497,7 +600,11 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
     }
     WorkerThread *worker = &handle->workers[ctx->worker_idx];
     pthread_mutex_lock(&worker->mutex);
-    worker->pending_req = request_id;
+    if (!worker_pending_req_push(worker, request_id)) {
+        pthread_mutex_unlock(&worker->mutex);
+        OST_LOG_ERROR("Failed to enqueue pending request %u for worker %d", request_id, worker->worker_idx);
+        return -1;
+    }
     pthread_cond_signal(&worker->cond_task);
     pthread_mutex_unlock(&worker->mutex);
     return 0;
@@ -791,7 +898,14 @@ static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
         }
     }
     worker->queue_size -= removed;
+    uint32_t removed_pending = worker_pending_req_remove_by_req(worker, req_id);
     pthread_mutex_unlock(&worker->mutex);
+    if (removed_pending > 0) {
+        OST_LOG_DEBUG("Removed %u pending wakeups for req %u from worker %d",
+                      removed_pending,
+                      req_id,
+                      worker->worker_idx);
+    }
     return removed;
 }
 

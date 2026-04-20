@@ -34,6 +34,11 @@ typedef struct TaskNode {
     struct TaskNode *next;
 } TaskNode;
 
+typedef struct PendingReqNode {
+    uint32_t request_id;
+    struct PendingReqNode *next;
+} PendingReqNode;
+
 /**
  * @brief Worker线程结构体（链表版本）
  */
@@ -47,7 +52,9 @@ typedef struct {
     TaskNode *queue_head;     // 队首
     TaskNode *queue_tail;     // 队尾
     uint32_t queue_size;      // 当前任务数
-    uint32_t pending_req;     // 等待执行的 request_id
+    PendingReqNode *pending_req_head; // 待执行 request_id 队首
+    PendingReqNode *pending_req_tail; // 待执行 request_id 队尾
+    uint32_t pending_req_count;       // 等待执行的 request_id 数量
 } WorkerThread;
 
 /**
