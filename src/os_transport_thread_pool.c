@@ -116,8 +116,8 @@ static int internal_task_wrapper(void *arg)
                      itask->request_id,
                      ret);
     }
-    free(itask);
     OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id);
+    free(itask);
     return ret;
 }
 
