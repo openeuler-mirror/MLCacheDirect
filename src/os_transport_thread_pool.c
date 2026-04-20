@@ -88,6 +88,7 @@ static uint32_t hash_req_id(uint32_t req_id)
 typedef struct {
     int (*user_func)(void *);
     void *user_arg;
+    TaskPrepareCb prepare_cb;
     TaskCompleteCb complete_cb;
     void *user_data;
     uint64_t task_id;
@@ -117,6 +118,20 @@ static int internal_task_wrapper(void *arg)
     OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id);
     free(itask);
     return ret;
+}
+
+static void prepare_internal_task_user_data(ThreadPoolTask *task, void *user_data)
+{
+    InternalTask *itask;
+
+    if (!task || !task->task_arg || !user_data) {
+        return;
+    }
+
+    itask = (InternalTask *)task->task_arg;
+    if (itask->prepare_cb) {
+        itask->prepare_cb(itask->user_arg, user_data);
+    }
 }
 
 // 生成唯一任务ID
@@ -176,8 +191,8 @@ static ThreadPoolTask *worker_queue_pop_by_req(WorkerThread *worker, uint32_t re
     return NULL;
 }
 
-// 向 worker 的待执行 request 队列追加 request_id（必须已持有 worker->mutex）
-static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id)
+// 向 worker 的待执行队列追加 request_id 以及对应completion user_data（必须已持有 worker->mutex）
+static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id, void *user_data)
 {
     PendingReqNode *node = malloc(sizeof(PendingReqNode));
     if (!node) {
@@ -188,6 +203,10 @@ static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id)
     }
 
     node->request_id = req_id;
+    memset(&node->user_data, 0, sizeof(node->user_data));
+    if (user_data) {
+        node->user_data = *(TransportData *)user_data;
+    }
     node->next = NULL;
 
     if (worker->pending_req_tail) {
@@ -200,14 +219,17 @@ static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id)
     return true;
 }
 
-// 从 worker 的待执行 request 队列取出一个 request_id（必须已持有 worker->mutex）
-static bool worker_pending_req_pop(WorkerThread *worker, uint32_t *req_id)
+// 从 worker 的待执行队列取出 request_id 以及对应completion user_data（必须已持有 worker->mutex）
+static bool worker_pending_req_pop(WorkerThread *worker, uint32_t *req_id, TransportData *user_data)
 {
     PendingReqNode *node = worker->pending_req_head;
     if (!node)
         return false;
 
     *req_id = node->request_id;
+    if (user_data) {
+        *user_data = node->user_data;
+    }
     worker->pending_req_head = node->next;
     if (!worker->pending_req_head) {
         worker->pending_req_tail = NULL;
@@ -330,7 +352,7 @@ static void remove_req_context(ThreadPoolHandle pool, uint32_t req_id)
 }
 
 // worker 执行任务并处理计数
-static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint32_t req_id)
+static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint32_t req_id, TransportData *user_data)
 {
     ThreadPoolHandle pool = worker->pool;
     int ret;
@@ -343,6 +365,7 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
         return;
     }
 
+    prepare_internal_task_user_data(task, user_data);
     ret = task->task_func(task->task_arg);
     task->is_completed = (ret == 0);
 
@@ -400,7 +423,8 @@ static void *worker_routine(void *arg)
         }
 
         uint32_t req_to_exec;
-        if (!worker_pending_req_pop(worker, &req_to_exec)) {
+        TransportData user_data = {0};
+        if (!worker_pending_req_pop(worker, &req_to_exec, &user_data)) {
             worker->state = WORKER_STATE_IDLE;
             continue;
         }
@@ -409,7 +433,7 @@ static void *worker_routine(void *arg)
         if (task) {
             worker->state = WORKER_STATE_BUSY;
             pthread_mutex_unlock(&worker->mutex);
-            worker_process_task(worker, task, req_to_exec);
+            worker_process_task(worker, task, req_to_exec, &user_data);
             pthread_mutex_lock(&worker->mutex);
         } else {
             OST_LOG_WARN("Wakeup received without matching queued task (worker=%d, request_id=%u).",
@@ -619,7 +643,7 @@ int thread_pool_start(ThreadPoolHandle handle)
     return 0;
 }
 
-int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id)
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data)
 {
     if (!handle) {
         OST_LOG_ERROR("Failed: handle is NULL in thread_pool_wake_up_worker_by_req_id.");
@@ -633,7 +657,7 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
     }
     WorkerThread *worker = &handle->workers[ctx->worker_idx];
     pthread_mutex_lock(&worker->mutex);
-    if (!worker_pending_req_push(worker, request_id)) {
+    if (!worker_pending_req_push(worker, request_id, user_data)) {
         pthread_mutex_unlock(&worker->mutex);
         OST_LOG_ERROR("Failed to enqueue pending request %u for worker %d", request_id, worker->worker_idx);
         return -1;
@@ -671,6 +695,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     }
     itask->user_func = task_func;
     itask->user_arg = task_arg;
+    itask->prepare_cb = NULL;
     itask->complete_cb = complete_cb;
     itask->user_data = user_data;
     itask->request_id = request_id;
@@ -684,6 +709,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     }
     task->task_id = generate_task_id(handle);
     task->request_id = request_id;
+    task->prepare_cb = NULL;
     task->task_func = internal_task_wrapper;
     task->task_arg = itask;
     task->is_completed = false;
@@ -756,6 +782,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
     }
     itask->user_func = src->task_func;
     itask->user_arg = src->task_arg;
+    itask->prepare_cb = src->prepare_cb;
     itask->complete_cb = complete_cb;
     itask->user_data = user_data;
     itask->request_id = req_id;
@@ -769,6 +796,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
     }
     task->task_id = generate_task_id(handle);
     task->request_id = req_id;
+    task->prepare_cb = NULL;
     task->task_func = internal_task_wrapper;
     task->task_arg = itask;
     task->is_completed = false;

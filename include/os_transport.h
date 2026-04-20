@@ -15,8 +15,14 @@
 extern "C" {
 #endif
 
-typedef void (*log_callback_t)(int level, const char* msg);
+typedef void (*log_callback_t)(int level, const char *msg);
 int os_transport_log_reg(int level, log_callback_t cb);
+
+/*
+ * recv notify回调。user_data指针指向每次URMA completion对应的
+ * os_transport_user_data_t副本，该副本在os_transport_wake_up_task阶段填充。
+ */
+typedef int (*notify_callback_t)(void *user_data);
 
 #define DEFAULT_CHUNK_SIZE (2 * 1024 * 1024) // 2MB
 
@@ -80,11 +86,14 @@ uint32_t os_transport_recv(void *handle,
                            ost_device_info_t *device_dst,
                            uint32_t len,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle);
+                           task_sync_t **ret_sync_handle,
+                           notify_callback_t notify_callback);
 
 int os_transport_wake_up_task(void *handle, void *cr_t);
 
 uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
+
+uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id);
 
 uint32_t os_transport_destroy(void *handle);
 
