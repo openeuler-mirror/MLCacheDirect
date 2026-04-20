@@ -80,9 +80,8 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, chunk_info_t *ch
     urma_jfr_wr_t *bad_wr;
 
     if (!recv_info.jfr) {
-        OST_LOG_ERROR("Failed: jfr is NULL for recv request (request_id=%u, len=%u).",
-                      recv_info.request_id,
-                      chunk_info->len);
+        OST_LOG_ERROR(
+            "Failed: jfr is NULL for recv request (request_id=%u, len=%u).", recv_info.request_id, chunk_info->len);
         return URMA_FAIL;
     }
 

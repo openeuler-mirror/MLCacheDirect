@@ -111,10 +111,8 @@ static int internal_task_wrapper(void *arg)
         itask->complete_cb(itask->task_id, itask->success, itask->user_data);
     }
     if (ret != 0) {
-        OST_LOG_WARN("Worker task returned error (task_id=%lu, request_id=%u, ret=%d).",
-                     itask->task_id,
-                     itask->request_id,
-                     ret);
+        OST_LOG_WARN(
+            "Worker task returned error (task_id=%lu, request_id=%u, ret=%d).", itask->task_id, itask->request_id, ret);
     }
     OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id);
     free(itask);
@@ -365,9 +363,8 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
             pthread_mutex_unlock(&pool->req_hash_mutex);
         }
     } else {
-        OST_LOG_WARN("No request context found after task execution (request_id=%u, worker=%d).",
-                     req_id,
-                     worker->worker_idx);
+        OST_LOG_WARN(
+            "No request context found after task execution (request_id=%u, worker=%d).", req_id, worker->worker_idx);
     }
 
     if (ret != 0) {
@@ -804,9 +801,7 @@ static bool validate_and_select_worker(ThreadPoolHandle handle,
         return false;
     }
     if (!tasks || task_count == 0) {
-        OST_LOG_ERROR("Failed: invalid task batch input (tasks=%p, task_count=%u).",
-                      (void *)tasks,
-                      task_count);
+        OST_LOG_ERROR("Failed: invalid task batch input (tasks=%p, task_count=%u).", (void *)tasks, task_count);
         return false;
     }
     if (!handle->is_running) {
@@ -826,9 +821,8 @@ static bool validate_and_select_worker(ThreadPoolHandle handle,
     }
     *task_ids = malloc(task_count * sizeof(uint64_t));
     if (!*task_ids) {
-        OST_LOG_ERROR("Failed: unable to allocate task_ids array for batch request_id=%u (task_count=%u).",
-                      *req_id,
-                      task_count);
+        OST_LOG_ERROR(
+            "Failed: unable to allocate task_ids array for batch request_id=%u (task_count=%u).", *req_id, task_count);
         return false;
     }
 
@@ -946,9 +940,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
     uint32_t created = 0;
     TaskNode *head = build_batch_nodes(handle, tasks, task_count, req_id, complete_cb, user_data, task_ids, &created);
     if (!head) {
-        OST_LOG_ERROR("Failed: build_batch_nodes returned NULL (request_id=%u, task_count=%u).",
-                      req_id,
-                      task_count);
+        OST_LOG_ERROR("Failed: build_batch_nodes returned NULL (request_id=%u, task_count=%u).", req_id, task_count);
         free(task_ids);
         return NULL;
     }
@@ -999,10 +991,8 @@ static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
     uint32_t removed_pending = worker_pending_req_remove_by_req(worker, req_id);
     pthread_mutex_unlock(&worker->mutex);
     if (removed_pending > 0) {
-        OST_LOG_INFO("Removed %u pending wakeups for req %u from worker %d.",
-                     removed_pending,
-                     req_id,
-                     worker->worker_idx);
+        OST_LOG_INFO(
+            "Removed %u pending wakeups for req %u from worker %d.", removed_pending, req_id, worker->worker_idx);
     }
     return removed;
 }

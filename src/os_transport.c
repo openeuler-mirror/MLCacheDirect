@@ -454,9 +454,8 @@ static int recv_task_worker_func(void *arg)
         cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
         int event_ret = cudaEventRecord(event, stream);
         if (event_ret != 0) {
-            OST_LOG_ERROR("Failed: cudaEventRecord returned %d (request_id=%u).",
-                          event_ret,
-                          recv_task_arg->recv_info.request_id);
+            OST_LOG_ERROR(
+                "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret, recv_task_arg->recv_info.request_id);
         }
     } else {
         // // 不是最后一个chunk时，调用urma_recv_with_notify，用于接收下一个分片
@@ -824,20 +823,15 @@ uint32_t os_transport_send(void *handle,
         *ret_sync_handle = NULL;
     }
 
-    OST_LOG_INFO("Submitting send request (len=%u, server_key=%u, client_key=%u).",
-                 len,
-                 server_key,
-                 client_key);
+    OST_LOG_INFO("Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
 
     if (validate_send_input(handle, jetty_info, local_src, remote_dst, len, ret_sync_handle) != 0) {
         return ret;
     }
 
     if (len <= DEFAULT_CHUNK_SIZE) {
-        OST_LOG_INFO("Using single-chunk send path (len=%u, server_key=%u, client_key=%u).",
-                     len,
-                     server_key,
-                     client_key);
+        OST_LOG_INFO(
+            "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
         return send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
     }
 
@@ -926,9 +920,8 @@ uint32_t os_transport_recv(void *handle,
     }
 
     *ret_sync_handle = sync_handle;
-    OST_LOG_INFO("Async recv request registered successfully (client_key=%u, chunk_count=%lu).",
-                 client_key,
-                 chunks_num);
+    OST_LOG_INFO(
+        "Async recv request registered successfully (client_key=%u, chunk_count=%lu).", client_key, chunks_num);
     for (uint64_t i = 0; i < chunks_num; i++) {
         if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
             OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
@@ -953,9 +946,7 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     int ret;
 
     if (!handle || !cr_t) {
-        OST_LOG_ERROR("Failed: invalid arguments in os_transport_wake_up_task (handle=%p, cr_t=%p).",
-                      handle,
-                      cr_t);
+        OST_LOG_ERROR("Failed: invalid arguments in os_transport_wake_up_task (handle=%p, cr_t=%p).", handle, cr_t);
         return -1;
     }
 
@@ -1004,9 +995,8 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
 
     request_id = task_group->tasks[0].request_id;
 
-    OST_LOG_INFO("Waiting for request completion (request_id=%u, total_tasks=%lu).",
-                 request_id,
-                 sync_handle->total_tasks);
+    OST_LOG_INFO(
+        "Waiting for request completion (request_id=%u, total_tasks=%lu).", request_id, sync_handle->total_tasks);
 
     completed_success = wait_for_task_complete(sync_handle);
 
