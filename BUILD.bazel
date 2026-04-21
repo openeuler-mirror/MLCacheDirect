@@ -37,7 +37,6 @@ cc_library(
     includes = ["include"],
     deps = [
         ":os_transport_hdrs",
-        "@local_cuda//:cuda",
         "@local_urma//:urma",
     ],
     linkopts = [
@@ -52,7 +51,6 @@ cc_binary(
     linkshared = True,
     deps = [
         ":os_transport_hdrs",
-        "@local_cuda//:cuda",
         "@local_urma//:urma",
     ],
     linkopts = [

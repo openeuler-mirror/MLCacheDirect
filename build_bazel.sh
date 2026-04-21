@@ -1,17 +1,15 @@
 #!/bin/bash
 set -e
 
-# ===================== auto chmod =====================
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 if [ ! -x "${SCRIPT_PATH}" ]; then
-    echo -e "\033[1;33m[WARN] Script not executable, adding +x ...\033[0m"
+    echo -e "[1;33m[WARN] Script not executable, adding +x ...[0m"
     chmod +x "${SCRIPT_PATH}" && exec "${SCRIPT_PATH}" "$@" || {
-        echo -e "\033[1;31m[ERROR] chmod failed. Run: chmod +x ${SCRIPT_PATH}\033[0m"
+        echo -e "[1;31m[ERROR] chmod failed. Run: chmod +x ${SCRIPT_PATH}[0m"
         exit 1
     }
 fi
 
-# ===================== arch detection =====================
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -25,11 +23,10 @@ detect_arch() {
     esac
 }
 
-# ===================== variables =====================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+RED='[0;31m'
+GREEN='[0;32m'
+YELLOW='[1;33m'
+NC='[0m'
 
 ARCH=$(detect_arch)
 echo -e "${YELLOW}[INFO] Detected arch: ${ARCH}${NC}"
@@ -46,13 +43,9 @@ INSTALL_DIR="${BUILD_DIR}/install"
 OUTPUT_DIR="${ROOT_DIR}/output"
 RPM_SPEC="${ROOT_DIR}/rpm/os-transport.spec"
 
-# ===================== external dependency paths =====================
-CUDA_INCLUDE_DIR="${CUDA_INCLUDE_DIR:-/usr/local/cuda/include}"
-CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda/lib64}"
 URMA_INCLUDE_DIR="${URMA_INCLUDE_DIR:-/usr/include}"
 URMA_LIB_DIR="${URMA_LIB_DIR:-/usr/lib64}"
 
-# ===================== usage =====================
 usage() {
     echo "Usage: $0 [options]"
     echo ""
@@ -64,8 +57,6 @@ usage() {
     echo "  -h, --help        Show this help"
     echo ""
     echo "Environment overrides:"
-    echo "  CUDA_INCLUDE_DIR  Default: /usr/local/cuda/include"
-    echo "  CUDA_LIB_DIR      Default: /usr/local/cuda/lib64"
     echo "  URMA_INCLUDE_DIR  Default: /usr/include"
     echo "  URMA_LIB_DIR      Default: /usr/lib64"
     echo ""
@@ -73,7 +64,7 @@ usage() {
     echo "  $0"
     echo "  $0 -t"
     echo "  $0 -d"
-    echo "  CUDA_INCLUDE_DIR=/opt/cuda/include CUDA_LIB_DIR=/opt/cuda/lib64 $0"
+    echo "  URMA_INCLUDE_DIR=/opt/urma/include URMA_LIB_DIR=/opt/urma/lib64 $0"
 }
 
 DO_CLEAN=0
@@ -96,7 +87,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ===================== prerequisites =====================
 check_dep() {
     if ! command -v "$1" &>/dev/null; then
         echo -e "${RED}[ERROR] Missing dependency: $1${NC}"
@@ -126,17 +116,12 @@ if [ ${DO_RPM} -eq 1 ]; then
     fi
 fi
 
-check_dir "${CUDA_INCLUDE_DIR}" "CUDA include directory"
-check_dir "${CUDA_LIB_DIR}" "CUDA lib directory"
 check_dir "${URMA_INCLUDE_DIR}" "URMA include directory"
 check_dir "${URMA_LIB_DIR}" "URMA lib directory"
 
-echo -e "${YELLOW}[INFO] CUDA_INCLUDE_DIR=${CUDA_INCLUDE_DIR}${NC}"
-echo -e "${YELLOW}[INFO] CUDA_LIB_DIR=${CUDA_LIB_DIR}${NC}"
 echo -e "${YELLOW}[INFO] URMA_INCLUDE_DIR=${URMA_INCLUDE_DIR}${NC}"
 echo -e "${YELLOW}[INFO] URMA_LIB_DIR=${URMA_LIB_DIR}${NC}"
 
-# ===================== clean =====================
 if [ ${DO_CLEAN} -eq 1 ]; then
     echo -e "${YELLOW}[INFO] Cleaning bazel cache and build artifacts...${NC}"
     cd "${ROOT_DIR}"
@@ -146,25 +131,19 @@ if [ ${DO_CLEAN} -eq 1 ]; then
     exit 0
 fi
 
-# ===================== common bazel flags =====================
 BAZEL_FLAGS=(
     "--config=${BAZEL_CONFIG}"
     "--enable_workspace"
 )
 
-# ===================== test =====================
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[INFO] Building and running tests...${NC}"
     cd "${ROOT_DIR}"
-    bazel test "${BAZEL_FLAGS[@]}" \
-        //:test_thread_pool \
-        //:test_os_transport_unit \
-        --test_output=all 2>&1
+    bazel test "${BAZEL_FLAGS[@]}"         //:test_thread_pool         //:test_os_transport_unit         --test_output=all 2>&1
     echo -e "${GREEN}[OK] Tests done.${NC}"
     exit 0
 fi
 
-# ===================== build library =====================
 echo -e "${YELLOW}[2/6] Cleaning old build and packaging artifacts (arch: ${ARCH})...${NC}"
 rm -rf "${BUILD_DIR}" "${CMAKE_BUILD_DIR}" "${OUTPUT_DIR}"
 mkdir -p "${BUILD_DIR}" "${INSTALL_DIR}" "${OUTPUT_DIR}"
@@ -173,7 +152,6 @@ echo -e "${YELLOW}[3/6] Building libos_transport.so with Bazel (config: ${BAZEL_
 cd "${ROOT_DIR}"
 bazel build "${BAZEL_FLAGS[@]}" //:libos_transport.so 2>&1
 
-# ===================== install layout =====================
 echo -e "${YELLOW}[4/6] Creating install layout at ${INSTALL_DIR}...${NC}"
 SO_FILE=$(find "$(bazel info bazel-bin 2>/dev/null)" -name "libos_transport.so" -type f | head -1)
 
@@ -190,20 +168,9 @@ ln -sf "libos_transport.so.${PKG_VERSION}" "${INSTALL_DIR}/usr/lib64/libos_trans
 mkdir -p "${INSTALL_DIR}/usr/include/os-transport"
 cp "${ROOT_DIR}/include/os_transport.h" "${INSTALL_DIR}/usr/include/os-transport/"
 
-# ===================== RPM packaging =====================
 if [ ${DO_RPM} -eq 1 ]; then
     echo -e "${YELLOW}[5/6] Building RPM packages (arch: ${ARCH}, version: ${PKG_VERSION})...${NC}"
-    rpmbuild -bb --nodeps \
-        --define "_topdir ${BUILD_DIR}/rpmbuild" \
-        --define "_builddir ${ROOT_DIR}" \
-        --define "_rpmdir ${OUTPUT_DIR}" \
-        --define "_srcrpmdir ${OUTPUT_DIR}" \
-        --define "version ${PKG_VERSION}" \
-        --define "version_major ${PKG_VERSION_MAJOR}" \
-        --define "release ${PKG_RELEASE}" \
-        --define "install_root ${INSTALL_DIR}" \
-        --define "build_arch ${ARCH}" \
-        "${RPM_SPEC}"
+    rpmbuild -bb --nodeps         --define "_topdir ${BUILD_DIR}/rpmbuild"         --define "_builddir ${ROOT_DIR}"         --define "_rpmdir ${OUTPUT_DIR}"         --define "_srcrpmdir ${OUTPUT_DIR}"         --define "version ${PKG_VERSION}"         --define "version_major ${PKG_VERSION_MAJOR}"         --define "release ${PKG_RELEASE}"         --define "install_root ${INSTALL_DIR}"         --define "build_arch ${ARCH}"         "${RPM_SPEC}"
 
     echo -e "${YELLOW}[6/6] Verifying RPM output...${NC}"
     MAIN_RPM=$(find "${OUTPUT_DIR}" -name "${PKG_NAME}-${PKG_VERSION}-${PKG_RELEASE}.${ARCH}.rpm" | head -1)
@@ -220,6 +187,5 @@ if [ ${DO_RPM} -eq 1 ]; then
         exit 1
     fi
 else
-    echo -e "${GREEN}[OK] libos_transport.so built successfully.${NC}"
-    echo -e "${GREEN}  Output: ${SO_FILE}${NC}"
+    echo -e "${GREEN}[OK] Library build succeeded: ${SO_FILE}${NC}"
 fi
