@@ -1,7 +1,6 @@
 #ifndef OS_TRANSPORT_H
 #define OS_TRANSPORT_H
 
-#include <cuda_runtime.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -43,9 +42,7 @@ typedef struct {
 
 typedef struct {
     urma_jfr_t *jfr;     // 用于接收的jfr
-    void *dst;           // CUDA设备地址
-    cudaStream_t stream; // CUDA流
-    cudaEvent_t event;   // CUDA事件
+    void *dst;           // 数据缓冲区地址
 } ost_device_info_t;
 
 typedef enum jetty_mode { JETTY_MODE_SIMPLEX = 0, JETTY_MODE_DUPLEX } jetty_mode_t;

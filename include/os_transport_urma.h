@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct chunk_info chunk_info_t;
+struct chunk_info;
 
 typedef struct {
     urma_jfs_t *jfs;
@@ -30,7 +30,7 @@ typedef union {
     urma_recv_info_t recv_info;
 } urma_info_t;
 
-urma_status_t urma_write_with_notify(urma_write_info_t write_info, chunk_info_t *chunk_info);
+urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_info *chunk_info);
 
-urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, chunk_info_t *chunk_info);
+urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_info *chunk_info);
 #endif // OS_TRANSPORT_URMA_H

@@ -462,21 +462,13 @@ static int recv_task_worker_func(void *arg)
                      ret);
     }
     if (recv_task_arg->is_last_chunk) {
-        // 主线程返回后通过cudaEventSynchronize(event)等待所有h2d操作完成，确保数据可用
-        cudaStream_t stream = recv_task_arg->recv_info.device_info.stream;
-        cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
-        int event_ret = cudaEventRecord(event, stream);
-        if (event_ret != 0) {
-            OST_LOG_ERROR(
-                "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret, recv_task_arg->recv_info.request_id);
-        }
-    } else {
-        // // 不是最后一个chunk时，调用urma_recv_with_notify，用于接收下一个分片
-        // if (urma_recv_with_notify(recv_task_arg->recv_info, recv_task_arg->chunk_info) != URMA_SUCCESS) {
-        //     OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
-        //                   "(len=%u, client_key=%u).",
-        //                   recv_task_arg->chunk_info->len,
-        //                   recv_task_arg->recv_info.request_id);
+        // // 主线程返回后通过cudaEventSynchronize(event)等待所有h2d操作完成，确保数据可用
+        // cudaStream_t stream = recv_task_arg->recv_info.device_info.stream;
+        // cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
+        // int event_ret = cudaEventRecord(event, stream);
+        // if (event_ret != 0) {
+        //     OST_LOG_ERROR(
+        //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret, recv_task_arg->recv_info.request_id);
         // }
     }
     return ret;
