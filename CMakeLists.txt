@@ -66,8 +66,16 @@ install(
 
 if(OS_TRANSPORT_BUILD_TESTS)
     # 编译测试程序
-    add_executable(test_thread_pool test/test_thread_pool.c)
-    target_link_libraries(test_thread_pool os_transport pthread)
+    add_executable(test_thread_pool
+        test/test_thread_pool.c
+        src/os_transport_thread_pool.c
+        src/os_transport_log.c
+    )
+    target_include_directories(test_thread_pool
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_thread_pool pthread)
 
     # os_transport.c 白盒单元测试（使用mock隔离外部依赖）
     add_executable(test_os_transport_unit test/test_os_transport_unit.c)

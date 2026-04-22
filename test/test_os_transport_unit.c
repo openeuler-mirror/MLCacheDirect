@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+
+#include "os_transport_log_internal.h"
 
 /*
  * White-box unit tests for src/os_transport.c.
@@ -22,21 +25,24 @@ static void *g_mock_last_submit_task_arg0 = NULL;
 static int g_mock_cancel_ret = 0;
 static uint32_t g_mock_cancel_calls = 0;
 static uint32_t g_mock_cancel_last_request_id = 0;
+static uint32_t g_mock_wake_calls = 0;
+static uint32_t g_mock_wake_last_request_id = 0;
+static os_transport_user_data_t g_mock_wake_last_user_data;
 
-/* URMA write mock controls and observations. */
+/* URMA mock controls and observations. */
 static urma_status_t g_mock_urma_write_status = URMA_SUCCESS;
+static urma_status_t g_mock_urma_recv_status = URMA_SUCCESS;
 static uint32_t g_mock_urma_write_calls = 0;
+static uint32_t g_mock_urma_recv_calls = 0;
 static urma_write_info_t g_mock_last_write_info;
+static urma_recv_info_t g_mock_last_recv_info;
 static struct chunk_info g_mock_last_write_chunk;
+static struct chunk_info g_mock_last_recv_chunk;
 
-/* CUDA memcpy mock controls and observations. */
-static int g_mock_cuda_memcpy_ret = 0;
-static uint32_t g_mock_cuda_memcpy_calls = 0;
-static void *g_mock_cuda_last_dst = NULL;
-static const void *g_mock_cuda_last_src = NULL;
-static size_t g_mock_cuda_last_count = 0;
-static enum cudaMemcpyKind g_mock_cuda_last_kind = cudaMemcpyHostToHost;
-static cudaStream_t g_mock_cuda_last_stream = {0};
+/* Notify callback mock controls and observations. */
+static int g_mock_notify_ret = 0;
+static uint32_t g_mock_notify_calls = 0;
+static os_transport_user_data_t g_mock_last_notify_user_data;
 
 /* Reset all global mock states between tests. */
 static void reset_mocks(void)
@@ -51,19 +57,22 @@ static void reset_mocks(void)
     g_mock_cancel_ret = 0;
     g_mock_cancel_calls = 0;
     g_mock_cancel_last_request_id = 0;
+    g_mock_wake_calls = 0;
+    g_mock_wake_last_request_id = 0;
+    memset(&g_mock_wake_last_user_data, 0, sizeof(g_mock_wake_last_user_data));
 
     g_mock_urma_write_status = URMA_SUCCESS;
+    g_mock_urma_recv_status = URMA_SUCCESS;
     g_mock_urma_write_calls = 0;
+    g_mock_urma_recv_calls = 0;
     memset(&g_mock_last_write_info, 0, sizeof(g_mock_last_write_info));
+    memset(&g_mock_last_recv_info, 0, sizeof(g_mock_last_recv_info));
     memset(&g_mock_last_write_chunk, 0, sizeof(g_mock_last_write_chunk));
+    memset(&g_mock_last_recv_chunk, 0, sizeof(g_mock_last_recv_chunk));
 
-    g_mock_cuda_memcpy_ret = 0;
-    g_mock_cuda_memcpy_calls = 0;
-    g_mock_cuda_last_dst = NULL;
-    g_mock_cuda_last_src = NULL;
-    g_mock_cuda_last_count = 0;
-    g_mock_cuda_last_kind = cudaMemcpyHostToHost;
-    memset(&g_mock_cuda_last_stream, 0, sizeof(g_mock_cuda_last_stream));
+    g_mock_notify_ret = 0;
+    g_mock_notify_calls = 0;
+    memset(&g_mock_last_notify_user_data, 0, sizeof(g_mock_last_notify_user_data));
 }
 
 ThreadPoolHandle thread_pool_init(uint32_t worker_thread_num, uint32_t pending_queue_cap)
@@ -149,6 +158,19 @@ int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id
     return g_mock_cancel_ret;
 }
 
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data)
+{
+    if (!handle) {
+        return -1;
+    }
+    g_mock_wake_calls++;
+    g_mock_wake_last_request_id = request_id;
+    if (user_data) {
+        g_mock_wake_last_user_data = *(os_transport_user_data_t *)user_data;
+    }
+    return 0;
+}
+
 void thread_pool_destroy(ThreadPoolHandle handle)
 {
     g_mock_destroy_calls++;
@@ -165,15 +187,31 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_
     return g_mock_urma_write_status;
 }
 
-int cudaMemcpyAsync(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind, cudaStream_t stream)
+urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_info *chunk_info)
 {
-    g_mock_cuda_memcpy_calls++;
-    g_mock_cuda_last_dst = dst;
-    g_mock_cuda_last_src = src;
-    g_mock_cuda_last_count = count;
-    g_mock_cuda_last_kind = kind;
-    g_mock_cuda_last_stream = stream;
-    return g_mock_cuda_memcpy_ret;
+    g_mock_urma_recv_calls++;
+    g_mock_last_recv_info = recv_info;
+    if (chunk_info) {
+        g_mock_last_recv_chunk = *chunk_info;
+    }
+    return g_mock_urma_recv_status;
+}
+
+void ost_log_write(LogLevel level, const char *file, int line, const char *fmt, ...)
+{
+    (void)level;
+    (void)file;
+    (void)line;
+    (void)fmt;
+}
+
+static int test_notify_cb(void *user_data)
+{
+    g_mock_notify_calls++;
+    if (user_data) {
+        g_mock_last_notify_user_data = *(os_transport_user_data_t *)user_data;
+    }
+    return g_mock_notify_ret;
 }
 
 static int dummy_task_func(void *arg)
@@ -200,8 +238,8 @@ static task_sync_t *create_sync_with_tasks(uint32_t task_num, int request_comple
 /* Build valid arguments for send-path API tests. */
 static void build_valid_send_args(os_transport_handle_t *ost_handle,
                                   urma_jetty_info_t *jetty_info,
-                                  struct buffer_info *local_src,
-                                  struct buffer_info *remote_dst)
+                                  ost_buffer_info_t *local_src,
+                                  ost_buffer_info_t *remote_dst)
 {
     memset(ost_handle, 0, sizeof(*ost_handle));
     memset(jetty_info, 0, sizeof(*jetty_info));
@@ -320,8 +358,8 @@ static void test_update_and_validate_and_build(void)
     struct _ThreadPool pool = {0};
     os_transport_handle_t handle = {0};
     urma_jetty_info_t jetty_info = {0};
-    struct buffer_info local_src = {0};
-    struct buffer_info remote_dst = {0};
+    ost_buffer_info_t local_src = {0};
+    ost_buffer_info_t remote_dst = {0};
     ost_device_info_t device_dst = {0};
     urma_write_info_t write_info;
     task_sync_t *sync_handle = NULL;
@@ -335,7 +373,7 @@ static void test_update_and_validate_and_build(void)
 
     g_inited = 0;
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == -1);
-    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle) == -1);
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == -1);
 
     g_inited = 1;
     assert(validate_send_input(NULL, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == -1);
@@ -345,11 +383,12 @@ static void test_update_and_validate_and_build(void)
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 0, &sync_handle) == -1);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, NULL) == -1);
 
-    assert(validate_recv_input(NULL, &local_src, &device_dst, 1, &sync_handle) == -1);
-    assert(validate_recv_input(&handle, NULL, &device_dst, 1, &sync_handle) == -1);
-    assert(validate_recv_input(&handle, &local_src, NULL, 1, &sync_handle) == -1);
-    assert(validate_recv_input(&handle, &local_src, &device_dst, 0, &sync_handle) == -1);
-    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, NULL) == -1);
+    assert(validate_recv_input(NULL, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == -1);
+    assert(validate_recv_input(&handle, NULL, &device_dst, 1, &sync_handle, test_notify_cb) == -1);
+    assert(validate_recv_input(&handle, &local_src, NULL, 1, &sync_handle, test_notify_cb) == -1);
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 0, &sync_handle, test_notify_cb) == -1);
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, NULL, test_notify_cb) == -1);
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, NULL) == -1);
 
     jetty_info.jfs = (urma_jfs_t *)0x10;
     jetty_info.jetty = (urma_jetty_t *)0x20;
@@ -357,17 +396,21 @@ static void test_update_and_validate_and_build(void)
     local_src.tseg = (urma_target_seg_t *)0x40;
     remote_dst.tseg = (urma_target_seg_t *)0x50;
 
-    write_info = build_write_info(&jetty_info, &local_src, &remote_dst, 123, 456);
+    write_info = build_write_info(&jetty_info, &local_src, &remote_dst, 123, 456, 789);
     assert(write_info.jfs == jetty_info.jfs);
     assert(write_info.jetty == jetty_info.jetty);
     assert(write_info.target_jfr == jetty_info.tjetty);
     assert(write_info.src_tseg == local_src.tseg);
     assert(write_info.dst_tseg == remote_dst.tseg);
     assert(write_info.flag.value == 0);
-    assert(write_info.user_ctx_server == 123);
-    assert(write_info.user_ctx_client == 456);
+    assert(write_info.user_ctx_server.bs.request_id == 456);
+    assert(write_info.user_ctx_server.bs.chunk_type == NOT_SPLIT);
+    assert(write_info.user_ctx_server.bs.chunk_size == 123);
+    assert(write_info.user_ctx_client.bs.request_id == 789);
+    assert(write_info.user_ctx_client.bs.chunk_type == NOT_SPLIT);
+    assert(write_info.user_ctx_client.bs.chunk_size == 123);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == 0);
-    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle) == 0);
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == 0);
 
     g_inited = 0;
 }
@@ -380,9 +423,9 @@ static void test_split_chunk_functions(void)
 {
     struct chunk_info *chunks = NULL;
     uint64_t chunk_num = 0;
-    struct buffer_info local = {0};
-    struct buffer_info remote = {0};
-    struct buffer_info host = {0};
+    ost_buffer_info_t local = {0};
+    ost_buffer_info_t remote = {0};
+    ost_buffer_info_t host = {0};
     ost_device_info_t device = {0};
 
     assert(common_split_chunks(0x1000, 0x2000, DEFAULT_CHUNK_SIZE * 2 + 5, &chunks, &chunk_num) == 0);
@@ -444,39 +487,39 @@ static void test_construct_and_worker_helper_functions(void)
 
     assert(init_task_sync(&sync) == 0);
 
-    write_info.user_ctx_server = 77;
-    write_info.user_ctx_client = 99;
+    write_info.user_ctx_server.bs.request_id = 77;
+    write_info.user_ctx_client.bs.request_id = 99;
     construct_send_task_arg(&send_arg, write_info, &chunk, 5, false, sync);
-    user_server.user_ctx = send_arg.write_info.user_ctx_server;
-    user_client.user_ctx = send_arg.write_info.user_ctx_client;
-    /*
-     * user_ctx_server/client are stored as uint32_t in urma_write_info_t,
-     * so we assert chunk metadata encoding here (stable across platforms).
-     */
+    user_server = send_arg.write_info.user_ctx_server;
+    user_client = send_arg.write_info.user_ctx_client;
     assert(user_server.bs.chunk_type == MIDDLE_CHUNK);
     assert(user_server.bs.chunk_id == 5);
     assert(user_server.bs.chunk_size == 123);
+    assert(user_server.bs.request_id == 77);
     assert(user_client.bs.chunk_type == MIDDLE_CHUNK);
+    assert(user_client.bs.request_id == 99);
 
     construct_send_task_arg(&send_arg, write_info, &chunk, 6, true, sync);
-    user_server.user_ctx = send_arg.write_info.user_ctx_server;
+    user_server = send_arg.write_info.user_ctx_server;
     assert(user_server.bs.chunk_type == LAST_CHUNK);
     assert(user_server.bs.chunk_id == 6);
 
     memset(&recv_arg, 0xAB, sizeof(recv_arg));
     recv_info.request_id = 55;
     recv_info.device_info.dst = (void *)0x12345;
-    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync);
+    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync, test_notify_cb);
     assert(recv_arg.recv_info.request_id == 55);
     assert(recv_arg.chunk_info == &chunk);
     assert(recv_arg.is_last_chunk == true);
     assert(recv_arg.sync == sync);
+    assert(recv_arg.notify_callback == test_notify_cb);
 
-    worker_task = construct_worker_task(100, 200, dummy_task_func, &chunk);
+    worker_task = construct_worker_task(100, 200, dummy_task_func, &chunk, prepare_recv_task_user_data);
     assert(worker_task.task_id == 100);
     assert(worker_task.request_id == 200);
     assert(worker_task.task_func == dummy_task_func);
     assert(worker_task.task_arg == &chunk);
+    assert(worker_task.prepare_cb == prepare_recv_task_user_data);
     assert(worker_task.is_completed == false);
     assert(worker_task.free_task_self == false);
 
@@ -491,29 +534,24 @@ static void test_do_chunk_and_worker_funcs(void)
 {
     task_sync_t *sync_send = NULL;
     task_sync_t *sync_recv = NULL;
+    task_sync_t *sync_recv_fail = NULL;
     struct chunk_info chunk = {.src = 0x1, .dst = 0x2, .len = 8};
     urma_write_info_t write_info = {0};
     urma_recv_info_t recv_info = {0};
     send_task_arg_t send_arg = {0};
     recv_task_arg_t recv_arg = {0};
+    recv_task_arg_t recv_fail_arg = {0};
+    os_transport_user_data_t notify_data = {0};
 
     reset_mocks();
     g_mock_urma_write_status = 7;
     assert(do_send_chunk_for_worker(write_info, &chunk) == 7);
     assert(g_mock_urma_write_calls == 1);
-    recv_info.device_info.stream.i = 9;
-    assert(do_recv_chunk_for_worker(recv_info, &chunk) == 0);
-    assert(g_mock_cuda_memcpy_calls == 1);
-    assert(g_mock_cuda_last_dst == (void *)(uintptr_t)chunk.dst);
-    assert(g_mock_cuda_last_src == (void *)(uintptr_t)chunk.src);
-    assert(g_mock_cuda_last_count == chunk.len);
-    assert(g_mock_cuda_last_kind == cudaMemcpyHostToDevice);
-    assert(g_mock_cuda_last_stream.i == 9);
 
     assert(init_task_sync(&sync_send) == 0);
     sync_send->total_tasks = 1;
-    write_info.user_ctx_server = 1;
-    write_info.user_ctx_client = 2;
+    write_info.user_ctx_server.bs.request_id = 1;
+    write_info.user_ctx_client.bs.request_id = 2;
     construct_send_task_arg(&send_arg, write_info, &chunk, 1, true, sync_send);
     g_mock_urma_write_status = -9;
     assert(send_task_worker_func(&send_arg) == -9);
@@ -522,14 +560,31 @@ static void test_do_chunk_and_worker_funcs(void)
 
     assert(init_task_sync(&sync_recv) == 0);
     sync_recv->total_tasks = 1;
-    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync_recv);
-    g_mock_cuda_memcpy_ret = -3;
-    assert(recv_task_worker_func(&recv_arg) == -3);
-    assert(sync_recv->completed_tasks == 0);
+    recv_info.request_id = 55;
+    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync_recv, test_notify_cb);
+    notify_data.bs.request_id = 55;
+    notify_data.bs.chunk_id = 3;
+    notify_data.bs.chunk_type = LAST_CHUNK;
+    notify_data.bs.chunk_size = 8;
+    prepare_recv_task_user_data(&recv_arg, &notify_data);
+    assert(recv_task_worker_func(&recv_arg) == 0);
+    assert(g_mock_notify_calls == 1);
+    assert(g_mock_last_notify_user_data.user_ctx == notify_data.user_ctx);
+    assert(sync_recv->completed_tasks == 1);
     assert(sync_recv->request_completed == 1);
+
+    assert(init_task_sync(&sync_recv_fail) == 0);
+    sync_recv_fail->total_tasks = 1;
+    construct_recv_task_arg(&recv_fail_arg, recv_info, &chunk, true, sync_recv_fail, test_notify_cb);
+    prepare_recv_task_user_data(&recv_fail_arg, &notify_data);
+    g_mock_notify_ret = -3;
+    assert(recv_task_worker_func(&recv_fail_arg) == -3);
+    assert(sync_recv_fail->completed_tasks == 0);
+    assert(sync_recv_fail->request_completed == 1);
 
     free_sync_owned_resources(sync_send);
     free_sync_owned_resources(sync_recv);
+    free_sync_owned_resources(sync_recv_fail);
 }
 
 /*
@@ -553,7 +608,7 @@ static void test_register_task_functions(void)
     ost_handle.thread_pool = (ThreadPoolHandle)0x1234;
 
     assert(init_task_sync(&sync) == 0);
-    urma_info.write_info.user_ctx_server = 0x55AA;
+    urma_info.write_info.user_ctx_server.bs.request_id = 0x55AA;
     assert(register_send_tasks(&ost_handle, chunks, 1, dummy_task_func, urma_info, sync) == -1);
     free_sync_owned_resources(sync);
 
@@ -581,20 +636,23 @@ static void test_register_task_functions(void)
     assert(init_task_sync(&sync) == 0);
     urma_info.recv_info.request_id = 0x777;
     g_mock_submit_fail = 1;
-    assert(register_recv_tasks(&ost_handle, chunks, 2, dummy_task_func, urma_info, sync) == -1);
+    assert(register_recv_tasks(&ost_handle, chunks, 2, dummy_task_func, urma_info, sync, test_notify_cb) == -1);
     g_mock_submit_fail = 0;
     free_sync_owned_resources(sync);
 
     assert(init_task_sync(&sync) == 0);
-    assert(register_recv_tasks(&ost_handle, chunks, 2, dummy_task_func, urma_info, sync) == 0);
+    assert(register_recv_tasks(&ost_handle, chunks, 2, dummy_task_func, urma_info, sync, test_notify_cb) == 0);
     assert(sync->total_tasks == 2);
     assert(sync->task_group->task_num == 2);
     recv_args = (recv_task_arg_t *)sync->task_group->task_args;
     assert(recv_args[0].chunk_info == &chunks[0]);
     assert(recv_args[0].is_last_chunk == false);
+    assert(recv_args[0].notify_callback == test_notify_cb);
     assert(recv_args[1].chunk_info == &chunks[1]);
     assert(recv_args[1].is_last_chunk == true);
+    assert(recv_args[1].notify_callback == test_notify_cb);
     assert(sync->task_group->tasks[0].request_id == 0x777);
+    assert(sync->task_group->tasks[0].prepare_cb == prepare_recv_task_user_data);
     free_sync_owned_resources(sync);
 }
 
@@ -617,34 +675,37 @@ static void test_construct_and_bind_functions(void)
 
     reset_mocks();
     ost_handle.thread_pool = (ThreadPoolHandle)0x1234;
-    urma_info.write_info.user_ctx_server = 88;
+    urma_info.write_info.user_ctx_server.bs.request_id = 88;
     urma_info.recv_info.request_id = 99;
 
-    assert(construct_and_register_worker_task(NULL, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+    assert(construct_and_register_worker_task(NULL, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, NULL, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+    assert(construct_and_register_worker_task(&ost_handle, NULL, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, NULL)
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, NULL, NULL)
            == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 0, SEND_TASK, dummy_task_func, urma_info, &sync)
-           == (uint32_t)-1);
-
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, NULL_TASK, dummy_task_func, urma_info, &sync)
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 0, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync)
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, NULL_TASK, dummy_task_func, urma_info, &sync, NULL)
+           == (uint32_t)-1);
+
+    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == 0);
     assert(sync != NULL);
     free_sync_owned_resources(sync);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync)
+    assert(construct_and_register_worker_task(
+               &ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync, test_notify_cb)
            == 0);
     assert(sync != NULL);
     free_sync_owned_resources(sync);
 
-    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, NULL)
+    assert(register_tasks_and_bind_chunks(
+               &ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, NULL, test_notify_cb)
            == -1);
-    assert(register_tasks_and_bind_chunks(&ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync)
+    assert(register_tasks_and_bind_chunks(
+               &ost_handle, chunks_recv, 1, RECV_TASK, dummy_task_func, urma_info, &sync, test_notify_cb)
            == 0);
     assert(sync->chunks == chunks_recv);
     sync->chunks = NULL;
@@ -658,8 +719,8 @@ static void test_construct_and_bind_functions(void)
 static void test_send_single_chunk_and_reg_jfc(void)
 {
     urma_jetty_info_t jetty_info = {0};
-    struct buffer_info local_src = {0};
-    struct buffer_info remote_dst = {0};
+    ost_buffer_info_t local_src = {0};
+    ost_buffer_info_t remote_dst = {0};
     struct _ThreadPool pool = {0};
     os_transport_handle_t handle = {0};
 
@@ -710,9 +771,9 @@ static void test_init_destroy_and_send_recv_api(void)
     os_transport_handle_t fake = {0};
     os_transport_handle_t send_handle = {0};
     urma_jetty_info_t jetty_info = {0};
-    struct buffer_info local_src = {0};
-    struct buffer_info remote_dst = {0};
-    struct buffer_info host_src = {0};
+    ost_buffer_info_t local_src = {0};
+    ost_buffer_info_t remote_dst = {0};
+    ost_buffer_info_t host_src = {0};
     ost_device_info_t device_dst = {0};
     task_sync_t *sync = (task_sync_t *)0xDEADBEEF;
 
@@ -722,6 +783,11 @@ static void test_init_destroy_and_send_recv_api(void)
     /* Only ost_cfg and handle are required by current implementation. */
     assert(os_transport_init(NULL, NULL, &handle) == (uint32_t)-1);
     assert(os_transport_init(NULL, &cfg, NULL) == (uint32_t)-1);
+
+    cfg.worker_thread_num = 4;
+    cfg.urma_event_mode = true;
+    cfg.jfce = (urma_jfce_t *)0x111;
+    cfg.jfc = (urma_jfc_t *)0x222;
 
     g_mock_pool_init_fail = 1;
     ret = os_transport_init(NULL, &cfg, &handle);
@@ -733,10 +799,6 @@ static void test_init_destroy_and_send_recv_api(void)
     assert(ret != 0);
     g_mock_pool_start_fail = 0;
 
-    cfg.worker_thread_num = 4;
-    cfg.urma_event_mode = true;
-    cfg.jfce = (urma_jfce_t *)0x111;
-    cfg.jfc = (urma_jfc_t *)0x222;
     assert(os_transport_init(NULL, &cfg, &handle) == 0);
     assert(handle != NULL);
     assert(g_inited == 1);
@@ -804,16 +866,21 @@ static void test_init_destroy_and_send_recv_api(void)
     sync = NULL;
 
     g_inited = 0;
-    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync) == (uint32_t)-1);
+    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
 
     g_inited = 1;
     reset_mocks();
     g_mock_submit_fail = 1;
-    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync) == (uint32_t)-1);
+    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
 
     reset_mocks();
-    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync) == 0);
+    assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == 0);
     assert(sync != NULL);
+    assert(g_mock_urma_recv_calls == 1);
+    assert(g_mock_last_recv_info.request_id == 88);
+    assert(g_mock_last_recv_chunk.src == 0x3300);
+    assert(g_mock_last_recv_chunk.dst == 0x4400);
+    assert(g_mock_last_recv_chunk.len == 64);
     /* API behavior test only: avoid asserting chunk ownership contract here. */
     sync->chunks = NULL;
     free_sync_owned_resources(sync);
@@ -836,6 +903,7 @@ static void test_wait_and_free_sync(void)
     assert(wait_and_free_sync(&handle, NULL) == (uint32_t)-1);
 
     sync = create_sync_with_tasks(1, 1);
+    sync->completed_tasks = 1;
     sync->task_group->tasks[0].is_completed = true;
     sync->task_group->tasks[0].request_id = 101;
     reset_mocks();
