@@ -5,7 +5,7 @@ option(OS_TRANSPORT_BUILD_TESTS "Build OS_TRANSPORT test binaries" OFF)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # 关闭隐式函数声明警告
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-implicit-function-declaration")
+# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-implicit-function-declaration")
 
 # 收集所有源码
 file(GLOB SRC_FILES src/*.c)

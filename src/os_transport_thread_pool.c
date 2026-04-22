@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 
 // #define TEST_MODE  // 由编译选项定义
 
@@ -400,11 +401,19 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
     free(task);
 }
 
+static void set_worker_thread_name(int idx)
+{
+    char name[16] = {0};
+    (void)snprintf(name, sizeof(name), "ost_wkr_%d", idx);
+    (void)prctl(PR_SET_NAME, name, 0, 0, 0);
+}
+
 // worker 线程主函数
 static void *worker_routine(void *arg)
 {
     WorkerThread *worker = (WorkerThread *)arg;
     ThreadPoolHandle pool = worker->pool;
+    set_worker_thread_name(worker->worker_idx);
     OST_LOG_INFO("Worker %d started", worker->worker_idx);
 
     pthread_mutex_lock(&worker->mutex);
@@ -492,10 +501,6 @@ static bool create_worker(ThreadPoolHandle pool, int idx)
         pthread_mutex_unlock(&w->mutex);
         return false;
     }
-
-    char name[16] = {0};
-    (void)snprintf(name, sizeof(name), "ost_wkr_%d", idx);
-    (void)pthread_setname_np(w->tid, name);
 
     while (w->state == WORKER_STATE_INIT) {
         pthread_cond_wait(&w->cond_task, &w->mutex);
