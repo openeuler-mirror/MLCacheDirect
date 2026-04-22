@@ -1,4 +1,5 @@
 #include "os_transport_internal.h"
+#include "os_transport_log_internal.h"
 #include "os_transport_thread_pool_internal.h"
 #include <pthread.h>
 #include <stdio.h>
