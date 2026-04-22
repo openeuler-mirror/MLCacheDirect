@@ -136,29 +136,6 @@ int os_transport_log_reg(int level, log_callback_t cb)
     return 0;
 }
 
-static const char *ost_log_relative_path(const char *file)
-{
-    const char *markers[] = {"/src/", "/include/", "/test/"};
-    size_t idx;
-
-    if (file == NULL || file[0] == '\0') {
-        return "<unknown>";
-    }
-
-    if (file[0] != '/') {
-        return file;
-    }
-
-    for (idx = 0; idx < sizeof(markers) / sizeof(markers[0]); ++idx) {
-        const char *match = strstr(file, markers[idx]);
-        if (match != NULL) {
-            return match + 1;
-        }
-    }
-
-    return strrchr(file, '/') != NULL ? strrchr(file, '/') + 1 : file;
-}
-
 static size_t ost_log_format_callback_line(char *buf, size_t buf_size, const char *file, int line, const char *message)
 {
     int written;
@@ -167,7 +144,7 @@ static size_t ost_log_format_callback_line(char *buf, size_t buf_size, const cha
         return 0;
     }
 
-    written = snprintf(buf, buf_size, "%s:%d %s\n", ost_log_relative_path(file), line, message);
+    written = snprintf(buf, buf_size, "%s:%d %s\n", file != NULL ? file : "<unknown>", line, message);
     if (written < 0) {
         buf[0] = '\0';
         return 0;
