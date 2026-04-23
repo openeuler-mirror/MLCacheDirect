@@ -286,28 +286,44 @@ static uint32_t worker_pending_req_remove_by_req(WorkerThread *worker, uint32_t 
     return removed;
 }
 
-// 查找最佳 worker：优先空闲，否则选队列最短
+// 查找最佳 worker：按综合负载选择最轻的 worker
 static WorkerThread *select_best_worker(ThreadPoolHandle pool)
 {
     WorkerThread *best = NULL;
-    uint32_t min_load = UINT32_MAX;
+    uint32_t best_load = UINT32_MAX;
+    uint32_t best_busy_bias = UINT32_MAX;
+
     for (uint32_t i = 0; i < pool->worker_count; i++) {
         WorkerThread *w = &pool->workers[i];
+        uint32_t load;
+        uint32_t busy_bias;
+
         pthread_mutex_lock(&w->mutex);
-        uint32_t load = w->queue_size;
-        if (w->state == WORKER_STATE_IDLE && load == 0) {
+
+        // queue_size 表示该 worker 尚未消费的任务数；
+        // pending_req_count 表示 completion 已到达、即将真正执行的 request 数。
+        // 在高并发下，这两部分都代表这个 worker 的未来负载。
+        load = w->queue_size + w->pending_req_count;
+        busy_bias = (w->state == WORKER_STATE_BUSY) ? 1U : 0U;
+
+        // 负载为 0 且当前不在执行任务，说明这是当前最理想的 worker，直接返回。
+        if (load == 0 && busy_bias == 0) {
             best = w;
             pthread_mutex_unlock(&w->mutex);
             break;
         }
-        if (w->state == WORKER_STATE_BUSY) {
-            if (load < min_load) {
-                min_load = load;
-                best = w;
-            }
+
+        // 优先选择综合负载更小的 worker；
+        // 负载相同时，优先选择当前不是 BUSY 的 worker，减少把新请求继续压到正在执行的线程上。
+        if (!best || load < best_load || (load == best_load && busy_bias < best_busy_bias)) {
+            best = w;
+            best_load = load;
+            best_busy_bias = busy_bias;
         }
+
         pthread_mutex_unlock(&w->mutex);
     }
+
     return best;
 }
 
