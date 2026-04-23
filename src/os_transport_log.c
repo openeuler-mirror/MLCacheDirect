@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -61,13 +63,6 @@ static inline OstLogState *ost_log_state(void)
     return &state;
 }
 
-static inline int *ost_log_syslog_probe_override(void)
-{
-    static int override_available = -1;
-
-    return &override_available;
-}
-
 static inline const char *ost_log_level_name(LogLevel level)
 {
     switch (level) {
@@ -119,6 +114,31 @@ static inline bool ost_log_path_exists(const char *path)
 
     return stat(path, &st) == 0;
 }
+
+#ifdef OST_LOG_ENABLE_TEST_HOOKS
+static inline int *ost_log_syslog_probe_override(void)
+{
+    static int override_available = -1;
+
+    return &override_available;
+}
+
+static inline void ost_log_close_locked(OstLogState *state)
+{
+    if (state->fd >= 0) {
+        close(state->fd);
+        state->fd = -1;
+    }
+
+    if (state->syslog_opened) {
+        closelog();
+        state->syslog_opened = false;
+    }
+
+    state->backend = OST_LOG_BACKEND_UNINITIALIZED;
+    state->initialized = false;
+}
+#endif
 
 static inline bool ost_log_syslog_available_probe(void)
 {
@@ -174,22 +194,6 @@ static inline int ost_log_open_socket_fd(const char *path)
     return fd;
 }
 
-static inline void ost_log_close_locked(OstLogState *state)
-{
-    if (state->fd >= 0) {
-        close(state->fd);
-        state->fd = -1;
-    }
-
-    if (state->syslog_opened) {
-        closelog();
-        state->syslog_opened = false;
-    }
-
-    state->backend = OST_LOG_BACKEND_UNINITIALIZED;
-    state->initialized = false;
-}
-
 static void ost_log_init_locked(OstLogState *state)
 {
     const char *socket_path = getenv(OST_LOG_SOCKET_ENV);
@@ -237,6 +241,10 @@ static void ost_log_init_locked(OstLogState *state)
 
 int os_transport_log_reg(int level, log_callback_t cb)
 {
+    if (!cb) {
+        return -1;
+    }
+
     OstLogState *state = ost_log_state();
 
     pthread_mutex_lock(&state->mutex);

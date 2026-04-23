@@ -9,6 +9,8 @@
 // 全局初始化状态
 static int g_inited = 0;
 
+#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 6) - 1)
+
 static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, size_t task_arg_size)
 {
     task_group_t *task_group = NULL;
@@ -238,9 +240,9 @@ static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
                                           uint32_t client_key)
 {
     os_transport_user_data_t server_user_data = {
-        .bs.request_id = server_key, .bs.chunk_type = NOT_SPLIT, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = server_key, .bs.chunk_type = LAST_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
     os_transport_user_data_t client_user_data = {
-        .bs.request_id = client_key, .bs.chunk_type = NOT_SPLIT, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = client_key, .bs.chunk_type = LAST_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
     urma_write_info_t write_info = {.jfs = jetty_info->jfs,
                                     .jetty = jetty_info->jetty,
                                     .target_jfr = jetty_info->tjetty,
@@ -338,6 +340,11 @@ static void construct_send_task_arg(send_task_arg_t *arg,
 
     user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
     user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
+    if (chunk_id == OS_TRANSPORT_MAX_CHUNK_ID) {
+        OST_LOG_WARN("chunk_id=%lu exceeds user data bitfield range (max=%lu), value will be truncated.",
+                     (unsigned long)chunk_id,
+                     (unsigned long)OS_TRANSPORT_MAX_CHUNK_ID);
+    }
     user_data_server.bs.chunk_id = chunk_id;
     user_data_server.bs.chunk_size = chunk_info->len;
 
@@ -434,10 +441,7 @@ static int send_task_worker_func(void *arg)
 
     ret = do_send_chunk_for_worker(send_task_arg->write_info, send_task_arg->chunk_info);
     if (ret != 0) {
-        OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).",
-                     request_id,
-                     chunk_id,
-                     chunk_len);
+        OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).", request_id, chunk_id, chunk_len);
     }
     mark_task_group_completed(sync, ret == 0 ? true : false);
     return ret;
@@ -488,7 +492,8 @@ static int recv_task_worker_func(void *arg)
         // int event_ret = cudaEventRecord(event, stream);
         // if (event_ret != 0) {
         //     OST_LOG_ERROR(
-        //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret, recv_task_arg->recv_info.request_id);
+        //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret,
+        //         recv_task_arg->recv_info.request_id);
         // }
     }
     mark_task_group_completed(sync, ret == 0 ? true : false);
@@ -786,6 +791,8 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     if (!ost_handle->thread_pool) {
         if (ost_cfg->worker_thread_num == 0) {
             OST_LOG_WARN("os_transport initialized without worker threads because worker_thread_num is 0.");
+            g_inited = 0;
+            free(ost_handle);
             return 0;
         }
         OST_LOG_ERROR("Failed: thread_pool_init returned NULL "
