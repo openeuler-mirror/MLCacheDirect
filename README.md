@@ -1,27 +1,19 @@
-# MLCacheDirect 仓库说明
+# MLCacheDirect README
 
-## 1. 仓库简介
+## 1. 项目简介
 
-`MLCacheDirect` 是一个基于 **URMA + CUDA Runtime** 的 C 语言传输库，核心目标是把远端主机上的数据通过流水线方式分片搬运到本端 Host，再从本端 Host 继续搬运到 GPU。
-
-当前仓库的核心产物是：
+`MLCacheDirect` 是一个基于 **异步流水分片传输库** ，当前核心产物是：
 
 - 动态库：`libos_transport.so`
 - 对外头文件：`include/os_transport.h`
 
-这个仓库当前已经同时支持：
+它的主要职责是：
 
-- **CMake 构建**
-- **Bazel 构建**
-- **RPM 打包**
-
-从当前代码实现来看，库的主要职责包括：
-
-1. 基于 URMA 发起 Host 到 Host 的 write with notify。
-2. 按固定 chunk 大小对大块数据进行分片。
-3. 基于线程池按 `request_id` 组织任务执行。
-4. 在本端收到通知后触发下一阶段任务推进。
-5. 在本端把 Host 数据继续搬运到 GPU。
+1. 把一次大数据传输按固定大小切分为多个 chunk。
+2. 通过 URMA 提交 `write with notify` 或 `recv` 请求。
+3. 用线程池按 `request_id` 组织同一批 chunk 的后续处理。
+4. 在收到 completion 后，唤醒对应 worker 推进同一请求的后续任务。
+5. 为调用方提供一套“提交请求 -> 等待整批完成 -> 失败时取消剩余任务”的同步语义。
 
 ---
 
@@ -45,111 +37,272 @@
 │   └── os-transport.spec
 ├── src/
 │   ├── os_transport.c
+│   ├── os_transport_log.c
 │   ├── os_transport_thread_pool.c
 │   └── os_transport_urma.c
 ├── test/
-│   ├── os_transport_sample.c
 │   ├── test_os_transport_unit.c
-│   ├── test_thread_pool.c
-│   └── urma_sample.c
-└── third_party/
-    ├── BUILD.bazel
-    ├── BUILD.cuda
-    └── BUILD.urma
+│   └── test_thread_pool.c
+├── third_party/
+│   ├── BUILD.bazel
+│   └── BUILD.urma
+└── tools/
+    └── datasystem_test/
+        ├── CMakeLists.txt
+        ├── pipeline_h2d.cpp
+        └── README.md
+```
+
+说明：
+
+- 根目录下的库代码 **不依赖 CUDA runtime**。
+- `tools/datasystem_test/pipeline_h2d.cpp` 是上层联调用例，里面仍然会使用 `cudaMalloc/cudaMemcpy`，用于验证“上层自己完成 H2D”的新模式。
+
+---
+
+## 3. 架构与职责边界
+
+### 3.1 当前库负责什么
+
+当前 `MLCacheDirect` 库负责：
+
+- chunk 切分
+- URMA 请求投递
+- completion 事件解包
+- 根据 `request_id` 唤醒线程池 worker
+- 在 worker 中执行 send 侧的下一片发送任务
+- 在 worker 中执行 recv 侧的上层回调 `notify_callback`
+- 请求级同步与资源回收
+
+### 3.2 当前库不再负责什么
+
+当前库**不再直接负责**：
+
+- `cudaSetDevice`
+- `cudaMalloc`
+- `cudaMemcpy`
+- `cudaEventRecord`
+- CUDA stream / event 生命周期管理
+
+这些动作现在应该由上层完成，例如：
+
+- SDK
+- datasystem client
+- 业务自己的 GPU 数据搬运模块
+
+---
+
+## 4. 核心数据结构
+
+### 4.1 `os_transport_user_data_t`
+
+定义在 `include/os_transport.h`：
+
+```c
+typedef union {
+    struct {
+        uint64_t chunk_type : 2;
+        uint64_t chunk_id : 6;
+        uint64_t chunk_size : 24;
+        uint64_t request_id : 32;
+    } bs;
+    uint64_t user_ctx;
+} os_transport_user_data_t;
+```
+
+这是库中最关键的 completion 上下文，编码了：
+
+- `request_id`：整批请求的唯一标识
+- `chunk_id`：当前是第几个 chunk
+- `chunk_size`：当前 chunk 的字节数
+- `chunk_type`：当前 chunk 的类型
+  - `NOT_SPLIT`
+  - `MIDDLE_CHUNK`
+  - `LAST_CHUNK`
+
+在 send 路径里，这份信息会被塞进 URMA 的 `notify_data` / `user_ctx`。  
+在 recv 路径里，`os_transport_wake_up_task()` 会从 completion 中把它解析出来，再透传给上层回调。
+
+### 4.2 `ost_buffer_info_t`
+
+```c
+typedef struct {
+    uint64_t addr;
+    urma_target_seg_t *tseg;
+} ost_buffer_info_t;
+```
+
+表示一段 Host 侧缓冲区：
+
+- `addr`：缓冲区地址
+- `tseg`：URMA 目标段信息
+
+### 4.3 `ost_device_info_t`
+
+```c
+typedef struct {
+    urma_jfr_t *jfr;
+    void *dst;
+} ost_device_info_t;
+```
+
+虽然结构体名还叫 `device_info`，但就当前代码来说，它只为 recv 路径提供：
+
+- `jfr`：用于提交 URMA recv 的接收端资源
+- `dst`：目标地址
+
+注意：当前库里**不会直接对 `dst` 做 `cudaMemcpy`**。  
+它只是参与 chunk 地址计算，并在后续回调链路里让上层知道“这批数据是发往哪个目标地址逻辑范围的”。
+
+### 4.4 `notify_callback_t`
+
+```c
+typedef int (*notify_callback_t)(void *user_data);
+```
+
+这是当前 recv 路径的关键扩展点。
+
+回调参数 `user_data` 实际上指向的是一份 `os_transport_user_data_t` 副本，副本内容由 `os_transport_wake_up_task()` 解析 completion 后，在 worker 执行前填充。
+
+也就是说，上层在 `notify_callback` 里可以拿到：
+
+- `request_id`
+- `chunk_id`
+- `chunk_size`
+- `chunk_type`
+
+然后自行决定后续动作，例如：
+
+- 查到对应 chunk 的 host buffer / device ptr
+- 触发 `cudaMemcpyAsync`
+- 做最后一个 chunk 的收尾通知
+
+---
+
+## 5. 代码模块说明
+
+### 5.1 `src/os_transport.c`
+
+这是库的主入口文件，主要负责：
+
+- 对外 API 实现
+- 参数校验
+- 分片
+- 构造任务组
+- 注册到线程池
+- completion 后的 worker 执行逻辑
+- 等待请求完成并释放资源
+
+其中最关键的两类 worker 任务是：
+
+#### send worker
+
+`send_task_worker_func()` 负责调用：
+
+- `urma_write_with_notify()`
+
+把后续 chunk 继续发出去。
+
+#### recv worker
+
+`recv_task_worker_func()` 当前**不做 CUDA 拷贝**，而是：
+
+1. 从 `recv_task_arg->notify_user_data` 取出 completion 元数据；
+2. 调用上层注册的 `notify_callback(&recv_task_arg->notify_user_data)`；
+3. 根据回调返回值决定当前 chunk 是否成功；
+4. 更新整批任务的完成计数。
+
+这正是“把 `cudaMemcpy` 移出去”后的核心落点。
+
+### 5.2 `src/os_transport_thread_pool.c`
+
+这是线程池实现，负责：
+
+- worker 创建与销毁
+- 任务队列管理
+- pending request 队列管理
+- `request_id -> worker` 绑定
+- 收到 completion 后按 `request_id` 唤醒 worker
+- 批量任务提交
+- 按请求取消未执行任务
+
+当前设计的关键点：
+
+1. **同一个 `request_id` 的任务会绑定到同一个 worker。**
+2. **worker 真正执行任务的时机由 completion 唤醒推进。**
+3. **整批任务共享同一个 `task_sync_t`，主线程可以统一等待。**
+
+### 5.3 `src/os_transport_urma.c`
+
+负责 URMA 封装：
+
+- `urma_write_with_notify()`
+- `urma_recv_with_notify()`
+
+send 路径通过 `URMA_OPC_WRITE_IMM` 发送，并携带 `notify_data` / `user_ctx`。  
+recv 路径负责向 `jfr` 投递 recv work request。
+
+### 5.4 `src/os_transport_log.c`
+
+负责日志注册与日志输出。
+
+对外接口：
+
+```c
+int os_transport_log_reg(int level, log_callback_t cb);
 ```
 
 ---
 
-## 3. 核心模块说明
+## 6. 分片机制
 
-### 3.1 `src/os_transport.c`
-
-这是主入口实现文件，负责：
-
-- 对外 API 的实现
-- send/recv 参数校验
-- 大块数据分片
-- 构造线程池任务
-- 等待整批任务完成
-- 失败时按 `request_id` 取消剩余任务
-
-当前对外暴露的主要接口定义在 `include/os_transport.h` 中：
-
-- `os_transport_init()`：初始化传输句柄和线程池
-- `os_transport_reg_jfc()`：注册 JFC/JFCE 信息
-- `os_transport_send()`：远端 Host -> 本端 Host 的发送入口
-- `os_transport_recv()`：本端 Host -> GPU 的接收入口
-- `os_transport_wake_up_task()`：收到通知后按 `request_id` 唤醒对应任务
-- `wait_and_free_sync()`：等待一批任务全部结束并释放同步资源
-- `os_transport_destroy()`：销毁库句柄和线程池
-
-### 3.2 `src/os_transport_thread_pool.c`
-
-这是线程池模块，负责：
-
-- worker 创建与启动
-- request 级别的任务归属
-- 按 `request_id` 将任务绑定到固定 worker
-- 收到通知后唤醒指定 request 的 worker
-- 批量提交任务
-- 取消指定 `request_id` 对应的未执行任务
-
-当前实现里有几个很关键的设计点：
-
-1. **同一批分片任务共享同一个 `request_id`**。
-2. 同一个 `request_id` 会绑定到同一个 worker。
-3. 收到 URMA 通知后，通过 `thread_pool_wake_up_worker_by_req_id()` 推进该请求的下一片任务。
-4. 可以通过 `thread_pool_cancel_tasks_by_req()` 只清理某个请求的剩余任务，不影响其他请求。
-
-### 3.3 `src/os_transport_urma.c`
-
-这个文件负责与 URMA 相关的底层封装，当前主要用于 write with notify 以及相关数据结构处理。
-
----
-
-## 4. 分片与流水线机制
-
-当前实现中，默认 chunk 大小为：
+默认 chunk 大小定义在 `include/os_transport.h`：
 
 ```c
 #define DEFAULT_CHUNK_SIZE (2 * 1024 * 1024)
 ```
 
-也就是 **2MB**。
+即默认 **2MB**。
 
-### 4.1 分片规则
+### 6.1 send / recv 的共同分片规则
 
-当 `os_transport_send()` 或 `os_transport_recv()` 的数据长度：
+- 当 `len <= DEFAULT_CHUNK_SIZE` 时，按单 chunk 处理。
+- 当 `len > DEFAULT_CHUNK_SIZE` 时，拆成多个 chunk。
+- 每个 chunk 都会有自己的 `chunk_id`、`chunk_size` 和 `chunk_type`。
 
-- 小于等于 `DEFAULT_CHUNK_SIZE`：直接按单片处理
-- 大于 `DEFAULT_CHUNK_SIZE`：拆成多个 chunk，每个 chunk 最多 2MB
+### 6.2 send 路径分片特点
 
-### 4.2 分片上下文
+大于 2MB 时：
 
-`os_transport_user_data_t` 里封装了当前任务的重要上下文：
+1. 主线程先把整批 send task 注册到线程池；
+2. 立即手动发送第一个 chunk；
+3. 后续 chunk 由 completion 驱动 worker 逐个继续发送；
+4. 调用方通过 `wait_and_free_sync()` 等待整批完成。
 
-- `chunk_type`
-- `chunk_id`
-- `chunk_size`
-- `request_id`
+### 6.3 recv 路径分片特点
 
-其中 `request_id` 是整个请求分片链路的关键标识。
+大于 2MB 时：
 
-### 4.3 当前流水线语义
+1. 主线程先切出所有 chunk；
+2. 为每个 chunk 注册一个 recv task；
+3. 调用 `urma_recv_with_notify()` 为每个 chunk 投递 recv 请求；
+4. completion 到来后，线程池按 `request_id` 唤醒对应 worker；
+5. worker 调用上层 `notify_callback`；
+6. 调用方通过 `wait_and_free_sync()` 等待整批完成。
 
-结合当前代码和现有调用方式，可以把链路理解为：
+这里要特别注意：
 
-1. 远端先发送第一个分片到本端 Host。
-2. 第一个分片写入完成后，远端和本端都会收到通知。
-3. 远端收到通知后，继续推进下一个分片写入。
-4. 本端收到通知后，开始把当前 Host 分片搬运到 GPU。
-5. 周而复始，直到同一个 `request_id` 对应的所有分片全部完成。
+> recv 路径的“完成”语义，当前指的是：
+> - URMA completion 已到达；
+> - 对应的 `notify_callback` 已执行完成并返回。
+>
+> 它**不自动等价于**“GPU 数据已经就绪”，除非你的 `notify_callback` 自己实现了这部分保证。
 
 ---
 
-## 5. 对外接口说明
+## 7. 对外接口说明
 
-### 5.1 初始化
+### 7.1 初始化
 
 ```c
 uint32_t os_transport_init(urma_context_t *urma_ctx,
@@ -159,31 +312,34 @@ uint32_t os_transport_init(urma_context_t *urma_ctx,
 
 作用：
 
-- 初始化全局句柄
-- 保存 URMA 上下文
-- 初始化线程池
-- 启动 worker 线程
+- 初始化 `os_transport_handle_t`
+- 保存 URMA 上下文和配置
+- 创建线程池
+- 注册 JFC/JFCE
+- 启动线程池
 
 关键配置项：
 
-- `urma_event_mode`
-- `worker_thread_num`
-- `jfce`
-- `jfc`
-
-### 5.2 注册 JFC
-
 ```c
-uint32_t os_transport_reg_jfc(urma_jfce_t *jfce,
-                              urma_jfc_t *jfc,
-                              void *handle);
+typedef struct os_transport_cfg {
+    bool urma_event_mode;
+    uint8_t reserved1[3];
+    uint32_t worker_thread_num;
+    urma_jfce_t *jfce;
+    urma_jfc_t *jfc;
+    uint32_t reserved2[10];
+} os_transport_cfg_t;
 ```
 
-作用：
+### 7.2 注册日志
 
-- 更新库内部用于 poll/事件处理的 JFC/JFCE 信息。
+```c
+int os_transport_log_reg(int level, log_callback_t cb);
+```
 
-### 5.3 发送
+用于注册日志回调。
+
+### 7.3 send 接口
 
 ```c
 uint32_t os_transport_send(void *handle,
@@ -198,12 +354,18 @@ uint32_t os_transport_send(void *handle,
 
 作用：
 
-- 将本端 Host 缓冲区数据按 chunk 切分
-- 构造 URMA write with notify 任务
-- 将任务批量提交到线程池
-- 返回 `task_sync_t` 用于后续等待整批完成
+- 切分 Host -> Host 发送数据
+- 生成异步 send task
+- 首片立即发送
+- 后续分片由 notify 驱动 worker 继续发送
+- 返回 `task_sync_t` 供调用方等待整批完成
 
-### 5.4 接收
+说明：
+
+- `client_key` 最终会作为 `request_id` 写入 completion 透传字段。
+- `server_key` 会用于另一侧 completion/上下文区分。
+
+### 7.4 recv 接口
 
 ```c
 uint32_t os_transport_recv(void *handle,
@@ -211,17 +373,24 @@ uint32_t os_transport_recv(void *handle,
                            ost_device_info_t *device_dst,
                            uint32_t len,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle);
+                           task_sync_t **ret_sync_handle,
+                           notify_callback_t notify_callback);
 ```
 
 作用：
 
-- 将本端 Host 上的数据按 chunk 切分
-- 构造 Host -> GPU 的搬运任务
-- 批量提交到线程池
-- 返回同步句柄
+- 切分接收数据范围
+- 为每个 chunk 注册 recv task
+- 向 URMA 的 `jfr` 投递 recv 请求
+- completion 到来后回调上层 `notify_callback`
+- 返回 `task_sync_t` 给调用方等待整批完成
 
-### 5.5 通知唤醒
+这个接口和旧版最大的不同是：
+
+> `notify_callback` 现在是 **必填**。  
+> 库自身不再在 recv worker 中做 `cudaMemcpy`，而是把“收到 completion 之后怎么处理这片数据”的决定权交给上层。
+
+### 7.5 completion 唤醒接口
 
 ```c
 int os_transport_wake_up_task(void *handle, void *cr_t);
@@ -229,11 +398,12 @@ int os_transport_wake_up_task(void *handle, void *cr_t);
 
 作用：
 
-- 从完成事件里解析 `request_id`
-- 调用线程池按 `request_id` 唤醒对应 worker
-- 推进下一片任务执行
+- 从 URMA completion 中解析 `user_data`
+- 获取 `request_id`
+- 通知线程池唤醒对应 worker
+- 把本次 completion 的 `user_data` 作为透传信息传给后续 recv worker
 
-### 5.6 等待全部完成
+### 7.6 等待并释放同步资源
 
 ```c
 uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
@@ -241,11 +411,21 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
 
 作用：
 
-- 等待当前请求整批任务完成
-- 如果中途有任务失败，会提前结束等待
-- 释放本次请求关联的同步和任务组资源
+- 等待当前请求整批任务结束
+- 如果中途检测到任务未完整完成，则按 `request_id` 取消剩余任务
+- 释放同步对象、chunk 数组和任务组资源
 
-### 5.7 销毁
+### 7.7 取消指定请求的任务
+
+```c
+uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id);
+```
+
+作用：
+
+- 取消该 `request_id` 对应的未执行任务
+
+### 7.8 销毁句柄
 
 ```c
 uint32_t os_transport_destroy(void *handle);
@@ -254,307 +434,292 @@ uint32_t os_transport_destroy(void *handle);
 作用：
 
 - 销毁线程池
-- 释放库句柄
-- 清理内部资源
+- 释放内部资源
 
 ---
 
-## 6. 线程池与 request_id 机制
+## 8. 典型时序
 
-当前线程池 API 定义在 `include/os_transport_thread_pool.h`，其设计重点是：
+### 8.1 send 路径时序
 
-- **任务调度不是纯 FIFO**
-- 而是以 **`request_id` 为主线** 组织执行
+```text
+调用方
+  -> os_transport_send()
+      -> 切 chunk
+      -> 注册后续 task 到线程池
+      -> 立即发送第一个 chunk
 
-### 6.1 request 绑定 worker
+远端/本端产生 completion
+  -> os_transport_wake_up_task()
+      -> 按 request_id 唤醒 worker
+          -> worker 执行下一片 send task
+              -> urma_write_with_notify()
 
-同一个 `request_id` 的任务会绑定到同一个 worker，保证：
-
-- 同一请求的分片顺序推进
-- 收到 notify 后能精确唤醒目标 worker
-
-### 6.2 批量任务提交
-
-批量提交接口：
-
-```c
-uint64_t *thread_pool_submit_batch_tasks(...)
+调用方
+  -> wait_and_free_sync()
+      -> 等整批发送完成
 ```
 
-要求一批任务中的 `request_id` 一致，否则会返回错误。
+### 8.2 recv 路径时序
 
-### 6.3 取消任务
+```text
+调用方
+  -> os_transport_recv(..., notify_callback)
+      -> 切 chunk
+      -> 注册 recv task
+      -> 为每个 chunk 投递 urma_recv_with_notify()
 
-取消接口：
+URMA completion 到来
+  -> os_transport_wake_up_task()
+      -> 解析 request_id/chunk_id/chunk_size/chunk_type
+      -> 按 request_id 唤醒 worker
+          -> worker 执行 recv task
+              -> notify_callback(&os_transport_user_data_t_copy)
 
-```c
-int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id);
+上层 notify_callback
+  -> 根据 chunk_id / chunk_size 查找业务上下文
+  -> 视需要执行 cudaMemcpy / cudaMemcpyAsync / 其他处理
+
+调用方
+  -> wait_and_free_sync()
+      -> 等整批 recv task 完成
 ```
-
-语义是：
-
-- 只删除某个 `request_id` 对应的**未执行任务**
-- 不会影响其他请求的任务
-
-这个能力对于超时清理和失败回滚很重要。
 
 ---
 
-## 7. 构建方式
+## 9. 如何在上层实现新的 H2D 模式
 
-当前仓库同时支持 CMake 和 Bazel。
+因为 `cudaMemcpy` 已经从库内移出，推荐上层把真正的 H2D 逻辑写进 `notify_callback` 或其后续调度流程中。
 
-### 7.1 CMake 构建
+一个最简伪代码如下：
 
-直接执行：
+```c
+static int my_notify_callback(void *user_data)
+{
+    os_transport_user_data_t *ud = (os_transport_user_data_t *)user_data;
+    if (!ud) {
+        return -1;
+    }
+
+    uint32_t request_id = ud->bs.request_id;
+    uint32_t chunk_id = ud->bs.chunk_id;
+    uint32_t chunk_size = ud->bs.chunk_size;
+    uint32_t chunk_type = ud->bs.chunk_type;
+
+    // 1. 根据 request_id 找到这次请求在上层保存的上下文
+    // 2. 根据 chunk_id 找到对应 host 地址和 device 地址
+    // 3. 执行 cudaMemcpyAsync(...) 或其他处理
+    // 4. 如有需要，在 LAST_CHUNK 时做额外收尾
+
+    (void)chunk_size;
+    (void)chunk_type;
+    return 0;
+}
+```
+
+建议上层自己维护一份“请求上下文表”，至少包含：
+
+- `request_id`
+- 原始 host base address
+- 原始 device base address
+- 每个 chunk 的偏移
+- stream / event
+- 是否最后一片
+- 是否需要聚合完成通知
+
+这样 `notify_callback` 才能真正把 completion 元数据映射成实际的 GPU 拷贝动作。
+
+---
+
+## 10. 构建说明
+
+### 10.1 CMake 构建
+
+项目根目录提供 `build.sh`：
 
 ```bash
+chmod +x build.sh
 ./build.sh
 ```
 
-脚本会自动完成：
-
-1. 架构识别（`x86_64` / `aarch64`）
-2. 清理旧产物
-3. CMake 配置
-4. `make` 编译
-5. 临时安装布局生成
-6. RPM 打包
-
-输出目录主要是：
-
-- `build-<arch>/`
-- `output/`
-
-### 7.2 Bazel 构建
-
-直接执行：
+仅运行单元测试：
 
 ```bash
-./build_bazel.sh
+./build.sh -t
 ```
 
-脚本支持：
+当前 `build.sh` 特点：
 
-- `-c / --clean`：清理
-- `-t / --test`：编译并运行测试
-- `-d / --debug`：debug 构建
-- `-r / --rpm`：构建 RPM
+- 自动识别 `x86_64/aarch64`
+- 构建目录为 `build-<arch>`
+- 默认会清理旧的 CMake/Bazel 构建产物
+- 默认会生成 RPM
 
-例如：
+依赖：
 
-```bash
-./build_bazel.sh
-./build_bazel.sh -t
-./build_bazel.sh -d
-```
-
-### 7.3 直接使用 Bazel target
-
-当前 `BUILD.bazel` 中主要 target：
-
-- `//:os_transport_hdrs`
-- `//:os_transport_prefixed_hdrs`
-- `//:os_transport_lib`
-- `//:libos_transport.so`
-- `//:test_thread_pool`
-- `//:test_os_transport_unit`
-
-如果直接用 Bazel，可执行：
-
-```bash
-bazel build //:libos_transport.so
-bazel test //:test_thread_pool //:test_os_transport_unit
-```
-
----
-
-## 8. 头文件导出方式
-
-当前 `BUILD.bazel` 同时导出了两种头文件引用形式：
-
-### 8.1 普通导出
-
-```bazel
-cc_library(
-    name = "os_transport_hdrs",
-    hdrs = glob(["include/*.h"]),
-    includes = ["include"],
-)
-```
-
-对应包含方式：
-
-```c
-#include "os_transport.h"
-```
-
-### 8.2 带前缀导出
-
-```bazel
-cc_library(
-    name = "os_transport_prefixed_hdrs",
-    hdrs = glob(["include/*.h"]),
-    strip_include_prefix = "include",
-    include_prefix = "os-transport",
-)
-```
-
-对应包含方式：
-
-```c
-#include "os-transport/os_transport.h"
-```
-
-这个设计是为了方便在外部仓库中按更稳定的 include 前缀引用该头文件。
-
----
-
-## 9. 外部依赖
-
-当前仓库依赖：
-
-- `pthread`
-- `URMA`
-- `CUDA Runtime`
-
-### 9.1 CMake 侧
-
-`CMakeLists.txt` 会自动查找：
-
+- `cmake`
+- `gcc`
+- `make`
+- `rpmbuild`（打包时）
 - `liburma.so`
-- `libcudart.so`
 
-默认搜索路径包括：
+### 10.2 Bazel 构建
 
-- `/usr/lib64`
-- `/usr/local/lib`
-- `/usr/local/cuda/lib64`
-- `/opt/urma/lib64`
-
-### 9.2 Bazel 侧
-
-`BUILD.bazel` 通过：
-
-- `@local_cuda//:cuda`
-- `@local_urma//:urma`
-
-接入系统上的 CUDA/URMA。
-
-对应规则定义在：
-
-- `third_party/BUILD.cuda`
-- `third_party/BUILD.urma`
-
-通常需要在主工程的 `WORKSPACE` 中通过 `new_local_repository(...)` 实例化。
-
----
-
-## 10. 测试与示例
-
-当前仓库测试/示例文件包括：
-
-- `test/test_thread_pool.c`：线程池功能测试
-- `test/test_os_transport_unit.c`：`os_transport.c` 白盒单元测试
-- `test/os_transport_sample.c`：基础示例
-- `test/urma_sample.c`：URMA 相关示例
-
-Bazel 测试：
+项目根目录提供 `build_bazel.sh`：
 
 ```bash
-bazel test //:test_thread_pool //:test_os_transport_unit
+chmod +x build_bazel.sh
+./build_bazel.sh
 ```
 
-脚本测试：
+运行测试：
 
 ```bash
 ./build_bazel.sh -t
 ```
 
----
+清理构建缓存：
 
-## 11. 安装与产物
-
-### 11.1 动态库
-
-安装后主要产物为：
-
-```text
-/usr/lib64/libos_transport.so
-/usr/lib64/libos_transport.so.1
-/usr/lib64/libos_transport.so.1.0.0
+```bash
+./build_bazel.sh -c
 ```
 
-### 11.2 头文件
+可通过环境变量指定 URMA 路径：
 
-对外安装头文件为：
-
-```text
-/usr/include/os-transport/os_transport.h
+```bash
+URMA_INCLUDE_DIR=/usr/include \
+URMA_LIB_DIR=/usr/lib64 \
+./build_bazel.sh
 ```
 
-当前对外只安装 `os_transport.h`，其他内部头文件不作为公开开发接口。
+### 10.3 当前库的构建依赖说明
+
+根目录库本身当前只依赖：
+
+- URMA
+- pthread
+
+**不依赖 CUDA runtime。**
+
+这一点可以从当前代码直接看出：
+
+- 根目录 `src/*.c` 没有包含 `cuda_runtime.h`
+- `CMakeLists.txt` 没有链接 `CUDA::cudart`
+- `BUILD.bazel` 没有引入 CUDA 依赖
+
+只有 `tools/datasystem_test/pipeline_h2d.cpp` 这个上层联调用例还需要 CUDA。
 
 ---
 
-## 12. 当前代码特征与注意事项
+## 11. RPM 产物
 
-### 12.1 全局初始化状态
+默认打包会生成：
 
-当前 `src/os_transport.c` 中使用了：
+- 主包：`os-transport-<version>-<release>.<arch>.rpm`
+- 开发包：`os-transport-devel-<version>-<release>.<arch>.rpm`
 
-```c
-static int g_inited = 0;
+安装内容主要包括：
+
+- `libos_transport.so`
+- `include/os_transport.h`
+
+当前对外只安装公共头：
+
+- `include/os_transport.h`
+
+内部头文件不对外导出。
+
+---
+
+## 12. 测试
+
+### 12.1 单元测试
+
+当前仓库内置两个测试：
+
+- `test_thread_pool`
+- `test_os_transport_unit`
+
+运行方式：
+
+```bash
+./build.sh -t
 ```
 
-用于标记库是否已初始化。
+或：
 
-### 12.2 失败后的清理策略
-
-当前实现里，如果批量任务等待失败，会通过：
-
-```c
-thread_pool_cancel_tasks_by_req(...)
+```bash
+./build_bazel.sh -t
 ```
 
-按 `request_id` 取消剩余未执行任务。
+### 12.2 上层联调工具
 
-### 12.3 线程命名
+`tools/datasystem_test/pipeline_h2d.cpp` 是一个联调/验证程序。
 
-你当前这版仓库里，`worker_routine()` 还没有显式设置线程名。如果后续需要在 `top -H`、`ps -T`、`/proc/<pid>/task/*/comm` 中区分 worker，需要额外调用 `pthread_setname_np()`。
+它的意义在于：
 
-### 12.4 超时机制
+- 演示上层如何自己分配 device memory
+- 演示上层如何在业务层处理 H2D
+- 验证“库只做传输与通知，上层做 CUDA 拷贝”的新分工
 
-从当前仓库代码来看，`wait_and_free_sync()` 仍然是**无超时阻塞等待**，也就是：
+这个工具的编译和使用说明见：
 
-- 只要 `request_completed` 没置位
-- 就会一直等待
-
-如果后续要复用上层超时机制，需要在上层调用链或这里继续扩展。
-
----
-
-## 13. 建议的典型接入方式
-
-如果这个仓库作为独立库被外部工程接入，推荐方式是：
-
-1. 初始化 `os_transport` 句柄。
-2. 注册或更新 JFC/JFCE。
-3. 调用 `os_transport_send()` / `os_transport_recv()` 发起任务。
-4. 在 URMA completion 回调里调用 `os_transport_wake_up_task()`。
-5. 在请求结束阶段调用 `wait_and_free_sync()`。
-6. 进程退出前调用 `os_transport_destroy()`。
+- `tools/datasystem_test/README.md`
 
 ---
 
-## 14. 当前仓库适用场景
+## 13. 使用建议与注意事项
 
-这个仓库当前更适合如下场景：
+### 13.1 recv 路径必须提供 `notify_callback`
 
-- 多分片 Host -> Host -> GPU 的流水线搬运
-- 需要按请求维度控制任务推进顺序
-- 需要按 `request_id` 定位和清理剩余任务
-- 外部系统已经具备自己的超时、调度和通知机制
+当前 `os_transport_recv()` 的入参校验要求 `notify_callback != NULL`。
+
+因为当前版本里，recv worker 的主要职责就是执行这个回调。
+
+### 13.2 `wait_and_free_sync()` 只保证库侧任务完成
+
+当前等待语义保证的是：
+
+- URMA 任务提交与 completion 推进完成
+- 线程池中对应 task 已完成
+- 上层 `notify_callback` 已返回
+
+它不天然保证：
+
+- GPU kernel 已完成
+- CUDA stream 已同步
+- device 数据一定已经可立即消费
+
+这些保证要由你的 `notify_callback` 及其外部同步逻辑补齐。
+
+### 13.3 `request_id` 是整批请求的关键键值
+
+无论 send 还是 recv，`request_id` 都是整个任务编排的核心索引。
+
+上层最好保证：
+
+- 同时活跃的请求中 `request_id` 唯一
+- 能通过 `request_id` 快速查到业务上下文
+
+### 13.4 如果回调要做重活，建议上层自行控制并发
+
+当前 `notify_callback` 运行在线程池 worker 中。  
+如果你在回调里直接做耗时很长的 H2D、同步等待或复杂业务逻辑，会占住该 worker。
+
+因此更推荐的方式通常是：
+
+- 在 `notify_callback` 里只做轻量分发
+- 真正的 CUDA 操作交给上层自己的线程/stream 调度模块
 
 ---
+
+## 14. 一句话总结
+
+当前版本的 `MLCacheDirect` 已经从“库内部负责 URMA + CUDA memcpy”的模型，调整成了“库负责 **URMA 分片传输 + completion 唤醒 + 上层回调编排**，而 **H2D 具体执行由上层负责**”的模型。
+
+因此，在接入这个版本时，最重要的不是再去找库里的 `cudaMemcpy`，而是要在上层把这三件事补齐：
+
+1. `request_id -> 业务上下文` 映射；
+2. `chunk_id -> host/device 偏移` 映射；
+3. `notify_callback` 中的 H2D / 完成同步策略。
 
