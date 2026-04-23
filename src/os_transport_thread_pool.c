@@ -312,44 +312,40 @@ static WorkerThread *select_best_worker(ThreadPoolHandle pool)
 }
 
 // 哈希表操作
-static RequestContext *find_req_context(ThreadPoolHandle pool, uint32_t req_id)
+static RequestContext *find_req_context_locked(ThreadPoolHandle pool, uint32_t req_id)
 {
     uint32_t h = hash_req_id(req_id);
-    pthread_mutex_lock(&pool->req_hash_mutex);
     RequestContext *ctx = pool->req_hash[h];
     while (ctx) {
-        if (ctx->request_id == req_id)
+        if (ctx->request_id == req_id) {
             break;
+        }
         ctx = ctx->next;
     }
-    pthread_mutex_unlock(&pool->req_hash_mutex);
     return ctx;
 }
 
-static void insert_req_context(ThreadPoolHandle pool, RequestContext *ctx)
+static void insert_req_context_locked(ThreadPoolHandle pool, RequestContext *ctx)
 {
     uint32_t h = hash_req_id(ctx->request_id);
-    pthread_mutex_lock(&pool->req_hash_mutex);
     ctx->next = pool->req_hash[h];
     pool->req_hash[h] = ctx;
-    pthread_mutex_unlock(&pool->req_hash_mutex);
 }
 
-static void remove_req_context(ThreadPoolHandle pool, uint32_t req_id)
+static bool remove_req_context_locked(ThreadPoolHandle pool, uint32_t req_id)
 {
     uint32_t h = hash_req_id(req_id);
-    pthread_mutex_lock(&pool->req_hash_mutex);
     RequestContext **p = &pool->req_hash[h];
     while (*p) {
         if ((*p)->request_id == req_id) {
             RequestContext *tmp = *p;
             *p = tmp->next;
             free(tmp);
-            break;
+            return true;
         }
         p = &(*p)->next;
     }
-    pthread_mutex_unlock(&pool->req_hash_mutex);
+    return false;
 }
 
 // worker 执行任务并处理计数
@@ -370,23 +366,26 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
     ret = task->task_func(task->task_arg);
     task->is_completed = (ret == 0);
 
-    RequestContext *ctx = find_req_context(pool, req_id);
+    pthread_mutex_lock(&pool->req_hash_mutex);
+    RequestContext *ctx = find_req_context_locked(pool, req_id);
     if (ctx) {
-        pthread_mutex_lock(&pool->req_hash_mutex);
+        TaskCompleteCb batch_cb = NULL;
+        void *batch_data = NULL;
+
         ctx->pending_count--;
         if (ctx->pending_count == 0) {
-            TaskCompleteCb batch_cb = ctx->batch_cb;
-            void *batch_data = ctx->batch_user_data;
-            pthread_mutex_unlock(&pool->req_hash_mutex);
-            if (batch_cb) {
-                batch_cb(0, true, batch_data);
-            }
+            batch_cb = ctx->batch_cb;
+            batch_data = ctx->batch_user_data;
+            (void)remove_req_context_locked(pool, req_id);
+        }
+        pthread_mutex_unlock(&pool->req_hash_mutex);
+
+        if (batch_cb) {
+            batch_cb(0, true, batch_data);
             OST_LOG_INFO("Request batch completed (request_id=%u, worker=%d).", req_id, worker->worker_idx);
-            remove_req_context(pool, req_id);
-        } else {
-            pthread_mutex_unlock(&pool->req_hash_mutex);
         }
     } else {
+        pthread_mutex_unlock(&pool->req_hash_mutex);
         OST_LOG_WARN(
             "No request context found after task execution (request_id=%u, worker=%d).", req_id, worker->worker_idx);
     }
@@ -655,12 +654,20 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
         return -1;
     }
 
-    RequestContext *ctx = find_req_context(handle, request_id);
-    if (!ctx) {
+    int worker_idx = -1;
+
+    pthread_mutex_lock(&handle->req_hash_mutex);
+    RequestContext *ctx = find_req_context_locked(handle, request_id);
+    if (ctx) {
+        worker_idx = ctx->worker_idx;
+    }
+    pthread_mutex_unlock(&handle->req_hash_mutex);
+
+    if (worker_idx < 0) {
         OST_LOG_WARN("No context for request_id %u", request_id);
         return -1;
     }
-    WorkerThread *worker = &handle->workers[ctx->worker_idx];
+    WorkerThread *worker = &handle->workers[worker_idx];
     pthread_mutex_lock(&worker->mutex);
     if (!worker_pending_req_push(worker, request_id, user_data)) {
         pthread_mutex_unlock(&worker->mutex);
@@ -728,23 +735,19 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
         return 0;
     }
 
-    RequestContext *ctx = find_req_context(handle, request_id);
-    RequestContext *new_ctx = NULL;
-    if (!ctx) {
-        new_ctx = malloc(sizeof(RequestContext));
-        if (!new_ctx) {
-            OST_LOG_ERROR("Failed: unable to allocate RequestContext (request_id=%u).", request_id);
-            free(task);
-            free(itask);
-            return 0;
-        }
-        new_ctx->request_id = request_id;
-        new_ctx->worker_idx = worker->worker_idx;
-        new_ctx->pending_count = 1;
-        new_ctx->batch_cb = NULL;
-        new_ctx->batch_user_data = NULL;
-        new_ctx->next = NULL;
+    RequestContext *new_ctx = malloc(sizeof(RequestContext));
+    if (!new_ctx) {
+        OST_LOG_ERROR("Failed: unable to allocate RequestContext (request_id=%u).", request_id);
+        free(task);
+        free(itask);
+        return 0;
     }
+    new_ctx->request_id = request_id;
+    new_ctx->worker_idx = worker->worker_idx;
+    new_ctx->pending_count = 1;
+    new_ctx->batch_cb = NULL;
+    new_ctx->batch_user_data = NULL;
+    new_ctx->next = NULL;
 
     pthread_mutex_lock(&worker->mutex);
     if (!worker_queue_push(worker, task)) {
@@ -760,12 +763,15 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     }
     pthread_mutex_unlock(&worker->mutex);
 
+    pthread_mutex_lock(&handle->req_hash_mutex);
+    RequestContext *ctx = find_req_context_locked(handle, request_id);
     if (ctx) {
-        pthread_mutex_lock(&handle->req_hash_mutex);
         ctx->pending_count++;
         pthread_mutex_unlock(&handle->req_hash_mutex);
+        free(new_ctx);
     } else {
-        insert_req_context(handle, new_ctx);
+        insert_req_context_locked(handle, new_ctx);
+        pthread_mutex_unlock(&handle->req_hash_mutex);
     }
     OST_LOG_INFO("Task %lu (req=%u) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
     return task->task_id;
@@ -931,24 +937,28 @@ static bool update_batch_context(ThreadPoolHandle handle,
                                  TaskCompleteCb batch_complete_cb,
                                  void *batch_user_data)
 {
-    RequestContext *ctx = find_req_context(handle, req_id);
+    pthread_mutex_lock(&handle->req_hash_mutex);
+    RequestContext *ctx = find_req_context_locked(handle, req_id);
     if (ctx) {
-        pthread_mutex_lock(&handle->req_hash_mutex);
         ctx->pending_count += task_count;
         pthread_mutex_unlock(&handle->req_hash_mutex);
-    } else {
-        ctx = malloc(sizeof(RequestContext));
-        if (!ctx) {
-            OST_LOG_ERROR("Failed: unable to allocate RequestContext for batch request_id=%u.", req_id);
-            return false;
-        }
-        ctx->request_id = req_id;
-        ctx->worker_idx = worker_idx;
-        ctx->pending_count = task_count;
-        ctx->batch_cb = batch_complete_cb;
-        ctx->batch_user_data = batch_user_data;
-        insert_req_context(handle, ctx);
+        return true;
     }
+
+    ctx = malloc(sizeof(RequestContext));
+    if (!ctx) {
+        pthread_mutex_unlock(&handle->req_hash_mutex);
+        OST_LOG_ERROR("Failed: unable to allocate RequestContext for batch request_id=%u.", req_id);
+        return false;
+    }
+    ctx->request_id = req_id;
+    ctx->worker_idx = worker_idx;
+    ctx->pending_count = task_count;
+    ctx->batch_cb = batch_complete_cb;
+    ctx->batch_user_data = batch_user_data;
+    ctx->next = NULL;
+    insert_req_context_locked(handle, ctx);
+    pthread_mutex_unlock(&handle->req_hash_mutex);
     return true;
 }
 
@@ -1031,22 +1041,14 @@ static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
 }
 
 // 取消后更新上下文
-static void
-update_context_after_cancel(ThreadPoolHandle handle, RequestContext *ctx, uint32_t request_id, uint32_t removed)
+static void update_context_after_cancel(ThreadPoolHandle handle, uint32_t request_id, uint32_t removed)
 {
     pthread_mutex_lock(&handle->req_hash_mutex);
-    ctx->pending_count -= removed;
-    if (ctx->pending_count == 0) {
-        uint32_t h = hash_req_id(request_id);
-        RequestContext **p = &handle->req_hash[h];
-        while (*p) {
-            if ((*p)->request_id == request_id) {
-                RequestContext *tmp = *p;
-                *p = tmp->next;
-                free(tmp);
-                break;
-            }
-            p = &(*p)->next;
+    RequestContext *ctx = find_req_context_locked(handle, request_id);
+    if (ctx) {
+        ctx->pending_count -= removed;
+        if (ctx->pending_count <= 0) {
+            (void)remove_req_context_locked(handle, request_id);
         }
     }
     pthread_mutex_unlock(&handle->req_hash_mutex);
@@ -1064,15 +1066,23 @@ int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id
         return -1;
     }
 
-    RequestContext *ctx = find_req_context(handle, request_id);
-    if (!ctx) {
+    int worker_idx = -1;
+
+    pthread_mutex_lock(&handle->req_hash_mutex);
+    RequestContext *ctx = find_req_context_locked(handle, request_id);
+    if (ctx) {
+        worker_idx = ctx->worker_idx;
+    }
+    pthread_mutex_unlock(&handle->req_hash_mutex);
+
+    if (worker_idx < 0) {
         OST_LOG_INFO("No request context found when canceling request_id=%u.", request_id);
         return 0;
     }
 
-    uint32_t removed = cancel_in_worker_queue(&handle->workers[ctx->worker_idx], request_id);
+    uint32_t removed = cancel_in_worker_queue(&handle->workers[worker_idx], request_id);
     if (removed > 0) {
-        update_context_after_cancel(handle, ctx, request_id, removed);
+        update_context_after_cancel(handle, request_id, removed);
         OST_LOG_INFO("Canceled %u queued tasks for request_id=%u.", removed, request_id);
     } else {
         OST_LOG_INFO("No queued tasks needed cancellation for request_id=%u.", request_id);

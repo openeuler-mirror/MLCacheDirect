@@ -416,6 +416,10 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
 static int send_task_worker_func(void *arg)
 {
     int ret = 0;
+    uint32_t request_id;
+    uint32_t chunk_id;
+    uint32_t chunk_len;
+    task_sync_t *sync;
 
     if (!arg) {
         OST_LOG_ERROR("Failed: arg is NULL in send_task_worker_func.");
@@ -423,14 +427,19 @@ static int send_task_worker_func(void *arg)
     }
 
     send_task_arg_t *send_task_arg = (send_task_arg_t *)arg;
+    request_id = send_task_arg->write_info.user_ctx_client.bs.request_id;
+    chunk_id = send_task_arg->write_info.user_ctx_client.bs.chunk_id;
+    chunk_len = send_task_arg->chunk_info ? send_task_arg->chunk_info->len : 0;
+    sync = send_task_arg->sync;
+
     ret = do_send_chunk_for_worker(send_task_arg->write_info, send_task_arg->chunk_info);
-    mark_task_group_completed(send_task_arg->sync, ret == 0 ? true : false);
     if (ret != 0) {
         OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).",
-                     send_task_arg->write_info.user_ctx_client.bs.request_id,
-                     send_task_arg->write_info.user_ctx_client.bs.chunk_id,
-                     send_task_arg->chunk_info ? send_task_arg->chunk_info->len : 0);
+                     request_id,
+                     chunk_id,
+                     chunk_len);
     }
+    mark_task_group_completed(sync, ret == 0 ? true : false);
     return ret;
 }
 
@@ -438,6 +447,11 @@ static int send_task_worker_func(void *arg)
 static int recv_task_worker_func(void *arg)
 {
     int ret = 0;
+    uint32_t request_id;
+    uint64_t chunk_id;
+    uint64_t chunk_type;
+    bool is_last_chunk;
+    task_sync_t *sync;
 
     if (!arg) {
         OST_LOG_ERROR("Failed: arg is NULL in recv_task_worker_func.");
@@ -445,24 +459,29 @@ static int recv_task_worker_func(void *arg)
     }
 
     recv_task_arg_t *recv_task_arg = (recv_task_arg_t *)arg;
+    request_id = recv_task_arg->recv_info.request_id;
+    chunk_id = (uint64_t)recv_task_arg->notify_user_data.bs.chunk_id;
+    chunk_type = (uint64_t)recv_task_arg->notify_user_data.bs.chunk_type;
+    is_last_chunk = recv_task_arg->is_last_chunk;
+    sync = recv_task_arg->sync;
+
     if (!recv_task_arg->notify_callback) {
         OST_LOG_ERROR("Failed: notify_callback is NULL in recv_task_worker_func "
                       "(request_id=%u).",
-                      recv_task_arg->recv_info.request_id);
+                      request_id);
         ret = -1;
     } else {
         ret = recv_task_arg->notify_callback(&recv_task_arg->notify_user_data);
     }
-    mark_task_group_completed(recv_task_arg->sync, ret == 0 ? true : false);
     if (ret != 0) {
         OST_LOG_WARN("Recv notify callback failed "
                      "(request_id=%u, chunk_id=%lu, chunk_type=%lu, ret=%d).",
-                     recv_task_arg->recv_info.request_id,
-                     (uint64_t)recv_task_arg->notify_user_data.bs.chunk_id,
-                     (uint64_t)recv_task_arg->notify_user_data.bs.chunk_type,
+                     request_id,
+                     chunk_id,
+                     chunk_type,
                      ret);
     }
-    if (recv_task_arg->is_last_chunk) {
+    if (is_last_chunk) {
         // // 主线程返回后通过cudaEventSynchronize(event)等待所有h2d操作完成，确保数据可用
         // cudaStream_t stream = recv_task_arg->recv_info.device_info.stream;
         // cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
@@ -472,6 +491,7 @@ static int recv_task_worker_func(void *arg)
         //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret, recv_task_arg->recv_info.request_id);
         // }
     }
+    mark_task_group_completed(sync, ret == 0 ? true : false);
     return ret;
 }
 
@@ -1048,11 +1068,11 @@ uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id)
     }
 
     int ret = thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
-    if (ret != 0) {
+    if (ret < 0) {
         OST_LOG_WARN("Failed to cancel tasks for request_id=%u.", request_id);
         return -1;
     }
-    OST_LOG_INFO("Tasks cancelled successfully for request_id=%u.", request_id);
+    OST_LOG_INFO("Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
     return 0;
 }
 

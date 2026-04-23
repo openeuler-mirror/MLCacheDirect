@@ -32,6 +32,9 @@ target_link_libraries(os_transport
     ${URMA_LIB}
 )
 
+# 共享库在链接期就必须解析完全部符号，避免把 undefined symbol 留到 dlopen 阶段才暴露
+target_link_options(os_transport PRIVATE -Wl,-z,defs)
+
 # 如果未找到 URMA，可允许继续构建（因为测试模式可能不需要），但这里不强制
 if(NOT URMA_LIB)
     message(WARNING "Missing required libraries. The built library may have undefined symbols.")
