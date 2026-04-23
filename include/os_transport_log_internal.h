@@ -13,12 +13,8 @@ void ost_log_reset_for_tests(void);
 void ost_log_force_syslog_available_for_tests(bool available);
 #endif
 
-#ifndef __FILE_NAME__
-#define __FILE_NAME__ __FILE__
-#endif
-
 // 日志格式化输出宏
-#define OST_LOG(level, fmt, ...) ost_log_write((level), __FILE_NAME__, __LINE__, (fmt), ##__VA_ARGS__)
+#define OST_LOG(level, fmt, ...) ost_log_write((level), __FILE__, __LINE__, (fmt), ##__VA_ARGS__)
 
 // 快捷日志宏
 #define OST_LOG_DEBUG(fmt, ...) OST_LOG(LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)
