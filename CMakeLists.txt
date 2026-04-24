@@ -1,11 +1,18 @@
 cmake_minimum_required(VERSION 3.10)
 project(OS_TRANSPORT VERSION 1.0.0 LANGUAGES C)
 option(OS_TRANSPORT_BUILD_TESTS "Build OS_TRANSPORT test binaries" OFF)
+option(OS_TRANSPORT_WITH_INJECT "Enable fault injection for os_transport" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # 关闭隐式函数声明警告
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-implicit-function-declaration")
+
+# 启用故障注入（可选）
+if(OS_TRANSPORT_WITH_INJECT)
+    add_definitions(-DOS_TRANSPORT_WITH_INJECT=1)
+    message(STATUS "Fault injection enabled for os_transport (with shared memory)")
+endif()
 
 # 收集所有源码
 file(GLOB SRC_FILES src/*.c)
@@ -26,11 +33,14 @@ add_library(os_transport SHARED
     ${SRC_FILES}
 )
 
-# 链接pthread、urma
-target_link_libraries(os_transport
-    pthread
-    ${URMA_LIB}
-)
+# 链接pthread、urma；启用故障注入时额外链接rt（共享内存需要）
+target_link_libraries(os_transport pthread)
+if(OS_TRANSPORT_WITH_INJECT)
+    target_link_libraries(os_transport rt)
+endif()
+if(URMA_LIB)
+    target_link_libraries(os_transport ${URMA_LIB})
+endif()
 
 # 共享库在链接期就必须解析完全部符号，避免把 undefined symbol 留到 dlopen 阶段才暴露
 target_link_options(os_transport PRIVATE -Wl,-z,defs)
@@ -54,7 +64,7 @@ set_target_properties(os_transport PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-# 安装规则（对外仅导出 os_transport.h）
+# 安装规则（默认导出 os_transport.h，启用注入时额外导出注入头文件）
 install(
     TARGETS os_transport
     LIBRARY DESTINATION lib64
@@ -67,7 +77,27 @@ install(
     COMPONENT devel
 )
 
+if(OS_TRANSPORT_WITH_INJECT)
+    # 故障注入头文件安装
+    install(
+        FILES include/os_transport_inject.h
+        DESTINATION include/os-transport
+        COMPONENT devel
+    )
+endif()
+
 if(OS_TRANSPORT_BUILD_TESTS)
+    # 故障注入单元测试（不依赖 URMA/CUDA，可以独立运行）
+    if(OS_TRANSPORT_WITH_INJECT)
+        add_executable(test_inject_unit test/test_inject_unit.c src/os_transport_inject.c)
+        target_include_directories(test_inject_unit
+            PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(test_inject_unit pthread rt)
+        message(STATUS "Fault injection unit test will be built: test_inject_unit")
+    endif()
+
     # 编译测试程序
     add_executable(test_thread_pool
         test/test_thread_pool.c
