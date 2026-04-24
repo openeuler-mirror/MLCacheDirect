@@ -1063,7 +1063,7 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
     return completed_success;
 }
 
-uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id)
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id)
 {
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
 
@@ -1081,6 +1081,8 @@ uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id)
         OST_LOG_WARN("Failed to cancel tasks for request_id=%u.", request_id);
         return -1;
     }
+    free_sync_owned_resources(*sync_handle);
+    *sync_handle = NULL;
     OST_LOG_INFO("Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
     return 0;
 }

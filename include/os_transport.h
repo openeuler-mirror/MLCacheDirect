@@ -41,8 +41,8 @@ typedef struct {
 } ost_buffer_info_t;
 
 typedef struct {
-    urma_jfr_t *jfr;     // 用于接收的jfr
-    void *dst;           // 数据缓冲区地址
+    urma_jfr_t *jfr; // 用于接收的jfr
+    void *dst;       // 数据缓冲区地址
 } ost_device_info_t;
 
 typedef enum jetty_mode { JETTY_MODE_SIMPLEX = 0, JETTY_MODE_DUPLEX } jetty_mode_t;
@@ -90,7 +90,7 @@ int os_transport_wake_up_task(void *handle, void *cr_t);
 
 uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
 
-uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id);
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id);
 
 uint32_t os_transport_destroy(void *handle);
 
