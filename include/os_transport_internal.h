@@ -69,6 +69,10 @@ typedef struct {
     bool is_last_chunk;
     // urma接收端相关参数，包括h2d相关信息
     urma_recv_info_t recv_info;
+    // 上层注册的notify回调；后续worker应使用wake_up阶段带来的user_data调用它
+    notify_callback_t notify_callback;
+    // 保存每次wake_up解析出的user_data副本，notify_callback的入参应传该字段地址
+    os_transport_user_data_t notify_user_data;
 } recv_task_arg_t;
 
 #endif // OS_TRANSPORT_INTERNAL_H

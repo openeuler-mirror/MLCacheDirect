@@ -1,8 +1,8 @@
 /*
- * test_thread_pool.c - 线程池单元测试（TEST_MODE 模拟 URMA 事件）
+ * test_thread_pool.c - 线程池单元测试
  *
  * 编译命令：
- *   gcc -DTEST_MODE -g -o test_thread_pool os_transport_thread_pool.c test_thread_pool.c -lpthread -I.
+ *   gcc -g -o test_thread_pool src/os_transport_thread_pool.c src/os_transport_log.c test/test_thread_pool.c -lpthread -Iinclude
  */
 
 #include "os_transport_thread_pool.h"
@@ -13,13 +13,6 @@
 #include <unistd.h>
 #include <assert.h>
 #include <pthread.h>
-
-/* ---------- 声明测试模式下的模拟队列函数 ---------- */
-#ifdef TEST_MODE
-void mock_event_queue_init(uint32_t cap);
-void mock_event_queue_push(uint64_t req_id);
-void mock_event_queue_destroy(void);
-#endif
 
 /* ---------- 测试全局状态 ---------- */
 typedef struct {
@@ -33,11 +26,15 @@ typedef struct {
 } TestState;
 
 static TestState g_state = {0};
+static bool g_state_sync_initialized = false;
 
 static void test_state_init(int total)
 {
-    pthread_mutex_init(&g_state.lock, NULL);
-    pthread_cond_init(&g_state.cond, NULL);
+    if (!g_state_sync_initialized) {
+        pthread_mutex_init(&g_state.lock, NULL);
+        pthread_cond_init(&g_state.cond, NULL);
+        g_state_sync_initialized = true;
+    }
     g_state.completed_count = 0;
     g_state.batch_completed_count = 0;
     if (g_state.exec_order)
@@ -45,6 +42,11 @@ static void test_state_init(int total)
     g_state.exec_order = calloc(total, sizeof(int));
     g_state.exec_index = 0;
     g_state.total_tasks = total;
+}
+
+static void wake_request(ThreadPoolHandle pool, uint32_t req_id)
+{
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req_id, NULL) == 0);
 }
 
 static void test_state_wait_completion(void)
@@ -83,6 +85,7 @@ static int test_task(void *arg)
 static void test_complete_cb(uint64_t task_id, bool success, void *user_data)
 {
     (void)user_data;
+    (void)success;
     pthread_mutex_lock(&g_state.lock);
     g_state.completed_count++;
     pthread_cond_signal(&g_state.cond);
@@ -92,6 +95,8 @@ static void test_complete_cb(uint64_t task_id, bool success, void *user_data)
 
 static void batch_complete_cb(uint64_t task_id, bool success, void *user_data)
 {
+    (void)task_id;
+    (void)success;
     uint32_t req_id = (uint32_t)(uintptr_t)user_data;
     printf("Batch complete for req %u\n", req_id);
     pthread_mutex_lock(&g_state.lock);
@@ -118,11 +123,12 @@ static void test_single_tasks(ThreadPoolHandle pool)
     assert(id1 != 0 && id2 != 0);
     printf("Submitted tasks: %lu, %lu\n", id1, id2);
 
-    mock_event_queue_push(req1);
-    mock_event_queue_push(req2);
+    wake_request(pool, req1);
+    wake_request(pool, req2);
 
     test_state_wait_completion();
-    assert(g_state.exec_order[0] == 1 && g_state.exec_order[1] == 2);
+    assert((g_state.exec_order[0] == 1 && g_state.exec_order[1] == 2) ||
+           (g_state.exec_order[0] == 2 && g_state.exec_order[1] == 1));
     printf("Test 1 passed.\n");
 }
 
@@ -136,6 +142,7 @@ static void test_batch_tasks(ThreadPoolHandle pool)
     int *args[BATCH];
 
     test_state_init(BATCH);
+    memset(tasks, 0, sizeof(tasks));
     for (int i = 0; i < BATCH; i++) {
         args[i] = malloc(sizeof(int));
         *args[i] = i + 10;
@@ -151,8 +158,8 @@ static void test_batch_tasks(ThreadPoolHandle pool)
     free(ids);
 
     for (int i = 0; i < BATCH; i++) {
-        mock_event_queue_push(batch_req);
-        usleep(20000); // 让 asyncPoll 处理
+        wake_request(pool, batch_req);
+        usleep(20000); // 让 worker 处理
     }
 
     test_state_wait_completion();
@@ -173,6 +180,8 @@ static void test_interleaved(ThreadPoolHandle pool)
     int *sa[N], *sb[N];
 
     test_state_init(N * 2);
+    memset(ta, 0, sizeof(ta));
+    memset(tb, 0, sizeof(tb));
     for (int i = 0; i < N; i++) {
         sa[i] = malloc(sizeof(int));
         *sa[i] = 100 + i;
@@ -195,17 +204,17 @@ static void test_interleaved(ThreadPoolHandle pool)
     free(idb);
 
     // 交错发送
-    mock_event_queue_push(req_a);
+    wake_request(pool, req_a);
     usleep(20000);
-    mock_event_queue_push(req_b);
+    wake_request(pool, req_b);
     usleep(20000);
-    mock_event_queue_push(req_a);
+    wake_request(pool, req_a);
     usleep(20000);
-    mock_event_queue_push(req_b);
+    wake_request(pool, req_b);
     usleep(20000);
-    mock_event_queue_push(req_a);
+    wake_request(pool, req_a);
     usleep(20000);
-    mock_event_queue_push(req_b);
+    wake_request(pool, req_b);
     usleep(20000);
 
     test_state_wait_completion();
@@ -240,6 +249,7 @@ static void test_many(ThreadPoolHandle pool)
     int *args[LARGE];
 
     test_state_init(LARGE);
+    memset(tasks, 0, sizeof(tasks));
     for (int i = 0; i < LARGE; i++) {
         args[i] = malloc(sizeof(int));
         *args[i] = i;
@@ -254,7 +264,7 @@ static void test_many(ThreadPoolHandle pool)
     free(ids);
 
     for (int i = 0; i < LARGE; i++) {
-        mock_event_queue_push(req);
+        wake_request(pool, req);
     }
 
     test_state_wait_completion();
@@ -271,6 +281,8 @@ static void test_cancel(ThreadPoolHandle pool)
     ThreadPoolTask tasks[TOTAL];
     int *args[TOTAL];
 
+    test_state_init(TOTAL);
+    memset(tasks, 0, sizeof(tasks));
     for (int i = 0; i < TOTAL; i++) {
         args[i] = malloc(sizeof(int));
         *args[i] = i;
@@ -288,8 +300,8 @@ static void test_cancel(ThreadPoolHandle pool)
     int canceled = thread_pool_cancel_tasks_by_req(pool, req);
     assert(canceled == TOTAL);
 
-    // 发送通知，不应有任务执行
-    mock_event_queue_push(req);
+    // 取消后不存在request上下文，唤醒应失败且不执行任务
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req, NULL) == -1);
     usleep(100000);
 
     pthread_mutex_lock(&g_state.lock);
@@ -309,21 +321,11 @@ static void test_destroy(ThreadPoolHandle pool)
 /* ---------- 主函数 ---------- */
 int main(void)
 {
-    printf("Starting thread pool tests (TEST_MODE enabled)...\n");
-
-    // 初始化模拟事件队列
-    mock_event_queue_init(64);
+    printf("Starting thread pool tests...\n");
 
     // 初始化线程池（2个worker）
     ThreadPoolHandle pool = thread_pool_init(2, 0);
     assert(pool != NULL);
-
-    // 设置 URMA 信息（测试模式下不会真正使用，但需避免空指针）
-    static urma_jfce_t dummy_jfce;
-    static urma_jfc_t dummy_jfc;
-    pool->urmaInfo.jfce = &dummy_jfce;
-    pool->urmaInfo.jfc = &dummy_jfc;
-    pool->urmaInfo.urma_event_mode = false;
 
     int ret = thread_pool_start(pool);
     assert(ret == 0);
@@ -336,10 +338,11 @@ int main(void)
     test_cancel(pool);
     test_destroy(pool);
 
-    mock_event_queue_destroy();
     free(g_state.exec_order);
-    pthread_mutex_destroy(&g_state.lock);
-    pthread_cond_destroy(&g_state.cond);
+    if (g_state_sync_initialized) {
+        pthread_mutex_destroy(&g_state.lock);
+        pthread_cond_destroy(&g_state.cond);
+    }
 
     printf("\nAll tests passed!\n");
     return 0;

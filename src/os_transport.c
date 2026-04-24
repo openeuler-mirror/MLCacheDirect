@@ -1,4 +1,5 @@
 #include "os_transport_internal.h"
+#include "os_transport_log_internal.h"
 #include "os_transport_thread_pool_internal.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -8,22 +9,34 @@
 // 全局初始化状态
 static int g_inited = 0;
 
+#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 6) - 1)
+
 static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, size_t task_arg_size)
 {
     task_group_t *task_group = NULL;
 
     if (!task_group_out || task_num == 0 || task_arg_size == 0) {
+        OST_LOG_ERROR("Failed: invalid arguments for alloc_task_group "
+                      "(task_group_out=%p, task_num=%lu, task_arg_size=%zu).",
+                      (void *)task_group_out,
+                      task_num,
+                      task_arg_size);
         return -1;
     }
 
     task_group = calloc(1, sizeof(task_group_t));
     if (!task_group) {
+        OST_LOG_ERROR("Failed: unable to allocate task_group_t (size=%zu).", sizeof(task_group_t));
         return -1;
     }
 
     task_group->tasks = calloc(task_num, sizeof(ThreadPoolTask));
     task_group->task_args = calloc(task_num, task_arg_size);
     if (!task_group->tasks || !task_group->task_args) {
+        OST_LOG_ERROR("Failed: unable to allocate task group buffers "
+                      "(task_num=%lu, task_arg_size=%zu).",
+                      task_num,
+                      task_arg_size);
         free(task_group->task_args);
         free(task_group->tasks);
         free(task_group);
@@ -41,22 +54,26 @@ static int init_task_sync(task_sync_t **sync_out)
     int ret;
 
     if (!sync_out) {
+        OST_LOG_ERROR("Failed: sync_out is NULL in init_task_sync.");
         return -1;
     }
 
     sync = calloc(1, sizeof(task_sync_t));
     if (!sync) {
+        OST_LOG_ERROR("Failed: unable to allocate task_sync_t (size=%zu).", sizeof(task_sync_t));
         return -1;
     }
 
     ret = pthread_mutex_init(&sync->mutex, NULL);
     if (ret != 0) {
+        OST_LOG_ERROR("Failed: pthread_mutex_init returned %d in init_task_sync.", ret);
         free(sync);
         return -1;
     }
 
     ret = pthread_cond_init(&sync->cond, NULL);
     if (ret != 0) {
+        OST_LOG_ERROR("Failed: pthread_cond_init returned %d in init_task_sync.", ret);
         pthread_mutex_destroy(&sync->mutex);
         free(sync);
         return -1;
@@ -97,16 +114,28 @@ static void free_sync_owned_resources(task_sync_t *sync)
 
 static uint32_t wait_for_task_complete(task_sync_t *sync_handle)
 {
+    int ret;
+
     if (!sync_handle) {
+        OST_LOG_ERROR("Failed: sync_handle is NULL in wait_for_task_complete.");
         return -1;
     }
 
     pthread_mutex_lock(&sync_handle->mutex);
     while (!sync_handle->request_completed) {
-        pthread_cond_wait(&sync_handle->cond, &sync_handle->mutex);
+        ret = pthread_cond_wait(&sync_handle->cond, &sync_handle->mutex);
+        if (ret != 0) {
+            pthread_mutex_unlock(&sync_handle->mutex);
+            OST_LOG_ERROR("Failed: pthread_cond_wait returned %d while waiting for request completion.", ret);
+            return -1;
+        }
     }
     pthread_mutex_unlock(&sync_handle->mutex);
     if (sync_handle->completed_tasks != sync_handle->total_tasks) {
+        OST_LOG_WARN("Request completed early or incompletely "
+                     "(completed=%lu, total=%lu).",
+                     sync_handle->completed_tasks,
+                     sync_handle->total_tasks);
         return -1;
     }
     return 0;
@@ -120,6 +149,7 @@ static void mark_task_group_completed(task_sync_t *sync, bool task_success)
 
     // 如果当前task执行失败，直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
     if (!task_success) {
+        OST_LOG_WARN("Task group marked completed early because one task failed.");
         pthread_mutex_lock(&sync->mutex);
         sync->request_completed = 1;
         pthread_cond_signal(&sync->cond);
@@ -131,6 +161,7 @@ static void mark_task_group_completed(task_sync_t *sync, bool task_success)
     pthread_mutex_lock(&sync->mutex);
     sync->completed_tasks++;
     if (sync->completed_tasks == sync->total_tasks) {
+        OST_LOG_INFO("Task group completed successfully (total_tasks=%lu).", sync->total_tasks);
         sync->request_completed = 1;
         pthread_cond_signal(&sync->cond);
     }
@@ -177,16 +208,19 @@ static int validate_recv_input(void *handle,
                                ost_buffer_info_t *host_src,
                                ost_device_info_t *device_dst,
                                uint32_t len,
-                               task_sync_t **ret_sync_handle)
+                               task_sync_t **ret_sync_handle,
+                               notify_callback_t notify_callback)
 {
-    if (!handle || !host_src || !device_dst || !ret_sync_handle || len == 0) {
+    if (!handle || !host_src || !device_dst || !ret_sync_handle || len == 0 || !notify_callback) {
         OST_LOG_ERROR("Failed: invalid arguments "
-                      "(handle=%p, host_src=%p, device_dst=%p, ret_sync_handle=%p, len=%u)",
+                      "(handle=%p, host_src=%p, device_dst=%p, ret_sync_handle=%p, len=%u, "
+                      "notify_callback=%p)",
                       handle,
                       (void *)host_src,
                       (void *)device_dst,
                       (void *)ret_sync_handle,
-                      len);
+                      len,
+                      (void *)notify_callback);
         return -1;
     }
     if (!g_inited) {
@@ -206,9 +240,9 @@ static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
                                           uint32_t client_key)
 {
     os_transport_user_data_t server_user_data = {
-        .bs.request_id = server_key, .bs.chunk_type = NOT_SPLIT, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = server_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
     os_transport_user_data_t client_user_data = {
-        .bs.request_id = client_key, .bs.chunk_type = NOT_SPLIT, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = client_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
     urma_write_info_t write_info = {.jfs = jetty_info->jfs,
                                     .jetty = jetty_info->jetty,
                                     .target_jfr = jetty_info->tjetty,
@@ -306,6 +340,11 @@ static void construct_send_task_arg(send_task_arg_t *arg,
 
     user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
     user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
+    if (chunk_id == OS_TRANSPORT_MAX_CHUNK_ID) {
+        OST_LOG_WARN("chunk_id=%lu exceeds user data bitfield range (max=%lu), value will be truncated.",
+                     (unsigned long)chunk_id,
+                     (unsigned long)OS_TRANSPORT_MAX_CHUNK_ID);
+    }
     user_data_server.bs.chunk_id = chunk_id;
     user_data_server.bs.chunk_size = chunk_info->len;
 
@@ -324,24 +363,30 @@ static void construct_send_task_arg(send_task_arg_t *arg,
     arg->sync = sync;
 }
 
-static void construct_recv_task_arg(
-    recv_task_arg_t *arg, urma_recv_info_t recv_info, chunk_info_t *chunk_info, bool is_last_chunk, task_sync_t *sync)
+static void construct_recv_task_arg(recv_task_arg_t *arg,
+                                    urma_recv_info_t recv_info,
+                                    chunk_info_t *chunk_info,
+                                    bool is_last_chunk,
+                                    task_sync_t *sync,
+                                    notify_callback_t notify_callback)
 {
     memset(arg, 0, sizeof(*arg));
     arg->recv_info = recv_info;
     arg->chunk_info = chunk_info;
     arg->is_last_chunk = is_last_chunk;
     arg->sync = sync;
+    arg->notify_callback = notify_callback;
 }
 
 // 构建供worker取用的task信息
-static ThreadPoolTask
-construct_worker_task(uint64_t task_id, uint32_t request_id, int (*task_func)(void *), void *task_arg)
+static ThreadPoolTask construct_worker_task(
+    uint64_t task_id, uint32_t request_id, int (*task_func)(void *), void *task_arg, TaskPrepareCb prepare_cb)
 {
     ThreadPoolTask task;
     memset(&task, 0, sizeof(task));
     task.task_id = task_id;
     task.request_id = request_id;
+    task.prepare_cb = prepare_cb;
     task.task_func = task_func;
     task.task_arg = task_arg;
     task.is_completed = false;
@@ -362,22 +407,43 @@ static int do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *
     return ret;
 }
 
-static int do_recv_chunk_for_worker(urma_recv_info_t recv_info, chunk_info_t *chunk_info)
+static void prepare_recv_task_user_data(void *task_arg, void *user_data)
 {
-    void *host_buf = (void *)(uintptr_t)chunk_info->src;
-    void *device_buf = (void *)(uintptr_t)chunk_info->dst;
-    cudaStream_t stream = recv_info.device_info.stream;
-    return cudaMemcpyAsync(device_buf, host_buf, chunk_info->len, cudaMemcpyHostToDevice, stream);
+    recv_task_arg_t *recv_task_arg = (recv_task_arg_t *)task_arg;
+    os_transport_user_data_t *notify_user_data = (os_transport_user_data_t *)user_data;
+
+    if (!recv_task_arg || !notify_user_data) {
+        return;
+    }
+
+    recv_task_arg->notify_user_data = *notify_user_data;
 }
 
 // worker线程执行的send任务函数，负责发送chunk
 static int send_task_worker_func(void *arg)
 {
     int ret = 0;
+    uint32_t request_id;
+    uint32_t chunk_id;
+    uint32_t chunk_len;
+    task_sync_t *sync;
+
+    if (!arg) {
+        OST_LOG_ERROR("Failed: arg is NULL in send_task_worker_func.");
+        return -1;
+    }
 
     send_task_arg_t *send_task_arg = (send_task_arg_t *)arg;
+    request_id = send_task_arg->write_info.user_ctx_client.bs.request_id;
+    chunk_id = send_task_arg->write_info.user_ctx_client.bs.chunk_id;
+    chunk_len = send_task_arg->chunk_info ? send_task_arg->chunk_info->len : 0;
+    sync = send_task_arg->sync;
+
     ret = do_send_chunk_for_worker(send_task_arg->write_info, send_task_arg->chunk_info);
-    mark_task_group_completed(send_task_arg->sync, ret == 0 ? true : false);
+    if (ret != 0) {
+        OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).", request_id, chunk_id, chunk_len);
+    }
+    mark_task_group_completed(sync, ret == 0 ? true : false);
     return ret;
 }
 
@@ -385,23 +451,52 @@ static int send_task_worker_func(void *arg)
 static int recv_task_worker_func(void *arg)
 {
     int ret = 0;
+    uint32_t request_id;
+    uint64_t chunk_id;
+    uint64_t chunk_type;
+    bool is_last_chunk;
+    task_sync_t *sync;
+
+    if (!arg) {
+        OST_LOG_ERROR("Failed: arg is NULL in recv_task_worker_func.");
+        return -1;
+    }
+
     recv_task_arg_t *recv_task_arg = (recv_task_arg_t *)arg;
-    ret = do_recv_chunk_for_worker(recv_task_arg->recv_info, recv_task_arg->chunk_info);
-    mark_task_group_completed(recv_task_arg->sync, ret == 0 ? true : false);
-    if (recv_task_arg->is_last_chunk) {
-        // 主线程返回后通过cudaEventSynchronize(event)等待所有h2d操作完成，确保数据可用
-        cudaStream_t stream = recv_task_arg->recv_info.device_info.stream;
-        cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
-        cudaEventRecord(event, stream);
+    request_id = recv_task_arg->recv_info.request_id;
+    chunk_id = (uint64_t)recv_task_arg->notify_user_data.bs.chunk_id;
+    chunk_type = (uint64_t)recv_task_arg->notify_user_data.bs.chunk_type;
+    is_last_chunk = recv_task_arg->is_last_chunk;
+    sync = recv_task_arg->sync;
+
+    if (!recv_task_arg->notify_callback) {
+        OST_LOG_ERROR("Failed: notify_callback is NULL in recv_task_worker_func "
+                      "(request_id=%u).",
+                      request_id);
+        ret = -1;
     } else {
-        // // 不是最后一个chunk时，调用urma_recv_with_notify，用于接收下一个分片
-        // if (urma_recv_with_notify(recv_task_arg->recv_info, recv_task_arg->chunk_info) != URMA_SUCCESS) {
-        //     OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
-        //                   "(len=%u, client_key=%u).",
-        //                   recv_task_arg->chunk_info->len,
-        //                   recv_task_arg->recv_info.request_id);
+        ret = recv_task_arg->notify_callback(&recv_task_arg->notify_user_data);
+    }
+    if (ret != 0) {
+        OST_LOG_WARN("Recv notify callback failed "
+                     "(request_id=%u, chunk_id=%lu, chunk_type=%lu, ret=%d).",
+                     request_id,
+                     chunk_id,
+                     chunk_type,
+                     ret);
+    }
+    if (is_last_chunk) {
+        // // 主线程返回后通过cudaEventSynchronize(event)等待所有h2d操作完成，确保数据可用
+        // cudaStream_t stream = recv_task_arg->recv_info.device_info.stream;
+        // cudaEvent_t event = recv_task_arg->recv_info.device_info.event;
+        // int event_ret = cudaEventRecord(event, stream);
+        // if (event_ret != 0) {
+        //     OST_LOG_ERROR(
+        //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret,
+        //         recv_task_arg->recv_info.request_id);
         // }
     }
+    mark_task_group_completed(sync, ret == 0 ? true : false);
     return ret;
 }
 
@@ -443,7 +538,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
         construct_send_task_arg(
             &task_args[i], urma_info.write_info, &chunks[chunk_idx], chunk_idx, is_last_chunk, sync);
-        task_group->tasks[i] = construct_worker_task(chunk_idx, request_id, task_func, &task_args[i]);
+        task_group->tasks[i] = construct_worker_task(chunk_idx, request_id, task_func, &task_args[i], NULL);
     }
 
     task_ids =
@@ -461,6 +556,10 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
+    OST_LOG_INFO("Registered async send tasks (request_id=%u, task_num=%lu, chunk_num=%lu).",
+                 (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
+                 task_num,
+                 chunk_num);
     return 0;
 }
 
@@ -469,7 +568,8 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
                                uint64_t chunk_num,
                                int (*task_func)(void *),
                                urma_info_t urma_info,
-                               task_sync_t *sync)
+                               task_sync_t *sync,
+                               notify_callback_t notify_callback)
 {
     uint64_t *task_ids = NULL;
     task_group_t *task_group = NULL;
@@ -488,8 +588,9 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
     for (uint64_t i = 0; i < chunk_num; i++) {
         bool is_last_chunk = (i == chunk_num - 1);
         uint32_t request_id = (uint32_t)(urma_info.recv_info.request_id);
-        construct_recv_task_arg(&task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync);
-        task_group->tasks[i] = construct_worker_task(i, request_id, task_func, &task_args[i]);
+        construct_recv_task_arg(&task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync, notify_callback);
+        task_group->tasks[i] =
+            construct_worker_task(i, request_id, task_func, &task_args[i], prepare_recv_task_user_data);
     }
 
     task_ids =
@@ -507,6 +608,9 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
+    OST_LOG_INFO("Registered async recv tasks (request_id=%u, task_num=%lu).",
+                 (uint32_t)(urma_info.recv_info.request_id),
+                 chunk_num);
     return 0;
 }
 
@@ -517,7 +621,8 @@ static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_ha
                                                    task_type_t type,
                                                    int (*task_func)(void *),
                                                    urma_info_t urma_info,
-                                                   task_sync_t **sync_handle)
+                                                   task_sync_t **sync_handle,
+                                                   notify_callback_t notify_callback)
 {
     task_sync_t *sync = NULL;
     int ret = -1;
@@ -542,13 +647,17 @@ static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_ha
     if (type == SEND_TASK) {
         ret = register_send_tasks(ost_handle, chunks, chunk_num, task_func, urma_info, sync);
     } else if (type == RECV_TASK) {
-        ret = register_recv_tasks(ost_handle, chunks, chunk_num, task_func, urma_info, sync);
+        ret = register_recv_tasks(ost_handle, chunks, chunk_num, task_func, urma_info, sync, notify_callback);
     } else {
         OST_LOG_ERROR("Failed: unsupported task type (%d).", type);
         ret = -1;
     }
 
     if (ret != 0) {
+        OST_LOG_ERROR("Failed: register worker task path returned error "
+                      "(type=%d, chunk_num=%lu).",
+                      type,
+                      chunk_num);
         pthread_mutex_destroy(&sync->mutex);
         pthread_cond_destroy(&sync->cond);
         free(sync);
@@ -565,16 +674,19 @@ static int register_tasks_and_bind_chunks(os_transport_handle_t *ost_handle,
                                           task_type_t type,
                                           int (*task_func)(void *),
                                           urma_info_t urma_info,
-                                          task_sync_t **sync_handle)
+                                          task_sync_t **sync_handle,
+                                          notify_callback_t notify_callback)
 {
     task_sync_t *sync = NULL;
     int ret;
 
     if (!sync_handle) {
+        OST_LOG_ERROR("Failed: sync_handle is NULL in register_tasks_and_bind_chunks.");
         return -1;
     }
 
-    ret = construct_and_register_worker_task(ost_handle, chunks, chunk_num, type, task_func, urma_info, &sync);
+    ret = construct_and_register_worker_task(
+        ost_handle, chunks, chunk_num, type, task_func, urma_info, &sync, notify_callback);
     if (ret != 0) {
         return -1;
     }
@@ -592,6 +704,8 @@ static int send_single_chunk(urma_jetty_info_t *jetty_info,
                              uint32_t client_key)
 {
     urma_write_info_t write_info = build_write_info(jetty_info, local_src, remote_dst, len, server_key, client_key);
+    write_info.user_ctx_server.bs.chunk_type = LAST_CHUNK;
+    write_info.user_ctx_client.bs.chunk_type = LAST_CHUNK;
     chunk_info_t chunk = {.src = local_src[0].addr, .dst = remote_dst[0].addr, .len = len};
     if (urma_write_with_notify(write_info, &chunk) != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: URMA write_with_notify returned failure "
@@ -643,6 +757,11 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
 {
     os_transport_handle_t *ost_handle = NULL;
 
+    OST_LOG_INFO("Initializing os_transport (urma_ctx=%p, ost_cfg=%p, handle=%p).",
+                 (void *)urma_ctx,
+                 (void *)ost_cfg,
+                 (void *)handle);
+
     if (!ost_cfg || !handle) {
         OST_LOG_ERROR("Failed: invalid arguments (ost_cfg=%p, handle=%p).", (void *)ost_cfg, (void *)handle);
         return -1;
@@ -673,7 +792,9 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     ost_handle->thread_pool = thread_pool_init(ost_cfg->worker_thread_num, 0);
     if (!ost_handle->thread_pool) {
         if (ost_cfg->worker_thread_num == 0) {
-            OST_LOG_INFO("Return: worker_thread_num is 0");
+            OST_LOG_WARN("os_transport initialized without worker threads because worker_thread_num is 0.");
+            g_inited = 0;
+            free(ost_handle);
             return 0;
         }
         OST_LOG_ERROR("Failed: thread_pool_init returned NULL "
@@ -742,11 +863,15 @@ uint32_t os_transport_send(void *handle,
         *ret_sync_handle = NULL;
     }
 
+    OST_LOG_INFO("Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
+
     if (validate_send_input(handle, jetty_info, local_src, remote_dst, len, ret_sync_handle) != 0) {
         return ret;
     }
 
     if (len <= DEFAULT_CHUNK_SIZE) {
+        OST_LOG_INFO(
+            "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
         return send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
     }
 
@@ -759,12 +884,22 @@ uint32_t os_transport_send(void *handle,
     urma_info.write_info = write_info;
 
     if (register_tasks_and_bind_chunks(
-            ost_handle, chunks, chunks_num, SEND_TASK, send_task_worker_func, urma_info, &sync_handle)
+            ost_handle, chunks, chunks_num, SEND_TASK, send_task_worker_func, urma_info, &sync_handle, NULL)
         != 0) {
+        OST_LOG_ERROR("Failed: unable to register async send tasks "
+                      "(server_key=%u, client_key=%u, chunk_count=%lu).",
+                      server_key,
+                      client_key,
+                      chunks_num);
         free(chunks);
         return ret;
     }
     *ret_sync_handle = sync_handle;
+    OST_LOG_INFO("Async send request registered successfully "
+                 "(server_key=%u, client_key=%u, chunk_count=%lu).",
+                 server_key,
+                 client_key,
+                 chunks_num);
     if (urma_write_with_notify(write_info, &chunks[0]) != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: first chunk submission returned URMA error "
                       "(total_len=%u, chunk_count=%lu, server_key=%u, client_key=%u).",
@@ -788,7 +923,8 @@ uint32_t os_transport_recv(void *handle,
                            ost_device_info_t *device_dst,
                            uint32_t len,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle)
+                           task_sync_t **ret_sync_handle,
+                           notify_callback_t notify_callback)
 {
     urma_info_t urma_info = {0};
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
@@ -800,7 +936,9 @@ uint32_t os_transport_recv(void *handle,
         *ret_sync_handle = NULL;
     }
 
-    if (validate_recv_input(handle, host_src, device_dst, len, ret_sync_handle) != 0) {
+    OST_LOG_INFO("Submitting recv request (len=%u, client_key=%u).", len, client_key);
+
+    if (validate_recv_input(handle, host_src, device_dst, len, ret_sync_handle, notify_callback) != 0) {
         return -1;
     }
 
@@ -812,13 +950,19 @@ uint32_t os_transport_recv(void *handle,
         .jfr = device_dst->jfr, .local_tseg = host_src->tseg, .device_info = *device_dst, .request_id = client_key};
 
     if (register_tasks_and_bind_chunks(
-            ost_handle, chunks, chunks_num, RECV_TASK, recv_task_worker_func, urma_info, &sync_handle)
+            ost_handle, chunks, chunks_num, RECV_TASK, recv_task_worker_func, urma_info, &sync_handle, notify_callback)
         != 0) {
+        OST_LOG_ERROR("Failed: unable to register async recv tasks "
+                      "(client_key=%u, chunk_count=%lu).",
+                      client_key,
+                      chunks_num);
         free(chunks);
         return -1;
     }
 
     *ret_sync_handle = sync_handle;
+    OST_LOG_INFO(
+        "Async recv request registered successfully (client_key=%u, chunk_count=%lu).", client_key, chunks_num);
     for (uint64_t i = 0; i < chunks_num; i++) {
         if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
             OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
@@ -840,6 +984,13 @@ uint32_t os_transport_recv(void *handle,
 
 int os_transport_wake_up_task(void *handle, void *cr_t)
 {
+    int ret;
+
+    if (!handle || !cr_t) {
+        OST_LOG_ERROR("Failed: invalid arguments in os_transport_wake_up_task (handle=%p, cr_t=%p).", handle, cr_t);
+        return -1;
+    }
+
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     urma_cr_t *cr = (urma_cr_t *)cr_t;
     ThreadPoolHandle pool = ost_handle->thread_pool;
@@ -855,12 +1006,25 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     }
     uint32_t request_id = user_data.bs.request_id;
 
-    return thread_pool_wake_up_worker_by_req_id(pool, request_id);
+    /*
+     * 线程池会保存本次completion的user_data副本；后续recv worker再把对应副本的
+     * 指针传入notify_callback，避免传递当前栈变量地址。
+     */
+    ret = thread_pool_wake_up_worker_by_req_id(pool, request_id, &user_data);
+    if (ret != 0) {
+        OST_LOG_WARN("Failed to wake worker for completion event "
+                     "(request_id=%u, opcode=%d).",
+                     request_id,
+                     opcode);
+    }
+
+    return ret;
 }
 
 uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
 {
     uint32_t completed_success = 0;
+    uint32_t request_id;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     task_group_t *task_group;
 
@@ -874,10 +1038,14 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
         return -1;
     }
 
+    request_id = task_group->tasks[0].request_id;
+
+    OST_LOG_INFO(
+        "Waiting for request completion (request_id=%u, total_tasks=%lu).", request_id, sync_handle->total_tasks);
+
     completed_success = wait_for_task_complete(sync_handle);
 
     if (completed_success != 0) {
-        uint32_t request_id = task_group->tasks[0].request_id;
         OST_LOG_WARN("Detected incomplete request and will cancel remaining tasks "
                      "(request_id=%u, completed=%lu, total=%lu).",
                      request_id,
@@ -886,12 +1054,44 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
         thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
     }
     free_sync_owned_resources(sync_handle);
+    if (completed_success == 0) {
+        OST_LOG_INFO("Request completed and resources released successfully (request_id=%u).", request_id);
+    } else {
+        OST_LOG_WARN("Request finished with incomplete status and resources were released (request_id=%u).",
+                     request_id);
+    }
     return completed_success;
+}
+
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id)
+{
+    os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
+
+    if (!ost_handle) {
+        OST_LOG_ERROR("Failed: handle is NULL.");
+        return -1;
+    }
+    if (!g_inited) {
+        OST_LOG_ERROR("Failed: os_transport is not initialized.");
+        return -1;
+    }
+
+    int ret = thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
+    if (ret < 0) {
+        OST_LOG_WARN("Failed to cancel tasks for request_id=%u.", request_id);
+        return -1;
+    }
+    free_sync_owned_resources(*sync_handle);
+    *sync_handle = NULL;
+    OST_LOG_INFO("Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
+    return 0;
 }
 
 uint32_t os_transport_destroy(void *handle)
 {
     os_transport_handle_t *ost_handle;
+
+    OST_LOG_INFO("Destroying os_transport handle (handle=%p).", handle);
 
     if (!handle) {
         OST_LOG_ERROR("Failed: handle is NULL.");

@@ -5,7 +5,7 @@ option(OS_TRANSPORT_BUILD_TESTS "Build OS_TRANSPORT test binaries" OFF)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # 关闭隐式函数声明警告
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-implicit-function-declaration")
+# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-implicit-function-declaration")
 
 # 收集所有源码
 file(GLOB SRC_FILES src/*.c)
@@ -21,31 +21,22 @@ else()
     message(STATUS "Found URMA library: ${URMA_LIB}")
 endif()
 
-# 查找 CUDA 运行时库
-find_library(CUDART_LIB cudart
-    HINTS /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu /usr/lib64
-    DOC "CUDA runtime library path"
-)
-if(NOT CUDART_LIB)
-    message(WARNING "CUDA runtime library not found. Please ensure CUDA is installed.")
-else()
-    message(STATUS "Found CUDA runtime library: ${CUDART_LIB}")
-endif()
-
 # 编译动态库
 add_library(os_transport SHARED
     ${SRC_FILES}
 )
 
-# 链接pthread、urma、cuda
+# 链接pthread、urma
 target_link_libraries(os_transport
     pthread
     ${URMA_LIB}
-    ${CUDART_LIB}
 )
 
-# 如果未找到 URMA 或 CUDA，可允许继续构建（因为测试模式可能不需要），但这里不强制
-if(NOT URMA_LIB OR NOT CUDART_LIB)
+# 共享库在链接期就必须解析完全部符号，避免把 undefined symbol 留到 dlopen 阶段才暴露
+target_link_options(os_transport PRIVATE -Wl,-z,defs)
+
+# 如果未找到 URMA，可允许继续构建（因为测试模式可能不需要），但这里不强制
+if(NOT URMA_LIB)
     message(WARNING "Missing required libraries. The built library may have undefined symbols.")
 endif()
 
@@ -78,8 +69,16 @@ install(
 
 if(OS_TRANSPORT_BUILD_TESTS)
     # 编译测试程序
-    add_executable(test_thread_pool test/test_thread_pool.c)
-    target_link_libraries(test_thread_pool os_transport pthread)
+    add_executable(test_thread_pool
+        test/test_thread_pool.c
+        src/os_transport_thread_pool.c
+        src/os_transport_log.c
+    )
+    target_include_directories(test_thread_pool
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_thread_pool pthread)
 
     # os_transport.c 白盒单元测试（使用mock隔离外部依赖）
     add_executable(test_os_transport_unit test/test_os_transport_unit.c)

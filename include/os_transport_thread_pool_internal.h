@@ -1,22 +1,15 @@
 #ifndef OS_TRANSPORT_THREAD_POOL_INTERNAL_H
 #define OS_TRANSPORT_THREAD_POOL_INTERNAL_H
 
+#include "os_transport.h"
 #include "os_transport_thread_pool.h"
-#include "os_transport_urma.h"
-#include "os_transport_log_internal.h"
+#include <ub/umdk/urma/urma_api.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef union {
-    struct {
-        uint64_t chunk_type : 2;
-        uint64_t chunk_id : 6;
-        uint64_t chunk_size : 24;
-        uint64_t request_id : 32;
-    } bs;
-    uint64_t user_ctx;
-} TransportData;
+// 兼容仍通过内部头文件使用TransportData的调用方；线程池内部统一使用os_transport_user_data_t。
+typedef os_transport_user_data_t TransportData;
 
 /**
  * @brief Worker线程状态枚举
@@ -34,20 +27,29 @@ typedef struct TaskNode {
     struct TaskNode *next;
 } TaskNode;
 
+typedef struct PendingReqNode {
+    uint32_t request_id;
+    // 每个唤醒事件携带一份user_data副本，避免多个completion覆盖同一request上下文
+    TransportData user_data;
+    struct PendingReqNode *next;
+} PendingReqNode;
+
 /**
  * @brief Worker线程结构体（链表版本）
  */
 typedef struct {
-    pthread_t tid;            // 线程ID
-    pthread_mutex_t mutex;    // 线程锁
-    pthread_cond_t cond_task; // 任务通知条件变量
-    WorkerState state;        // 线程状态
-    int worker_idx;           // 线程索引
-    ThreadPoolHandle pool;    // 所属线程池句柄
-    TaskNode *queue_head;     // 队首
-    TaskNode *queue_tail;     // 队尾
-    uint32_t queue_size;      // 当前任务数
-    uint32_t pending_req;     // 等待执行的 request_id
+    pthread_t tid;                    // 线程ID
+    pthread_mutex_t mutex;            // 线程锁
+    pthread_cond_t cond_task;         // 任务通知条件变量
+    WorkerState state;                // 线程状态
+    int worker_idx;                   // 线程索引
+    ThreadPoolHandle pool;            // 所属线程池句柄
+    TaskNode *queue_head;             // 队首
+    TaskNode *queue_tail;             // 队尾
+    uint32_t queue_size;              // 当前任务数
+    PendingReqNode *pending_req_head; // 待执行 request_id/user_data 队首
+    PendingReqNode *pending_req_tail; // 待执行 request_id/user_data 队尾
+    uint32_t pending_req_count;       // 等待执行的 request_id 数量
 } WorkerThread;
 
 /**

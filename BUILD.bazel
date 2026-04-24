@@ -4,6 +4,7 @@ COMMON_SRCS = [
     "src/os_transport.c",
     "src/os_transport_thread_pool.c",
     "src/os_transport_urma.c",
+    "src/os_transport_log.c",
 ]
 
 COMMON_COPTS = [
@@ -30,6 +31,12 @@ cc_library(
 )
 
 cc_library(
+    name = "os_transport_unit_textual_src",
+    textual_hdrs = ["src/os_transport.c"],
+    deps = [":os_transport_hdrs"],
+)
+
+cc_library(
     name = "os_transport_lib",
     srcs = COMMON_SRCS,
     hdrs = glob(["include/*.h"]),
@@ -37,7 +44,6 @@ cc_library(
     includes = ["include"],
     deps = [
         ":os_transport_hdrs",
-        "@local_cuda//:cuda",
         "@local_urma//:urma",
     ],
     linkopts = [
@@ -52,11 +58,11 @@ cc_binary(
     linkshared = True,
     deps = [
         ":os_transport_hdrs",
-        "@local_cuda//:cuda",
         "@local_urma//:urma",
     ],
     linkopts = [
         "-lpthread",
+        "-Wl,-z,defs",
     ],
 )
 
@@ -65,8 +71,9 @@ cc_test(
     srcs = [
         "test/test_thread_pool.c",
         "src/os_transport_thread_pool.c",
+        "src/os_transport_log.c",
     ],
-    copts = COMMON_COPTS + ["-DTEST_MODE"],
+    copts = COMMON_COPTS,
     includes = ["include"],
     linkopts = ["-lpthread"],
     deps = [":os_transport_hdrs"],
@@ -83,5 +90,8 @@ cc_test(
         "src",
     ],
     linkopts = ["-lpthread"],
-    deps = [":os_transport_hdrs"],
+    deps = [
+        ":os_transport_hdrs",
+        ":os_transport_unit_textual_src",
+    ],
 )

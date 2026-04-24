@@ -5,11 +5,19 @@
 #include <stdint.h>
 
 /**
+ * @brief 任务执行前准备回调
+ * @param task_arg 任务参数
+ * @param user_data 唤醒事件携带的透传数据
+ */
+typedef void (*TaskPrepareCb)(void *task_arg, void *user_data);
+
+/**
  * @brief 任务结构体
  */
 typedef struct {
     uint64_t task_id;            // 唯一任务ID
     uint32_t request_id;         // 请求ID（相同批次任务此值相同）
+    TaskPrepareCb prepare_cb;    // 任务执行前准备回调
     int (*task_func)(void *arg); // 任务执行函数
     void *task_arg;              // 任务参数（用户自行管理内存）
     bool is_completed;           // 任务完成标记
@@ -48,9 +56,10 @@ int thread_pool_start(ThreadPoolHandle handle);
  * @brief 基于req_id找到对应的worker上下文，并唤醒对应的worker线程
  * @param handle 线程池句柄
  * @param request_id request_id
+ * @param user_data os_transport_wake_up_task解析出的completion user_data指针
  * @return 0=成功，-1=失败
  */
-int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id);
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data);
 
 /**
  * @brief 外部提交单个任务
