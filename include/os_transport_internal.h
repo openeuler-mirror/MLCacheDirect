@@ -42,6 +42,9 @@ typedef struct os_transport_handle {
     uint32_t worker_thread_num;
     bool urma_event_mode;
     ThreadPoolHandle thread_pool;
+    pthread_mutex_t recv_queue_mutex;
+    uint32_t recv_queue_available;
+    uint32_t recv_queue_acquired;
 } os_transport_handle_t;
 
 typedef enum {
