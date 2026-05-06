@@ -102,20 +102,14 @@ private:
 
 class H2DTest {
 public:
-    H2DTest(const std::string& host, int port = 18481, int thread_id = 0, int gpu_id = 0) 
-        : thread_id_(thread_id), gpu_id_(gpu_id) {
-        ConnectOptions connectOptions;
-        connectOptions.host = host;
-        connectOptions.port = port;
-        connectOptions.accessKey = "";
-        connectOptions.secretKey = "";
-        connectOptions.deviceId = std::to_string(gpu_id);
-        
-        client_ = std::make_unique<KVClient>(connectOptions);
-        client_->Init();
-        TLOG(thread_id_, "Connected to " << host << ":" << port << " (GPU: " << gpu_id << ")");
+    H2DTest(std::shared_ptr<KVClient> client, int thread_id = 0, int gpu_id = 0)
+        : client_(client), thread_id_(thread_id), gpu_id_(gpu_id)
+    {
+        if (client_ == nullptr) {
+            throw std::runtime_error("shared KVClient is nullptr");
+        }
+        TLOG(thread_id_, "Using shared KVClient instance: " << client_.get() << " (GPU: " << gpu_id << ")");
     }
-
     void SetDataParams(const std::string& value_prefix, 
                       const std::vector<std::string>& custom_keys,
                       int count,
@@ -237,10 +231,11 @@ public:
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             devShmChunks.push_back({dev_ptr, it.second.size()});
         }
-        
+        if (barrier_) barrier_->Wait();
         TIMER_START(Mget);
         auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
         TIMER_END(thread_id_, Mget, "MGETH2D");
+        if (barrier_) barrier_->Wait();
 
         if (ret == datasystem::Status::OK()) {
             TLOG(thread_id_, "MGetH2D success!"); 
@@ -349,6 +344,7 @@ public:
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             dev_ptrs.push_back(dev_ptr);
         }
+        if (barrier_) barrier_->Wait();
 
         TIMER_START(Get);
         Status rc = client_->Get(keys, values, timeout_ms);
@@ -391,6 +387,9 @@ public:
                 std::system(("diff /tmp/expect_T" + std::to_string(thread_id_) + 
                            " /tmp/real_T" + std::to_string(thread_id_)).c_str());
             }
+        }
+        for (auto ptr : dev_ptrs) {
+            cudaFree(ptr);
         }
     }
 
@@ -459,7 +458,7 @@ private:
         }
     }
 
-    std::unique_ptr<KVClient> client_;
+    std::shared_ptr<KVClient> client_;
     std::vector<std::pair<void*, size_t>> devShmChunks_;
     std::vector<std::pair<std::string, std::string>> data_;
     std::vector<long long> records;
@@ -474,15 +473,15 @@ private:
     std::shared_ptr<Barrier> barrier_;
 };
 
-void RunWorker(const std::string& host, int port,
-               const std::string& cmd, 
+void RunWorker(std::shared_ptr<KVClient> shared_client,
+               const std::string& cmd,
                int count, int batch, const std::string& value_prefix,
                const std::vector<std::string>& keys, size_t value_size,
-               bool delete_value, int thread_id, 
+               bool delete_value, int thread_id,
                std::shared_ptr<Barrier> barrier,
                int gpu_id) {
     try {
-        H2DTest bench(host, port, thread_id, gpu_id);
+        H2DTest bench(shared_client, thread_id, gpu_id);
         bench.SetDataParams(value_prefix, keys, count, value_size, delete_value);
         bench.SetBarrier(barrier);
         
@@ -649,14 +648,30 @@ int main(int argc, char* argv[]) {
               << "command=" << args.cmd << std::endl;
 
     try {
+        ConnectOptions connectOptions;
+        connectOptions.host = args.host;
+        connectOptions.port = args.port;
+        connectOptions.accessKey = "";
+        connectOptions.secretKey = "";
+        connectOptions.deviceId = std::to_string(args.gpu_id);
+
+        auto sharedClient = std::make_shared<KVClient>(connectOptions);
+        sharedClient->Init();
+
+        std::cout << "[Main] Shared KVClient initialized once: " << sharedClient.get()
+                  << ", host=" << args.host
+                  << ", port=" << args.port
+                  << ", gpu=" << args.gpu_id
+                  << std::endl;
+
         auto barrier = std::make_shared<Barrier>(args.thread_count);
         std::vector<std::thread> threads;
         
         for (int tid = 0; tid < args.thread_count; ++tid) {
-            threads.emplace_back(RunWorker, 
-                               args.host, args.port,
+            threads.emplace_back(RunWorker,
+                               sharedClient,
                                args.cmd,
-                               args.count, args.batch, 
+                               args.count, args.batch,
                                args.value_prefix, args.keys, args.value_size,
                                args.delete_value, tid, barrier, args.gpu_id);
         }
