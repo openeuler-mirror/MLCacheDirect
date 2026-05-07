@@ -4,13 +4,13 @@ project(pipeline_h2d_project LANGUAGES CXX)
 # deps
 find_package(CUDAToolkit REQUIRED)
 execute_process(
-    COMMAND python -c "import site; print(site.getsitepackages()[0])"
+    COMMAND sh -c "pip show openyuanrong-datasystem | grep '^Location:' | awk '{print $2}'"
     OUTPUT_VARIABLE OPENYUANRONG_SITE_PACKAGES
     OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE PYTHON_RESULT
+    RESULT_VARIABLE PIP_SHOW_PATH_RESULT
 )
-if(NOT PYTHON_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to get site-packages path from Python")
+if(NOT PIP_SHOW_PATH_RESULT EQUAL 0 OR NOT OPENYUANRONG_SITE_PACKAGES)
+    message(FATAL_ERROR "Failed to get openyuanrong-datasystem path from pip show")
 endif()
 set(OPENYUANRONG_DATASYSTEM_PATH "${OPENYUANRONG_SITE_PACKAGES}/yr")
 
