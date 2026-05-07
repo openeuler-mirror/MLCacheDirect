@@ -204,7 +204,7 @@ public:
         std::cout << std::endl;
     }
 
-    void RunMGetH2D(int count, int timeout_ms = 6000000) {
+    void RunMGetH2D(int count, int timeout_ms = 60000) {
         GenerateData(count);
         
         if (barrier_) barrier_->Wait();
@@ -262,7 +262,7 @@ public:
         }
     }
 
-    void MGetH2DBatch(int count, int batch, int timeout_ms = 6000000) {
+    void MGetH2DBatch(int count, int batch, int timeout_ms = 60000) {
         GenerateData(count);
         
         if (barrier_) barrier_->Wait();
@@ -317,7 +317,7 @@ public:
         }
     }
 
-    void Get(int count, int timeout_ms = 600000) {
+    void Get(int count, int timeout_ms = 60000) {
         GenerateData(count);
         
         if (barrier_) barrier_->Wait();
