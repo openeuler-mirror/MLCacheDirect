@@ -15,13 +15,84 @@ static int g_inited = 0;
 #define OS_TRANSPORT_WAIT_TIMEOUT 1U
 #define OS_TRANSPORT_WAIT_ERROR   ((uint32_t)-1)
 
-static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, size_t task_arg_size)
+// init和destroy接收队列限制器，ost_handle外部调用时已校验非空
+static int init_recv_queue_limiter(os_transport_handle_t *ost_handle, uint32_t recv_queue_capacity)
+{
+    int ret;
+    uint32_t capacity = recv_queue_capacity == 0 ? DEFAULT_RECV_QUEUE_CAPACITY : recv_queue_capacity;
+
+    ret = pthread_mutex_init(&ost_handle->recv_queue_mutex, NULL);
+    if (ret != 0) {
+        OST_LOG_ERROR("Failed: pthread_mutex_init returned %d in init_recv_queue_limiter.", ret);
+        return -1;
+    }
+
+    ost_handle->recv_queue_available = capacity;
+    ost_handle->recv_queue_acquired = 0;
+    OST_LOG_INFO("Recv queue limiter enabled (available=%u, acquired=%u).",
+                 ost_handle->recv_queue_available,
+                 ost_handle->recv_queue_acquired);
+    return 0;
+}
+
+static void destroy_recv_queue_limiter(os_transport_handle_t *ost_handle)
+{
+    pthread_mutex_destroy(&ost_handle->recv_queue_mutex);
+}
+
+static int acquire_recv_queue_resources(os_transport_handle_t *ost_handle,
+                                        uint32_t count,
+                                        uint32_t *reused_count,
+                                        uint32_t *post_count)
+{
+    uint32_t reused;
+    uint32_t required_new;
+
+    if (!ost_handle || !reused_count || !post_count) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&ost_handle->recv_queue_mutex);
+    reused = ost_handle->recv_queue_acquired < count ? ost_handle->recv_queue_acquired : count;
+    required_new = count - reused;
+    if (ost_handle->recv_queue_available < required_new) {
+        OST_LOG_WARN("Recv queue resources are insufficient (available=%u, acquired=%u, requested=%u, reusable=%u).",
+                     ost_handle->recv_queue_available,
+                     ost_handle->recv_queue_acquired,
+                     count,
+                     reused);
+        pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
+        return -1;
+    }
+
+    ost_handle->recv_queue_acquired -= reused;
+    ost_handle->recv_queue_available -= required_new;
+    pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
+
+    *reused_count = reused;
+    *post_count = required_new;
+    return 0;
+}
+
+static void release_recv_queue_resources(os_transport_handle_t *ost_handle, uint32_t available, uint32_t acquired)
+{
+    if (!ost_handle || (available == 0 && acquired == 0)) {
+        return;
+    }
+
+    pthread_mutex_lock(&ost_handle->recv_queue_mutex);
+    ost_handle->recv_queue_available += available;
+    ost_handle->recv_queue_acquired += acquired;
+    pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
+}
+
+static int alloc_task_group(task_group_t **task_group_out, uint32_t task_num, uint32_t task_arg_size)
 {
     task_group_t *task_group = NULL;
 
     if (!task_group_out || task_num == 0 || task_arg_size == 0) {
         OST_LOG_ERROR("Failed: invalid arguments for alloc_task_group "
-                      "(task_group_out=%p, task_num=%lu, task_arg_size=%zu).",
+                      "(task_group_out=%p, task_num=%u, task_arg_size=%zu).",
                       (void *)task_group_out,
                       task_num,
                       task_arg_size);
@@ -38,7 +109,7 @@ static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, si
     task_group->task_args = calloc(task_num, task_arg_size);
     if (!task_group->tasks || !task_group->task_args) {
         OST_LOG_ERROR("Failed: unable to allocate task group buffers "
-                      "(task_num=%lu, task_arg_size=%zu).",
+                      "(task_num=%u, task_arg_size=%zu).",
                       task_num,
                       task_arg_size);
         free(task_group->task_args);
@@ -413,17 +484,17 @@ static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
 }
 
 static uint32_t common_split_chunks(
-    uint64_t src_addr, uint64_t dst_addr, uint32_t len, chunk_info_t **ret_chunks, uint64_t *ret_chunk_num)
+    uint64_t src_addr, uint64_t dst_addr, uint32_t len, chunk_info_t **ret_chunks, uint32_t *ret_chunk_num)
 {
-    size_t remain_len = len;
-    size_t chunks_num;
+    uint32_t remain_len = len;
+    uint32_t chunks_num;
     chunk_info_t *chunks;
 
     chunks_num = (remain_len + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE;
     chunks = (chunk_info_t *)malloc(sizeof(chunk_info_t) * chunks_num);
     if (!chunks) {
         OST_LOG_ERROR("Failed: unable to allocate chunk array "
-                      "(src_addr=0x%lx, dst_addr=0x%lx, len=%u, chunk_count=%zu).",
+                      "(src_addr=0x%lx, dst_addr=0x%lx, len=%u, chunk_count=%u).",
                       src_addr,
                       dst_addr,
                       len,
@@ -431,7 +502,7 @@ static uint32_t common_split_chunks(
         return -1;
     }
 
-    for (size_t i = 0; i < chunks_num; i++) {
+    for (uint32_t i = 0; i < chunks_num; i++) {
         chunks[i].src = src_addr + i * DEFAULT_CHUNK_SIZE;
         chunks[i].dst = dst_addr + i * DEFAULT_CHUNK_SIZE;
         chunks[i].len = (remain_len - i * DEFAULT_CHUNK_SIZE) > DEFAULT_CHUNK_SIZE ?
@@ -448,7 +519,7 @@ static uint32_t send_split_chunks(ost_buffer_info_t *local_src,
                                   ost_buffer_info_t *remote_dst,
                                   uint32_t len,
                                   chunk_info_t **ret_chunks,
-                                  uint64_t *ret_chunk_num)
+                                  uint32_t *ret_chunk_num)
 {
     uint64_t src_addr;
     uint64_t dst_addr;
@@ -471,7 +542,7 @@ static uint32_t recv_split_chunks(ost_buffer_info_t *host,
                                   ost_device_info_t *device,
                                   uint32_t len,
                                   chunk_info_t **ret_chunks,
-                                  uint64_t *ret_chunk_num)
+                                  uint32_t *ret_chunk_num)
 {
     uint64_t src_addr;
     uint64_t dst_addr;
@@ -660,27 +731,27 @@ static int recv_task_worker_func(void *arg)
 
 static int register_send_tasks(os_transport_handle_t *ost_handle,
                                chunk_info_t *chunks,
-                               uint64_t chunk_num,
+                               uint32_t chunk_num,
                                int (*task_func)(void *),
                                urma_info_t urma_info,
                                task_sync_t *sync)
 {
     // 第0个chunk由调用线程发送，剩余chunk注册为task供worker线程发送，因此task_num为chunk_num-1
-    uint64_t task_num = chunk_num - 1;
+    uint32_t task_num = chunk_num - 1;
     uint64_t *task_ids = NULL;
     task_group_t *task_group = NULL;
     send_task_arg_t *task_args = NULL;
 
     if (chunk_num < 2) {
         OST_LOG_ERROR("Failed: chunk_num must be >= 2 for async send path "
-                      "(chunk_num=%lu).",
+                      "(chunk_num=%u).",
                       chunk_num);
         return -1;
     }
 
     if (alloc_task_group(&task_group, task_num, sizeof(send_task_arg_t)) != 0) {
         OST_LOG_ERROR("Failed: unable to allocate task group "
-                      "(task_num=%lu, arg_size=%zu).",
+                      "(task_num=%u, arg_size=%zu).",
                       task_num,
                       sizeof(send_task_arg_t));
         return -1;
@@ -689,8 +760,8 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     sync->total_tasks = task_num;
     // 从第1个chunk开始注册task，第0个chunk由调用线程发送，确保task_id与chunk_id保持一致，便于追踪和调试
-    for (uint64_t i = 0; i < task_num; i++) {
-        uint64_t chunk_idx = i + 1;
+    for (uint32_t i = 0; i < task_num; i++) {
+        uint32_t chunk_idx = i + 1;
         bool is_last_chunk = (chunk_idx == chunk_num - 1);
         uint32_t request_id = (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id);
 
@@ -703,7 +774,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
         thread_pool_submit_batch_tasks(ost_handle->thread_pool, task_group->tasks, task_num, NULL, NULL, NULL, NULL);
     if (!task_ids) {
         OST_LOG_ERROR("Failed: thread_pool_submit_batch_tasks returned NULL "
-                      "(request_id=%u, task_num=%lu).",
+                      "(request_id=%u, task_num=%u).",
                       (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
                       task_num);
         free(task_group->task_args);
@@ -714,7 +785,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_INFO("Registered async send tasks (request_id=%u, task_num=%lu, chunk_num=%lu).",
+    OST_LOG_INFO("Registered async send tasks (request_id=%u, task_num=%u, chunk_num=%u).",
                  (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
                  task_num,
                  chunk_num);
@@ -723,7 +794,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
 static int register_recv_tasks(os_transport_handle_t *ost_handle,
                                chunk_info_t *chunks,
-                               uint64_t chunk_num,
+                               uint32_t chunk_num,
                                int (*task_func)(void *),
                                urma_info_t urma_info,
                                task_sync_t *sync,
@@ -735,7 +806,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 
     if (alloc_task_group(&task_group, chunk_num, sizeof(recv_task_arg_t)) != 0) {
         OST_LOG_ERROR("Failed: unable to allocate task group "
-                      "(chunk_num=%lu, arg_size=%zu).",
+                      "(chunk_num=%u, arg_size=%zu).",
                       chunk_num,
                       sizeof(recv_task_arg_t));
         return -1;
@@ -743,7 +814,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
     task_args = (recv_task_arg_t *)task_group->task_args;
 
     sync->total_tasks = chunk_num;
-    for (uint64_t i = 0; i < chunk_num; i++) {
+    for (uint32_t i = 0; i < chunk_num; i++) {
         bool is_last_chunk = (i == chunk_num - 1);
         uint32_t request_id = (uint32_t)(urma_info.recv_info.request_id);
         construct_recv_task_arg(&task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync, notify_callback);
@@ -755,7 +826,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
         thread_pool_submit_batch_tasks(ost_handle->thread_pool, task_group->tasks, chunk_num, NULL, NULL, NULL, NULL);
     if (!task_ids) {
         OST_LOG_ERROR("Failed: thread_pool_submit_batch_tasks returned NULL "
-                      "(request_id=%u, task_num=%lu).",
+                      "(request_id=%u, task_num=%u).",
                       (uint32_t)(urma_info.recv_info.request_id),
                       chunk_num);
         free(task_group->task_args);
@@ -766,7 +837,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_INFO("Registered async recv tasks (request_id=%u, task_num=%lu).",
+    OST_LOG_INFO("Registered async recv tasks (request_id=%u, task_num=%u).",
                  (uint32_t)(urma_info.recv_info.request_id),
                  chunk_num);
     return 0;
@@ -775,7 +846,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 // 构造并注册所有task，sync_handle用于与主函数同步
 static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_handle,
                                                    chunk_info_t *chunks,
-                                                   uint64_t chunk_num,
+                                                   uint32_t chunk_num,
                                                    task_type_t type,
                                                    int (*task_func)(void *),
                                                    urma_info_t urma_info,
@@ -787,7 +858,7 @@ static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_ha
 
     if (!ost_handle || !chunks || !sync_handle || chunk_num == 0) {
         OST_LOG_ERROR("Failed: invalid arguments "
-                      "(ost_handle=%p, chunks=%p, sync_handle=%p, chunk_num=%lu, type=%d).",
+                      "(ost_handle=%p, chunks=%p, sync_handle=%p, chunk_num=%u, type=%d).",
                       (void *)ost_handle,
                       (void *)chunks,
                       (void *)sync_handle,
@@ -813,7 +884,7 @@ static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_ha
 
     if (ret != 0) {
         OST_LOG_ERROR("Failed: register worker task path returned error "
-                      "(type=%d, chunk_num=%lu).",
+                      "(type=%d, chunk_num=%u).",
                       type,
                       chunk_num);
         pthread_mutex_destroy(&sync->mutex);
@@ -828,7 +899,7 @@ static uint32_t construct_and_register_worker_task(os_transport_handle_t *ost_ha
 
 static int register_tasks_and_bind_chunks(os_transport_handle_t *ost_handle,
                                           chunk_info_t *chunks,
-                                          uint64_t chunk_num,
+                                          uint32_t chunk_num,
                                           task_type_t type,
                                           int (*task_func)(void *),
                                           urma_info_t urma_info,
@@ -943,6 +1014,12 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     ost_handle->worker_thread_num = ost_cfg->worker_thread_num;
     ost_handle->urma_event_mode = ost_cfg->urma_event_mode;
 
+    if (init_recv_queue_limiter(ost_handle, ost_cfg->recv_queue_capacity) != 0) {
+        OST_LOG_ERROR("Failed: init_recv_queue_limiter returned error.");
+        free(ost_handle);
+        return -1;
+    }
+
     g_inited = 1;
 
     // 初始化线程池
@@ -952,6 +1029,7 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
         if (ost_cfg->worker_thread_num == 0) {
             OST_LOG_WARN("os_transport initialized without worker threads because worker_thread_num is 0.");
             g_inited = 0;
+            destroy_recv_queue_limiter(ost_handle);
             free(ost_handle);
             return 0;
         }
@@ -987,6 +1065,7 @@ destroy_thread_pool:
     ost_handle->thread_pool = NULL;
 init_fail:
     g_inited = 0;
+    destroy_recv_queue_limiter(ost_handle);
     free(ost_handle);
     return -1;
 }
@@ -1013,7 +1092,7 @@ uint32_t os_transport_send(void *handle,
     urma_info_t urma_info;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     chunk_info_t *chunks;
-    uint64_t chunks_num;
+    uint32_t chunks_num;
     task_sync_t *sync_handle = NULL;
     uint32_t ret = -1;
 
@@ -1045,7 +1124,7 @@ uint32_t os_transport_send(void *handle,
             ost_handle, chunks, chunks_num, SEND_TASK, send_task_worker_func, urma_info, &sync_handle, NULL)
         != 0) {
         OST_LOG_ERROR("Failed: unable to register async send tasks "
-                      "(server_key=%u, client_key=%u, chunk_count=%lu).",
+                      "(server_key=%u, client_key=%u, chunk_count=%u).",
                       server_key,
                       client_key,
                       chunks_num);
@@ -1054,13 +1133,13 @@ uint32_t os_transport_send(void *handle,
     }
     *ret_sync_handle = sync_handle;
     OST_LOG_INFO("Async send request registered successfully "
-                 "(server_key=%u, client_key=%u, chunk_count=%lu).",
+                 "(server_key=%u, client_key=%u, chunk_count=%u).",
                  server_key,
                  client_key,
                  chunks_num);
     if (urma_write_with_notify(write_info, &chunks[0]) != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: first chunk submission returned URMA error "
-                      "(total_len=%u, chunk_count=%lu, server_key=%u, client_key=%u).",
+                      "(total_len=%u, chunk_count=%u, server_key=%u, client_key=%u).",
                       len,
                       chunks_num,
                       server_key,
@@ -1087,7 +1166,9 @@ uint32_t os_transport_recv(void *handle,
     urma_info_t urma_info = {0};
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     chunk_info_t *chunks;
-    uint64_t chunks_num;
+    uint32_t chunks_num;
+    uint32_t reused_recv_queue_count = 0;
+    uint32_t post_recv_queue_count = 0;
     task_sync_t *sync_handle = NULL;
 
     if (ret_sync_handle) {
@@ -1107,27 +1188,47 @@ uint32_t os_transport_recv(void *handle,
     urma_info.recv_info = (urma_recv_info_t){
         .jfr = device_dst->jfr, .local_tseg = host_src->tseg, .device_info = *device_dst, .request_id = client_key};
 
+    if (acquire_recv_queue_resources(ost_handle, chunks_num, &reused_recv_queue_count, &post_recv_queue_count) != 0) {
+        OST_LOG_ERROR("Failed: unable to acquire recv queue resources "
+                      "(len=%u, chunk_count=%u, client_key=%u).",
+                      len,
+                      chunks_num,
+                      client_key);
+        free(chunks);
+        return -1;
+    }
+    OST_LOG_INFO("Recv queue resources prepared (client_key=%u, chunk_count=%u, reused=%u, need_post=%u).",
+                 client_key,
+                 chunks_num,
+                 reused_recv_queue_count,
+                 post_recv_queue_count);
+
     if (register_tasks_and_bind_chunks(
             ost_handle, chunks, chunks_num, RECV_TASK, recv_task_worker_func, urma_info, &sync_handle, notify_callback)
         != 0) {
         OST_LOG_ERROR("Failed: unable to register async recv tasks "
-                      "(client_key=%u, chunk_count=%lu).",
+                      "(client_key=%u, chunk_count=%u).",
                       client_key,
                       chunks_num);
+        release_recv_queue_resources(ost_handle, post_recv_queue_count, reused_recv_queue_count);
         free(chunks);
         return -1;
     }
 
-    *ret_sync_handle = sync_handle;
-    OST_LOG_INFO(
-        "Async recv request registered successfully (client_key=%u, chunk_count=%lu).", client_key, chunks_num);
-    for (uint64_t i = 0; i < chunks_num; i++) {
+    OST_LOG_INFO("Async recv request registered successfully (client_key=%u, chunk_count=%u).", client_key, chunks_num);
+    for (uint32_t i = reused_recv_queue_count; i < chunks_num; i++) {
         if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
+            uint32_t successful_post_count = i - reused_recv_queue_count;
+            uint32_t unposted_count = post_recv_queue_count - successful_post_count;
+            release_recv_queue_resources(ost_handle, unposted_count, reused_recv_queue_count + successful_post_count);
             OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
-                          "(len=%u, chunk_count=%lu, client_key=%u).",
+                          "(len=%u, chunk_count=%u, client_key=%u, reused=%u, posted=%u, remaining=%u).",
                           len,
                           chunks_num,
-                          client_key);
+                          client_key,
+                          reused_recv_queue_count,
+                          successful_post_count,
+                          unposted_count);
             // 如果recv提交失败，应该直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
             pthread_mutex_lock(&sync_handle->mutex);
             sync_handle->request_completed = 1;
@@ -1136,6 +1237,7 @@ uint32_t os_transport_recv(void *handle,
             return -1;
         }
     }
+    *ret_sync_handle = sync_handle;
 
     return 0;
 }
@@ -1169,6 +1271,10 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
      * 指针传入notify_callback，避免传递当前栈变量地址。
      */
     ret = thread_pool_wake_up_worker_by_req_id(pool, request_id, &user_data);
+    if (opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
+        release_recv_queue_resources(ost_handle, 1, 0);
+        OST_LOG_INFO("Recv queue resource released after completion (request_id=%u).", request_id);
+    }
     if (ret != 0) {
         OST_LOG_WARN("Failed to wake worker for completion event "
                      "(request_id=%u, opcode=%d).",
@@ -1326,6 +1432,7 @@ uint32_t os_transport_destroy(void *handle)
         thread_pool_destroy(ost_handle->thread_pool);
         ost_handle->thread_pool = NULL;
     }
+    destroy_recv_queue_limiter(ost_handle);
 
     g_inited = 0;
     OST_LOG_INFO("Succeeded: resources released and thread pool stopped "

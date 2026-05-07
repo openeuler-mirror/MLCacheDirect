@@ -24,6 +24,7 @@ int os_transport_log_reg(int level, log_callback_t cb);
 typedef int (*notify_callback_t)(void *user_data);
 
 #define DEFAULT_CHUNK_SIZE (2 * 1024 * 1024) // 2MB
+#define DEFAULT_RECV_QUEUE_CAPACITY 256      // 默认接收队列容量
 
 typedef union {
     struct {
@@ -56,11 +57,12 @@ typedef struct urma_jetty_info {
 
 typedef struct os_transport_cfg {
     bool urma_event_mode;
-    uint8_t reserved1[3];       // 保留字节，保持结构体对齐
-    uint32_t worker_thread_num; // 线程池中工作线程数量
-    urma_jfce_t *jfce;          // 关联的JFCE对象
-    urma_jfc_t *jfc;            // 关联的JFC对象
-    uint32_t reserved2[10];
+    uint8_t reserved1[3];         // 保留字节，保持结构体对齐
+    uint32_t worker_thread_num;   // 线程池中工作线程数量
+    urma_jfce_t *jfce;            // 关联的JFCE对象
+    urma_jfc_t *jfc;              // 关联的JFC对象
+    uint32_t recv_queue_capacity; // 接收队列可用资源初始值
+    uint32_t reserved2[9];
 } os_transport_cfg_t;
 
 typedef struct task_sync task_sync_t;
