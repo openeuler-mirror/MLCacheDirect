@@ -1,15 +1,19 @@
 #include "os_transport_internal.h"
 #include "os_transport_log_internal.h"
 #include "os_transport_thread_pool_internal.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // 全局初始化状态
 static int g_inited = 0;
 
 #define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 6) - 1)
+#define OS_TRANSPORT_WAIT_TIMEOUT 1U
+#define OS_TRANSPORT_WAIT_ERROR   ((uint32_t)-1)
 
 static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, size_t task_arg_size)
 {
@@ -51,7 +55,9 @@ static int alloc_task_group(task_group_t **task_group_out, uint64_t task_num, si
 static int init_task_sync(task_sync_t **sync_out)
 {
     task_sync_t *sync = NULL;
+    pthread_condattr_t cond_attr;
     int ret;
+    bool cond_attr_inited = false;
 
     if (!sync_out) {
         OST_LOG_ERROR("Failed: sync_out is NULL in init_task_sync.");
@@ -71,7 +77,27 @@ static int init_task_sync(task_sync_t **sync_out)
         return -1;
     }
 
-    ret = pthread_cond_init(&sync->cond, NULL);
+    ret = pthread_condattr_init(&cond_attr);
+    if (ret == 0) {
+        cond_attr_inited = true;
+#ifdef CLOCK_MONOTONIC
+        ret = pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+        if (ret != 0) {
+            OST_LOG_ERROR("Failed: pthread_condattr_setclock(CLOCK_MONOTONIC) returned %d.", ret);
+            pthread_condattr_destroy(&cond_attr);
+            pthread_mutex_destroy(&sync->mutex);
+            free(sync);
+            return -1;
+        }
+#endif
+    } else {
+        OST_LOG_WARN("pthread_condattr_init returned %d, fallback to default cond attr.", ret);
+    }
+
+    ret = pthread_cond_init(&sync->cond, cond_attr_inited ? &cond_attr : NULL);
+    if (cond_attr_inited) {
+        pthread_condattr_destroy(&cond_attr);
+    }
     if (ret != 0) {
         OST_LOG_ERROR("Failed: pthread_cond_init returned %d in init_task_sync.", ret);
         pthread_mutex_destroy(&sync->mutex);
@@ -112,60 +138,192 @@ static void free_sync_owned_resources(task_sync_t *sync)
     free(sync);
 }
 
-static uint32_t wait_for_task_complete(task_sync_t *sync_handle)
+static bool sync_all_tasks_accounted_locked(task_sync_t *sync)
 {
-    int ret;
-
-    if (!sync_handle) {
-        OST_LOG_ERROR("Failed: sync_handle is NULL in wait_for_task_complete.");
-        return -1;
-    }
-
-    pthread_mutex_lock(&sync_handle->mutex);
-    while (!sync_handle->request_completed) {
-        ret = pthread_cond_wait(&sync_handle->cond, &sync_handle->mutex);
-        if (ret != 0) {
-            pthread_mutex_unlock(&sync_handle->mutex);
-            OST_LOG_ERROR("Failed: pthread_cond_wait returned %d while waiting for request completion.", ret);
-            return -1;
-        }
-    }
-    pthread_mutex_unlock(&sync_handle->mutex);
-    if (sync_handle->completed_tasks != sync_handle->total_tasks) {
-        OST_LOG_WARN("Request completed early or incompletely "
-                     "(completed=%lu, total=%lu).",
-                     sync_handle->completed_tasks,
-                     sync_handle->total_tasks);
-        return -1;
-    }
-    return 0;
+    return sync->total_tasks == 0 || (sync->completed_tasks + sync->canceled_tasks) >= sync->total_tasks;
 }
 
-static void mark_task_group_completed(task_sync_t *sync, bool task_success)
+static bool sync_should_free_locked(task_sync_t *sync)
 {
+    return sync->release_requested && sync->request_completed && sync_all_tasks_accounted_locked(sync) && !sync->freeing;
+}
+
+static void sync_free_if_ready(task_sync_t *sync)
+{
+    bool should_free = false;
+
     if (!sync) {
         return;
     }
 
-    // 如果当前task执行失败，直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
-    if (!task_success) {
-        OST_LOG_WARN("Task group marked completed early because one task failed.");
-        pthread_mutex_lock(&sync->mutex);
-        sync->request_completed = 1;
-        pthread_cond_signal(&sync->cond);
-        pthread_mutex_unlock(&sync->mutex);
+    pthread_mutex_lock(&sync->mutex);
+    if (sync_should_free_locked(sync)) {
+        sync->freeing = 1;
+        should_free = true;
+    }
+    pthread_mutex_unlock(&sync->mutex);
+
+    if (should_free) {
+        free_sync_owned_resources(sync);
+    }
+}
+
+static void sync_request_release(task_sync_t *sync)
+{
+    if (!sync) {
+        return;
+    }
+    pthread_mutex_lock(&sync->mutex);
+    sync->release_requested = 1;
+    pthread_mutex_unlock(&sync->mutex);
+    sync_free_if_ready(sync);
+}
+
+static void make_abs_timeout_ms(int64_t timeout_ms, struct timespec *ts)
+{
+#ifdef CLOCK_MONOTONIC
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#else
+    clock_gettime(CLOCK_REALTIME, ts);
+#endif
+    ts->tv_sec += timeout_ms / 1000;
+    ts->tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += ts->tv_nsec / 1000000000L;
+        ts->tv_nsec %= 1000000000L;
+    }
+}
+
+static uint32_t wait_for_task_complete_common(task_sync_t *sync_handle, int64_t timeout_ms)
+{
+    int ret = 0;
+    bool timed_wait = (timeout_ms >= 0);
+    struct timespec deadline = {0};
+
+    if (!sync_handle) {
+        OST_LOG_ERROR("Failed: sync_handle is NULL in wait_for_task_complete_common.");
+        return OS_TRANSPORT_WAIT_ERROR;
+    }
+
+    if (timed_wait) {
+        make_abs_timeout_ms(timeout_ms, &deadline);
+    }
+
+    pthread_mutex_lock(&sync_handle->mutex);
+    while (!sync_handle->request_completed) {
+        if (timed_wait) {
+            ret = pthread_cond_timedwait(&sync_handle->cond, &sync_handle->mutex, &deadline);
+            if (ret == ETIMEDOUT) {
+                sync_handle->request_timedout = 1;
+                pthread_mutex_unlock(&sync_handle->mutex);
+                return OS_TRANSPORT_WAIT_TIMEOUT;
+            }
+        } else {
+            ret = pthread_cond_wait(&sync_handle->cond, &sync_handle->mutex);
+        }
+        if (ret != 0) {
+            pthread_mutex_unlock(&sync_handle->mutex);
+            OST_LOG_ERROR("Failed: pthread_cond_wait/timedwait returned %d while waiting for request completion.", ret);
+            return OS_TRANSPORT_WAIT_ERROR;
+        }
+    }
+
+    bool success = (sync_handle->completed_tasks == sync_handle->total_tasks) && !sync_handle->request_canceled
+                   && !sync_handle->request_timedout;
+    if (!success) {
+        OST_LOG_WARN("Request completed early/incompletely/canceled "
+                     "(completed=%lu, canceled=%lu, total=%lu, canceled_flag=%d, timedout=%d).",
+                     sync_handle->completed_tasks,
+                     sync_handle->canceled_tasks,
+                     sync_handle->total_tasks,
+                     sync_handle->request_canceled,
+                     sync_handle->request_timedout);
+    }
+    pthread_mutex_unlock(&sync_handle->mutex);
+    return success ? 0 : OS_TRANSPORT_WAIT_ERROR;
+}
+
+static uint32_t wait_for_task_complete(task_sync_t *sync_handle)
+{
+    return wait_for_task_complete_common(sync_handle, -1);
+}
+
+static uint32_t wait_for_task_complete_timeout(task_sync_t *sync_handle, int64_t timeout_ms)
+{
+    return wait_for_task_complete_common(sync_handle, timeout_ms);
+}
+
+static void task_sync_add_canceled_tasks(task_sync_t *sync, uint64_t canceled_tasks, bool timedout)
+{
+    bool should_free = false;
+
+    if (!sync) {
         return;
     }
 
-    // 否则正常更新完成数，等待所有task完成后再唤醒等待线程
     pthread_mutex_lock(&sync->mutex);
-    sync->completed_tasks++;
-    if (sync->completed_tasks == sync->total_tasks) {
-        OST_LOG_INFO("Task group completed successfully (total_tasks=%lu).", sync->total_tasks);
+    sync->request_canceled = 1;
+    if (timedout) {
+        sync->request_timedout = 1;
+    }
+
+    uint64_t accounted = sync->completed_tasks + sync->canceled_tasks;
+    if (accounted < sync->total_tasks) {
+        uint64_t remain = sync->total_tasks - accounted;
+        sync->canceled_tasks += canceled_tasks > remain ? remain : canceled_tasks;
+    }
+
+    if (sync_all_tasks_accounted_locked(sync)) {
         sync->request_completed = 1;
         pthread_cond_signal(&sync->cond);
     }
+
+    if (sync_should_free_locked(sync)) {
+        sync->freeing = 1;
+        should_free = true;
+    }
     pthread_mutex_unlock(&sync->mutex);
+
+    if (should_free) {
+        free_sync_owned_resources(sync);
+    }
+}
+
+static void mark_task_group_completed(task_sync_t *sync, bool task_success)
+{
+    bool should_free = false;
+
+    if (!sync) {
+        return;
+    }
+
+    pthread_mutex_lock(&sync->mutex);
+    if (!task_success) {
+        sync->request_canceled = 1;
+        sync->request_completed = 1;
+        OST_LOG_WARN("Task group marked completed early because one task failed.");
+        pthread_cond_signal(&sync->cond);
+    } else {
+        sync->completed_tasks++;
+        if (sync_all_tasks_accounted_locked(sync)) {
+            OST_LOG_INFO("Task group completed successfully (completed=%lu, canceled=%lu, total_tasks=%lu).",
+                         sync->completed_tasks,
+                         sync->canceled_tasks,
+                         sync->total_tasks);
+            sync->request_completed = 1;
+            pthread_cond_signal(&sync->cond);
+        }
+    }
+
+    if (sync_should_free_locked(sync)) {
+        sync->freeing = 1;
+        should_free = true;
+    }
+    pthread_mutex_unlock(&sync->mutex);
+
+    if (should_free) {
+        free_sync_owned_resources(sync);
+    }
 }
 
 // 更新jfc信息并绑定poll线程，确保poll线程能够正确识别和处理事件
@@ -1021,51 +1179,96 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     return ret;
 }
 
-uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
+static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle, int64_t timeout_ms)
 {
-    uint32_t completed_success = 0;
+    uint32_t wait_ret = 0;
     uint32_t request_id;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     task_group_t *task_group;
 
     if (!ost_handle || !sync_handle) {
         OST_LOG_ERROR("Failed: invalid arguments (handle=%p, sync_handle=%p).", handle, (void *)sync_handle);
-        return -1;
+        return OS_TRANSPORT_WAIT_ERROR;
     }
     task_group = sync_handle->task_group;
-    if (!task_group) {
-        OST_LOG_ERROR("Failed: sync_handle->task_group is NULL (sync_handle=%p).", (void *)sync_handle);
-        return -1;
+    if (!task_group || !task_group->tasks || task_group->task_num == 0) {
+        OST_LOG_ERROR("Failed: invalid task_group in sync_handle (sync_handle=%p, task_group=%p).",
+                      (void *)sync_handle,
+                      (void *)task_group);
+        sync_request_release(sync_handle);
+        return OS_TRANSPORT_WAIT_ERROR;
     }
 
     request_id = task_group->tasks[0].request_id;
 
-    OST_LOG_INFO(
-        "Waiting for request completion (request_id=%u, total_tasks=%lu).", request_id, sync_handle->total_tasks);
+    OST_LOG_INFO("Waiting for request completion (request_id=%u, total_tasks=%lu, timeout_ms=%ld).",
+                 request_id,
+                 sync_handle->total_tasks,
+                 (long)timeout_ms);
 
-    completed_success = wait_for_task_complete(sync_handle);
-
-    if (completed_success != 0) {
-        OST_LOG_WARN("Detected incomplete request and will cancel remaining tasks "
-                     "(request_id=%u, completed=%lu, total=%lu).",
-                     request_id,
-                     sync_handle->completed_tasks,
-                     sync_handle->total_tasks);
-        thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
+    if (timeout_ms < 0) {
+        wait_ret = wait_for_task_complete(sync_handle);
+    } else {
+        wait_ret = wait_for_task_complete_timeout(sync_handle, timeout_ms);
     }
-    free_sync_owned_resources(sync_handle);
-    if (completed_success == 0) {
+
+    if (wait_ret != 0) {
+        int canceled = thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
+        if (canceled < 0) {
+            canceled = 0;
+        }
+        task_sync_add_canceled_tasks(sync_handle, (uint64_t)canceled, wait_ret == OS_TRANSPORT_WAIT_TIMEOUT);
+        OST_LOG_WARN("Request wait did not complete successfully; canceled queued tasks "
+                     "(request_id=%u, ret=%u, canceled=%d, timeout_ms=%ld).",
+                     request_id,
+                     wait_ret,
+                     canceled,
+                     (long)timeout_ms);
+    }
+
+    pthread_mutex_lock(&sync_handle->mutex);
+    sync_handle->release_requested = 1;
+    bool should_free = sync_should_free_locked(sync_handle);
+    if (should_free) {
+        sync_handle->freeing = 1;
+    }
+    uint64_t completed = sync_handle->completed_tasks;
+    uint64_t canceled = sync_handle->canceled_tasks;
+    uint64_t total = sync_handle->total_tasks;
+    pthread_mutex_unlock(&sync_handle->mutex);
+
+    if (should_free) {
+        free_sync_owned_resources(sync_handle);
+    }
+
+    if (wait_ret == 0) {
         OST_LOG_INFO("Request completed and resources released successfully (request_id=%u).", request_id);
     } else {
-        OST_LOG_WARN("Request finished with incomplete status and resources were released (request_id=%u).",
-                     request_id);
+        OST_LOG_WARN("Request finished with non-success status; release requested "
+                     "(request_id=%u, completed=%lu, canceled=%lu, total=%lu, ret=%u).",
+                     request_id,
+                     completed,
+                     canceled,
+                     total,
+                     wait_ret);
     }
-    return completed_success;
+    return wait_ret;
+}
+
+uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
+{
+    return wait_and_free_sync_common(handle, sync_handle, -1);
+}
+
+uint32_t wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms)
+{
+    return wait_and_free_sync_common(handle, sync_handle, timeout_ms);
 }
 
 uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id)
 {
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
+    task_sync_t *sync = NULL;
 
     if (!ost_handle) {
         OST_LOG_ERROR("Failed: handle is NULL.");
@@ -1081,8 +1284,23 @@ uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint
         OST_LOG_WARN("Failed to cancel tasks for request_id=%u.", request_id);
         return -1;
     }
-    free_sync_owned_resources(*sync_handle);
-    *sync_handle = NULL;
+
+    if (sync_handle && *sync_handle) {
+        sync = *sync_handle;
+        *sync_handle = NULL;
+        task_sync_add_canceled_tasks(sync, (uint64_t)ret, false);
+        pthread_mutex_lock(&sync->mutex);
+        sync->release_requested = 1;
+        bool should_free = sync_should_free_locked(sync);
+        if (should_free) {
+            sync->freeing = 1;
+        }
+        pthread_mutex_unlock(&sync->mutex);
+        if (should_free) {
+            free_sync_owned_resources(sync);
+        }
+    }
+
     OST_LOG_INFO("Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
     return 0;
 }

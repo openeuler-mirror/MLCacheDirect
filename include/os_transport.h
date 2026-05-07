@@ -90,6 +90,15 @@ int os_transport_wake_up_task(void *handle, void *cr_t);
 
 uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
 
+/*
+ * Wait for a split request to finish, but only up to timeout_ms milliseconds.
+ * If timeout_ms < 0, it behaves the same as wait_and_free_sync().
+ * On timeout, queued tasks for the same request_id are canceled and the sync
+ * resources are released immediately when it is safe to do so. Running tasks,
+ * if any, are allowed to finish and release the resources themselves.
+ */
+uint32_t wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms);
+
 uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id);
 
 uint32_t os_transport_destroy(void *handle);

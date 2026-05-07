@@ -1062,9 +1062,10 @@ static void update_context_after_cancel(ThreadPoolHandle handle, uint32_t reques
     pthread_mutex_lock(&handle->req_hash_mutex);
     RequestContext *ctx = find_req_context_locked(handle, request_id);
     if (ctx) {
-        ctx->pending_count -= removed;
-        if (ctx->pending_count <= 0) {
+        if (removed >= (uint32_t)ctx->pending_count) {
             (void)remove_req_context_locked(handle, request_id);
+        } else {
+            ctx->pending_count -= (int)removed;
         }
     }
     pthread_mutex_unlock(&handle->req_hash_mutex);
