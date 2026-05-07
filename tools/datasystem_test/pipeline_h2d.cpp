@@ -347,6 +347,7 @@ public:
         if (barrier_) barrier_->Wait();
 
         TIMER_START(Get);
+        TIMER_START(OriginGet);
         Status rc = client_->Get(keys, values, timeout_ms);
         TIMER_END(thread_id_, Get, "Get");
         
@@ -358,6 +359,7 @@ public:
             }
         }
         TIMER_END(thread_id_, H2D, "H2D");
+        TIMER_END(thread_id_, H2D, "OriginGet");
         
         if (rc.IsError()) {
             TLOG(thread_id_, "get failed " << rc.GetMsg());

@@ -30,9 +30,14 @@ typedef struct chunk_info {
 struct task_sync {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    int request_completed;    // 该请求的所有task是否都已完成
+    int request_completed;    // 该请求的所有task是否都已完成/取消完成
+    int request_canceled;     // 请求是否被取消
+    int request_timedout;     // 请求是否因超时被取消
+    int release_requested;    // 外部等待线程是否已经请求释放sync资源
+    int freeing;              // 防止多线程重复释放sync资源
     uint64_t total_tasks;     // 任务组总任务数
     uint64_t completed_tasks; // 任务组已完成任务数
+    uint64_t canceled_tasks;  // 任务组已取消任务数
     task_group_t *task_group; // 任务组，由主线程统一释放
     chunk_info_t *chunks;     // 本次请求关联的chunk数组，由主线程统一释放
 };
