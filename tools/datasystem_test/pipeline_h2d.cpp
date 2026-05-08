@@ -359,7 +359,7 @@ public:
             }
         }
         TIMER_END(thread_id_, H2D, "H2D");
-        TIMER_END(thread_id_, H2D, "OriginGet");
+        TIMER_END(thread_id_, OriginGet, "OriginGet");
         
         if (rc.IsError()) {
             TLOG(thread_id_, "get failed " << rc.GetMsg());
