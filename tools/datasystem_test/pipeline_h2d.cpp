@@ -656,6 +656,7 @@ int main(int argc, char* argv[]) {
         connectOptions.accessKey = "";
         connectOptions.secretKey = "";
         connectOptions.deviceId = std::to_string(args.gpu_id);
+        connectOptions.fastTransportMemSize = 1024 * 1024 * 1024;
 
         auto sharedClient = std::make_shared<KVClient>(connectOptions);
         sharedClient->Init();
