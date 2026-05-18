@@ -35,15 +35,28 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-# 默认不编译测试；仅显式传入 -t/--test 时只运行测试并退出
+# 默认不编译测试、不启用故障注入；仅显式传入 -t/--test 时只运行测试并退出
 DO_TEST=0
-for arg in "$@"; do
-    case "${arg}" in
+WITH_INJECT=OFF
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         -t|--test)
             DO_TEST=1
+            shift
+            ;;
+        --with-inject)
+            WITH_INJECT=ON
+            echo -e "${YELLOW}✅ 启用故障注入功能${NC}"
+            shift
+            ;;
+        -h|--help)
+            echo "用法: $0 [-t|--test] [--with-inject]"
+            echo "  -t, --test       只编译并运行测试"
+            echo "  --with-inject    启用故障注入功能"
+            exit 0
             ;;
         *)
-            echo -e "${RED}❌ 错误：未知参数 ${arg}。如需运行测试，请使用 -t 或 --test。${NC}"
+            echo -e "${RED}❌ 错误：未知参数 $1。使用 -h 查看帮助。${NC}"
             exit 1
             ;;
     esac
@@ -53,6 +66,7 @@ done
 ARCH=$(detect_arch)
 echo -e "${YELLOW}🔍 检测到当前架构：${ARCH}${NC}"
 echo -e "${YELLOW}🧪 仅运行测试：${DO_TEST}${NC}"
+echo -e "${YELLOW}💉 故障注入：${WITH_INJECT}${NC}"
 BUILD_TYPE="Release"
 if [ ${DO_TEST} -eq 1 ]; then
     BUILD_TYPE="Debug"
@@ -134,13 +148,21 @@ cmake \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DCMAKE_C_FLAGS="-Wall -Wextra -O2 -fPIC" \
     -DOS_TRANSPORT_BUILD_TESTS="$([ ${DO_TEST} -eq 1 ] && echo ON || echo OFF)" \
+    -DOS_TRANSPORT_WITH_INJECT="${WITH_INJECT}" \
     "${ROOT_DIR}"
 
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[4/6] 编译并运行测试...${NC}"
-    make test_thread_pool test_os_transport_unit -j$(nproc 2>/dev/null || echo 4)
+    TEST_TARGETS="test_thread_pool test_os_transport_unit"
+    if [ "${WITH_INJECT}" = "ON" ]; then
+        TEST_TARGETS="${TEST_TARGETS} test_inject_unit"
+    fi
+    make ${TEST_TARGETS} -j$(nproc 2>/dev/null || echo 4)
     ./test_thread_pool
     ./test_os_transport_unit
+    if [ "${WITH_INJECT}" = "ON" ]; then
+        ./test_inject_unit
+    fi
     echo -e "${GREEN}✅ 测试通过。${NC}"
     exit 0
 fi

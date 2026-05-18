@@ -1,5 +1,8 @@
 #include "os_transport_internal.h"
 #include "os_transport_log_internal.h"
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+#include "os_transport_inject.h"
+#endif
 
 urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_info *chunk_info)
 {
@@ -9,7 +12,10 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_
         OST_LOG_ERROR("Failed: chunk_info is NULL in urma_write_with_notify.");
         return URMA_FAIL;
     }
-
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    urma_status_t inject_ret = URMA_SUCCESS;
+    OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_URMA_WRITE, inject_ret);
+#endif
     urma_sge_t src_sge = {
         .addr = chunk_info->src,
         .len = chunk_info->len,
@@ -71,12 +77,13 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
         OST_LOG_ERROR("Failed: chunk_info is NULL in urma_recv_with_notify.");
         return URMA_FAIL;
     }
-
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    urma_status_t inject_ret = URMA_SUCCESS;
+    OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_URMA_RECV, inject_ret);
+#endif
     urma_sge_t src_sge = {.addr = (uint64_t)chunk_info->src, .len = chunk_info->len, .tseg = recv_info.local_tseg};
     urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
-    urma_jfr_wr_t wr = {.src = src_sg,
-                        .user_ctx = recv_info.request_id, // TODO：此处的user_ctx有什么作用？
-                        .next = NULL};
+    urma_jfr_wr_t wr = {.src = src_sg, .user_ctx = recv_info.request_id, .next = NULL};
     urma_jfr_wr_t *bad_wr;
 
     if (!recv_info.jfr) {

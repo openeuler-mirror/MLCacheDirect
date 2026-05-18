@@ -38,10 +38,10 @@ cp -r %{install_root}/* %{buildroot}/
 /usr/lib64/libos_transport.so.%{version_major}
 /usr/lib64/libos_transport.so
 
-# ========== devel包文件（仅头文件） ==========
+# ========== devel包文件（头文件） ==========
 %files devel
 %defattr(-,root,root)
-/usr/include/os-transport/os_transport.h
+/usr/include/os-transport/*.h
 
 # ========== 触发ldconfig更新库缓存 ==========
 %post -p /sbin/ldconfig

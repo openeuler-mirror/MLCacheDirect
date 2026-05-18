@@ -1,5 +1,8 @@
 #include "os_transport_internal.h"
 #include "os_transport_log_internal.h"
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+#include "os_transport_inject.h"
+#endif
 #include "os_transport_thread_pool_internal.h"
 #include <errno.h>
 #include <pthread.h>
@@ -13,7 +16,7 @@ static int g_inited = 0;
 
 #define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 6) - 1)
 #define OS_TRANSPORT_WAIT_TIMEOUT 1U
-#define OS_TRANSPORT_WAIT_ERROR   ((uint32_t)-1)
+#define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
 
 // init和destroy接收队列限制器，ost_handle外部调用时已校验非空
 static int init_recv_queue_limiter(os_transport_handle_t *ost_handle, uint32_t recv_queue_capacity)
@@ -88,6 +91,10 @@ static void release_recv_queue_resources(os_transport_handle_t *ost_handle, uint
 
 static int alloc_task_group(task_group_t **task_group_out, uint32_t task_num, uint32_t task_arg_size)
 {
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    int inject_ret = 0;
+    OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_ALLOC_TASK_GROUP, inject_ret);
+#endif
     task_group_t *task_group = NULL;
 
     if (!task_group_out || task_num == 0 || task_arg_size == 0) {
@@ -216,7 +223,8 @@ static bool sync_all_tasks_accounted_locked(task_sync_t *sync)
 
 static bool sync_should_free_locked(task_sync_t *sync)
 {
-    return sync->release_requested && sync->request_completed && sync_all_tasks_accounted_locked(sync) && !sync->freeing;
+    return sync->release_requested && sync->request_completed && sync_all_tasks_accounted_locked(sync)
+           && !sync->freeing;
 }
 
 static void sync_free_if_ready(task_sync_t *sync)
@@ -704,7 +712,16 @@ static int recv_task_worker_func(void *arg)
                       request_id);
         ret = -1;
     } else {
-        ret = recv_task_arg->notify_callback(&recv_task_arg->notify_user_data);
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+        int notify_inject_ret = 0;
+        if (os_transport_inject_execute(OS_TRANSPORT_INJECT_NOTIFY_CALLBACK, &notify_inject_ret)) {
+            ret = notify_inject_ret;
+        } else {
+#endif
+            ret = recv_task_arg->notify_callback(&recv_task_arg->notify_user_data);
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+        }
+#endif
     }
     if (ret != 0) {
         OST_LOG_WARN("Recv notify callback failed "
@@ -1106,6 +1123,10 @@ uint32_t os_transport_send(void *handle,
         return ret;
     }
 
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_SEND_BEGIN, ret);
+#endif
+
     if (len <= DEFAULT_CHUNK_SIZE) {
         OST_LOG_INFO(
             "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
@@ -1137,7 +1158,18 @@ uint32_t os_transport_send(void *handle,
                  server_key,
                  client_key,
                  chunks_num);
-    if (urma_write_with_notify(write_info, &chunks[0]) != URMA_SUCCESS) {
+    urma_status_t first_chunk_ret = URMA_SUCCESS;
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    int first_chunk_inject_ret = 0;
+    if (os_transport_inject_execute(OS_TRANSPORT_INJECT_SEND_FIRST_CHUNK, &first_chunk_inject_ret)) {
+        first_chunk_ret = (urma_status_t)first_chunk_inject_ret;
+    } else {
+#endif
+        first_chunk_ret = urma_write_with_notify(write_info, &chunks[0]);
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    }
+#endif
+    if (first_chunk_ret != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: first chunk submission returned URMA error "
                       "(total_len=%u, chunk_count=%u, server_key=%u, client_key=%u).",
                       len,
@@ -1180,7 +1212,10 @@ uint32_t os_transport_recv(void *handle,
     if (validate_recv_input(handle, host_src, device_dst, len, ret_sync_handle, notify_callback) != 0) {
         return -1;
     }
-
+#if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
+    uint32_t inject_ret = 0;
+    OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_RECV_BEGIN, inject_ret);
+#endif
     if (recv_split_chunks(host_src, device_dst, len, &chunks, &chunks_num) != 0) {
         return -1;
     }
