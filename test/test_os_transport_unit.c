@@ -389,6 +389,12 @@ static void test_update_and_validate_and_build(void)
     assert(validate_recv_input(&handle, &local_src, &device_dst, 0, &sync_handle, test_notify_cb) == -1);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, NULL, test_notify_cb) == -1);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, NULL) == -1);
+    assert(validate_recv_input(
+               &handle, &local_src, &device_dst, (uint32_t)OS_TRANSPORT_MAX_RECV_LEN, &sync_handle, test_notify_cb)
+           == 0);
+    assert(validate_recv_input(
+               &handle, &local_src, &device_dst, (uint32_t)OS_TRANSPORT_MAX_RECV_LEN + 1, &sync_handle, test_notify_cb)
+           == -1);
 
     jetty_info.jfs = (urma_jfs_t *)0x10;
     jetty_info.jetty = (urma_jetty_t *)0x20;
@@ -504,11 +510,16 @@ static void test_construct_and_worker_helper_functions(void)
     assert(user_server.bs.chunk_type == LAST_CHUNK);
     assert(user_server.bs.chunk_id == 6);
 
+    construct_send_task_arg(&send_arg, write_info, &chunk, OS_TRANSPORT_MAX_CHUNK_ID, true, sync);
+    user_server = send_arg.write_info.user_ctx_server;
+    assert(user_server.bs.chunk_id == OS_TRANSPORT_MAX_CHUNK_ID);
+
     memset(&recv_arg, 0xAB, sizeof(recv_arg));
     recv_info.request_id = 55;
     recv_info.device_info.dst = (void *)0x12345;
-    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync, test_notify_cb);
+    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync, test_notify_cb, 0x12345678ULL);
     assert(recv_arg.recv_info.request_id == 55);
+    assert(recv_arg.expected_imm64 == 0x12345678ULL);
     assert(recv_arg.chunk_info == &chunk);
     assert(recv_arg.is_last_chunk == true);
     assert(recv_arg.sync == sync);
@@ -524,6 +535,22 @@ static void test_construct_and_worker_helper_functions(void)
     assert(worker_task.free_task_self == false);
 
     free_sync_owned_resources(sync);
+}
+
+static void test_user_data_bitfield_limits(void)
+{
+    os_transport_user_data_t user_data = {0};
+
+    assert(OS_TRANSPORT_CHUNK_ID_BITS == 6U);
+    assert(OS_TRANSPORT_CHUNK_SIZE_BITS == 24U);
+    assert(OS_TRANSPORT_MAX_CHUNK_ID == 63U);
+    assert(OS_TRANSPORT_MAX_CHUNK_COUNT == 64U);
+    assert(OS_TRANSPORT_MAX_RECV_LEN == (uint64_t)OS_TRANSPORT_MAX_CHUNK_COUNT * DEFAULT_CHUNK_SIZE);
+
+    user_data.bs.chunk_id = OS_TRANSPORT_MAX_CHUNK_ID;
+    user_data.bs.chunk_size = (1ULL << OS_TRANSPORT_CHUNK_SIZE_BITS) - 1ULL;
+    assert(user_data.bs.chunk_id == OS_TRANSPORT_MAX_CHUNK_ID);
+    assert(user_data.bs.chunk_size == ((1ULL << OS_TRANSPORT_CHUNK_SIZE_BITS) - 1ULL));
 }
 
 /*
@@ -561,7 +588,7 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(init_task_sync(&sync_recv) == 0);
     sync_recv->total_tasks = 1;
     recv_info.request_id = 55;
-    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync_recv, test_notify_cb);
+    construct_recv_task_arg(&recv_arg, recv_info, &chunk, true, sync_recv, test_notify_cb, 0);
     notify_data.bs.request_id = 55;
     notify_data.bs.chunk_id = 3;
     notify_data.bs.chunk_type = LAST_CHUNK;
@@ -575,7 +602,7 @@ static void test_do_chunk_and_worker_funcs(void)
 
     assert(init_task_sync(&sync_recv_fail) == 0);
     sync_recv_fail->total_tasks = 1;
-    construct_recv_task_arg(&recv_fail_arg, recv_info, &chunk, true, sync_recv_fail, test_notify_cb);
+    construct_recv_task_arg(&recv_fail_arg, recv_info, &chunk, true, sync_recv_fail, test_notify_cb, 0);
     prepare_recv_task_user_data(&recv_fail_arg, &notify_data);
     g_mock_notify_ret = -3;
     assert(recv_task_worker_func(&recv_fail_arg) == -3);
@@ -863,6 +890,7 @@ static void test_init_destroy_and_send_recv_api(void)
 
     host_src.addr = 0x3300;
     device_dst.dst = (void *)0x4400;
+    send_handle.recv_queue_available = DEFAULT_RECV_QUEUE_CAPACITY;
     sync = NULL;
 
     g_inited = 0;
@@ -872,6 +900,20 @@ static void test_init_destroy_and_send_recv_api(void)
     reset_mocks();
     g_mock_submit_fail = 1;
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
+
+    reset_mocks();
+    sync = (task_sync_t *)0xBAD;
+    assert(os_transport_recv(&send_handle,
+                             &host_src,
+                             &device_dst,
+                             (uint32_t)OS_TRANSPORT_MAX_RECV_LEN + 1,
+                             88,
+                             &sync,
+                             test_notify_cb)
+           == (uint32_t)-1);
+    assert(sync == NULL);
+    assert(g_mock_last_submit_task_count == 0);
+    assert(g_mock_urma_recv_calls == 0);
 
     reset_mocks();
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == 0);
@@ -933,6 +975,7 @@ int main(void)
     RUN_TEST(test_update_and_validate_and_build);
     RUN_TEST(test_split_chunk_functions);
     RUN_TEST(test_construct_and_worker_helper_functions);
+    RUN_TEST(test_user_data_bitfield_limits);
     RUN_TEST(test_do_chunk_and_worker_funcs);
     RUN_TEST(test_register_task_functions);
     RUN_TEST(test_construct_and_bind_functions);

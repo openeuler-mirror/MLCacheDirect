@@ -23,14 +23,16 @@ int os_transport_log_reg(int level, log_callback_t cb);
  */
 typedef int (*notify_callback_t)(void *user_data);
 
-#define DEFAULT_CHUNK_SIZE          (2 * 1024 * 1024) // 2MB
-#define DEFAULT_RECV_QUEUE_CAPACITY 256               // 默认接收队列容量
+#define DEFAULT_CHUNK_SIZE           (2 * 1024 * 1024) // 2MB
+#define DEFAULT_RECV_QUEUE_CAPACITY  256               // 默认接收队列容量
+#define OS_TRANSPORT_CHUNK_ID_BITS   6U
+#define OS_TRANSPORT_CHUNK_SIZE_BITS 24U
 
 typedef union {
     struct {
         uint64_t chunk_type : 2;
-        uint64_t chunk_id : 6;
-        uint64_t chunk_size : 24;
+        uint64_t chunk_id : OS_TRANSPORT_CHUNK_ID_BITS;
+        uint64_t chunk_size : OS_TRANSPORT_CHUNK_SIZE_BITS;
         uint64_t request_id : 32;
     } bs;
     uint64_t user_ctx;
