@@ -410,10 +410,10 @@ static void test_update_and_validate_and_build(void)
     assert(write_info.dst_tseg == remote_dst.tseg);
     assert(write_info.flag.value == 0);
     assert(write_info.user_ctx_server.bs.request_id == 456);
-    assert(write_info.user_ctx_server.bs.chunk_type == NOT_SPLIT);
+    assert(write_info.user_ctx_server.bs.chunk_type == MIDDLE_CHUNK);
     assert(write_info.user_ctx_server.bs.chunk_size == 123);
     assert(write_info.user_ctx_client.bs.request_id == 789);
-    assert(write_info.user_ctx_client.bs.chunk_type == NOT_SPLIT);
+    assert(write_info.user_ctx_client.bs.chunk_type == MIDDLE_CHUNK);
     assert(write_info.user_ctx_client.bs.chunk_size == 123);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == 0);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == 0);
@@ -428,7 +428,7 @@ static void test_update_and_validate_and_build(void)
 static void test_split_chunk_functions(void)
 {
     struct chunk_info *chunks = NULL;
-    uint64_t chunk_num = 0;
+    uint32_t chunk_num = 0;
     ost_buffer_info_t local = {0};
     ost_buffer_info_t remote = {0};
     ost_buffer_info_t host = {0};
