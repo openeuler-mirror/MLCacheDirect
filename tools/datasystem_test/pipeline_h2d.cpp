@@ -19,33 +19,35 @@
 
 using namespace datasystem;
 
-#define TLOG(tid, ...) do { \
-    static std::mutex print_mutex; \
-    std::lock_guard<std::mutex> lock(print_mutex); \
-    std::cout << "[T" << tid << "] "; \
-    std::cout << __VA_ARGS__ << std::endl; \
-} while(0)
+#define TLOG(tid, ...)                                                                                                 \
+    do {                                                                                                               \
+        static std::mutex print_mutex;                                                                                 \
+        std::lock_guard<std::mutex> lock(print_mutex);                                                                 \
+        std::cout << "[T" << tid << "] ";                                                                              \
+        std::cout << __VA_ARGS__ << std::endl;                                                                         \
+    } while (0)
 
-#define TLOG_NONL(tid, ...) do { \
-    static std::mutex print_mutex; \
-    std::lock_guard<std::mutex> lock(print_mutex); \
-    std::cout << "[T" << tid << "] "; \
-    std::cout << __VA_ARGS__; \
-} while(0)
+#define TLOG_NONL(tid, ...)                                                                                            \
+    do {                                                                                                               \
+        static std::mutex print_mutex;                                                                                 \
+        std::lock_guard<std::mutex> lock(print_mutex);                                                                 \
+        std::cout << "[T" << tid << "] ";                                                                              \
+        std::cout << __VA_ARGS__;                                                                                      \
+    } while (0)
 
-#define TIMER_START(name) \
-    auto timer_start_##name = std::chrono::high_resolution_clock::now();
+#define TIMER_START(name) auto timer_start_##name = std::chrono::high_resolution_clock::now();
 
-#define TIMER_END(tid, name, desc) \
-    { \
-        auto timer_end_##name = std::chrono::high_resolution_clock::now(); \
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>( \
-            timer_end_##name - timer_start_##name).count(); \
-        TLOG(tid, desc << ": " << duration << " us"); \
-        records.push_back(duration); \
+#define TIMER_END(tid, name, desc)                                                                                     \
+    {                                                                                                                  \
+        auto timer_end_##name = std::chrono::high_resolution_clock::now();                                             \
+        auto duration =                                                                                                \
+            std::chrono::duration_cast<std::chrono::microseconds>(timer_end_##name - timer_start_##name).count();      \
+        TLOG(tid, desc << ": " << duration << " us");                                                                  \
+        records.push_back(duration);                                                                                   \
     }
 
-std::vector<std::string> SplitString(const std::string& str, char delimiter) {
+std::vector<std::string> SplitString(const std::string &str, char delimiter)
+{
     std::vector<std::string> tokens;
     std::stringstream ss(str);
     std::string token;
@@ -57,7 +59,8 @@ std::vector<std::string> SplitString(const std::string& str, char delimiter) {
     return tokens;
 }
 
-bool ParseKeyValue(const std::string& arg, std::string& key, std::string& value) {
+bool ParseKeyValue(const std::string &arg, std::string &key, std::string &value)
+{
     if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') {
         return false;
     }
@@ -70,17 +73,22 @@ bool ParseKeyValue(const std::string& arg, std::string& key, std::string& value)
     return false;
 }
 
-bool ParseBool(const std::string& str) {
-    if (str == "true" || str == "1") return true;
-    if (str == "false" || str == "0") return false;
+bool ParseBool(const std::string &str)
+{
+    if (str == "true" || str == "1")
+        return true;
+    if (str == "false" || str == "0")
+        return false;
     return true;
 }
 
 class Barrier {
 public:
-    Barrier(int count) : total_(count), count_(count), generation_(0) {}
-    
-    void Wait() {
+    Barrier(int count) : total_(count), count_(count), generation_(0)
+    {}
+
+    void Wait()
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         int gen = generation_;
         if (--count_ == 0) {
@@ -91,7 +99,7 @@ public:
             cv_.wait(lock, [this, gen] { return gen != generation_; });
         }
     }
-    
+
 private:
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -102,19 +110,20 @@ private:
 
 class H2DTest {
 public:
-    H2DTest(std::shared_ptr<KVClient> client, int thread_id = 0, int gpu_id = 0)
-        : client_(client), thread_id_(thread_id), gpu_id_(gpu_id)
+    H2DTest(std::shared_ptr<KVClient> client, int thread_id = 0, int gpu_id = 0) :
+        client_(client), thread_id_(thread_id), gpu_id_(gpu_id)
     {
         if (client_ == nullptr) {
             throw std::runtime_error("shared KVClient is nullptr");
         }
         TLOG(thread_id_, "Using shared KVClient instance: " << client_.get() << " (GPU: " << gpu_id << ")");
     }
-    void SetDataParams(const std::string& value_prefix, 
-                      const std::vector<std::string>& custom_keys,
-                      int count,
-                      size_t value_size,
-                      bool delete_value) {
+    void SetDataParams(const std::string &value_prefix,
+                       const std::vector<std::string> &custom_keys,
+                       int count,
+                       size_t value_size,
+                       bool delete_value)
+    {
         if (value_prefix.empty()) {
             base_value_prefix_ = "0";
         } else if (value_prefix.size() == 1) {
@@ -123,11 +132,11 @@ public:
             base_value_prefix_ = value_prefix.substr(0, 1);
             TLOG(thread_id_, "[WARN] value_prefix truncated to 1 char: '" << base_value_prefix_ << "'");
         }
-        
+
         custom_keys_ = custom_keys;
         value_size_ = (value_size > 0) ? value_size : 8388608;
         delete_value_ = delete_value;
-        
+
         if (count <= 0 && !custom_keys_.empty()) {
             count_ = static_cast<int>(custom_keys_.size());
         } else {
@@ -135,19 +144,24 @@ public:
         }
     }
 
-    void SetBarrier(std::shared_ptr<Barrier> barrier) { barrier_ = barrier; }
+    void SetBarrier(std::shared_ptr<Barrier> barrier)
+    {
+        barrier_ = barrier;
+    }
 
-    void GenerateData(int count) {
+    void GenerateData(int count)
+    {
         data_.clear();
-        
+
         int actual_count = count;
         if (actual_count <= 0 && !custom_keys_.empty()) {
             actual_count = static_cast<int>(custom_keys_.size());
         }
-        if (actual_count <= 0) actual_count = 10;
-        
+        if (actual_count <= 0)
+            actual_count = 10;
+
         std::string thread_value_prefix = base_value_prefix_ + "T" + std::to_string(thread_id_);
-        
+
         for (int i = 0; i < actual_count; i++) {
             std::string base_key;
             if (i < static_cast<int>(custom_keys_.size()) && !custom_keys_[i].empty()) {
@@ -156,7 +170,7 @@ public:
                 base_key = std::to_string(i);
             }
             std::string key = base_key + "_T" + std::to_string(thread_id_);
-            
+
             std::ostringstream oss;
             oss << "##########";
             int max_j = static_cast<int>(value_size_ / 10);
@@ -172,16 +186,17 @@ public:
             }
             data_.emplace_back(key, value);
         }
-        TLOG(thread_id_, "generate data ok, count=" << actual_count 
-                  << ", value_prefix='" << thread_value_prefix << "'"
-                  << ", value_size=" << value_size_);
+        TLOG(thread_id_,
+             "generate data ok, count=" << actual_count << ", value_prefix='" << thread_value_prefix << "'"
+                                        << ", value_size=" << value_size_);
     }
 
-    void RunSet(int count = 10) {
+    void RunSet(int count = 10)
+    {
         GenerateData(count);
-        
+
         int failed = 0;
-        for (const auto& it : data_) {
+        for (const auto &it : data_) {
             Status rc = client_->Set(it.first, it.second);
             if (rc.IsError()) {
                 failed++;
@@ -189,12 +204,14 @@ public:
             }
         }
         TLOG_NONL(thread_id_, "Set " << count << " keys completed.");
-        if (failed) TLOG_NONL(thread_id_, " failed " << failed);
-        
+        if (failed)
+            TLOG_NONL(thread_id_, " failed " << failed);
+
         TLOG(thread_id_, "");
         TLOG_NONL(thread_id_, "Set keys: ");
         for (size_t i = 0; i < data_.size(); ++i) {
-            if (i > 0) std::cout << ", ";
+            if (i > 0)
+                std::cout << ", ";
             std::cout << data_[i].first;
             if (i >= 9 && data_.size() > 10) {
                 std::cout << ", ... (" << (data_.size() - 10) << " more)";
@@ -204,13 +221,15 @@ public:
         std::cout << std::endl;
     }
 
-    void RunMGetH2D(int count, int timeout_ms = 60000) {
+    void RunMGetH2D(int count, int timeout_ms = 60000)
+    {
         GenerateData(count);
-        
-        if (barrier_) barrier_->Wait();
-        
+
+        if (barrier_)
+            barrier_->Wait();
+
         std::vector<std::string> keys;
-        std::vector<std::pair<void*, size_t>> devShmChunks;
+        std::vector<std::pair<void *, size_t>> devShmChunks;
         std::vector<std::string> outFailedKeys;
         cudaError_t err;
 
@@ -221,8 +240,8 @@ public:
         }
         TLOG(thread_id_, "Using GPU " << gpu_id);
 
-        void* dev_ptr = nullptr;
-        for (const auto& it : data_) {
+        void *dev_ptr = nullptr;
+        for (const auto &it : data_) {
             keys.push_back(it.first);
             if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
@@ -231,14 +250,16 @@ public:
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             devShmChunks.push_back({dev_ptr, it.second.size()});
         }
-        if (barrier_) barrier_->Wait();
+        if (barrier_)
+            barrier_->Wait();
         TIMER_START(Mget);
         auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
         TIMER_END(thread_id_, Mget, "MGETH2D");
-        if (barrier_) barrier_->Wait();
+        if (barrier_)
+            barrier_->Wait();
 
         if (ret == datasystem::Status::OK()) {
-            TLOG(thread_id_, "MGetH2D success!"); 
+            TLOG(thread_id_, "MGetH2D success!");
         } else {
             TLOG(thread_id_, "MGetH2D completed. Failed keys: " << outFailedKeys.size());
             TLOG(thread_id_, "last error is " << ret.GetMsg());
@@ -257,18 +278,20 @@ public:
             CheckData(count, devShmChunks);
         }
 
-        for (auto& chunk : devShmChunks) {
+        for (auto &chunk : devShmChunks) {
             cudaFree(chunk.first);
         }
     }
 
-    void MGetH2DBatch(int count, int batch, int timeout_ms = 60000) {
+    void MGetH2DBatch(int count, int batch, int timeout_ms = 60000)
+    {
         GenerateData(count);
-        
-        if (barrier_) barrier_->Wait();
-        
+
+        if (barrier_)
+            barrier_->Wait();
+
         std::vector<std::string> keys;
-        std::vector<std::pair<void*, size_t>> devShmChunks;
+        std::vector<std::pair<void *, size_t>> devShmChunks;
         std::vector<std::string> outFailedKeys;
         cudaError_t err;
 
@@ -282,12 +305,12 @@ public:
             keys.clear();
             outFailedKeys.clear();
             devShmChunks.clear();
-            
+
             for (int i = round * batch; i < (round + 1) * batch; i++) {
-                const auto& it = data_[i];
+                const auto &it = data_[i];
                 keys.push_back(it.first);
-                
-                void* dev_ptr = nullptr;
+
+                void *dev_ptr = nullptr;
                 if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
                     return;
@@ -299,9 +322,9 @@ public:
             TIMER_START(round);
             auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
             TIMER_END(thread_id_, round, "MGETH2D");
-            
+
             if (ret == datasystem::Status::OK()) {
-                TLOG(thread_id_, "MGetH2D success!"); 
+                TLOG(thread_id_, "MGetH2D success!");
             } else {
                 TLOG(thread_id_, "MGetH2D completed. Failed keys: " << outFailedKeys.size());
                 TLOG(thread_id_, "last error is " << ret.GetMsg());
@@ -311,22 +334,24 @@ public:
                 CheckDataBatch(round * batch, devShmChunks);
             }
 
-            for (auto& chunk : devShmChunks) {
+            for (auto &chunk : devShmChunks) {
                 cudaFree(chunk.first);
             }
         }
     }
 
-    void Get(int count, int timeout_ms = 60000) {
+    void Get(int count, int timeout_ms = 60000)
+    {
         GenerateData(count);
-        
-        if (barrier_) barrier_->Wait();
-        
+
+        if (barrier_)
+            barrier_->Wait();
+
         std::vector<std::string> keys;
         std::vector<std::string> failkeys;
         std::vector<std::string> values;
         cudaError_t err;
-        std::vector<void*> dev_ptrs;
+        std::vector<void *> dev_ptrs;
 
         int gpu_id = gpu_id_;
         if ((err = cudaSetDevice(gpu_id)) != cudaSuccess) {
@@ -334,9 +359,9 @@ public:
             return;
         }
 
-        for (const auto& it : data_) {
+        for (const auto &it : data_) {
             keys.push_back(it.first);
-            void* dev_ptr = nullptr;
+            void *dev_ptr = nullptr;
             if ((err = cudaMalloc(&dev_ptr, it.second.size() + 1)) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
                 return;
@@ -344,28 +369,30 @@ public:
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             dev_ptrs.push_back(dev_ptr);
         }
-        if (barrier_) barrier_->Wait();
+        if (barrier_)
+            barrier_->Wait();
 
         TIMER_START(Get);
         TIMER_START(OriginGet);
         Status rc = client_->Get(keys, values, timeout_ms);
         TIMER_END(thread_id_, Get, "Get");
-        
+
         TIMER_START(H2D);
         for (int i = 0; i < count; i++) {
-            if ((err = cudaMemcpy(dev_ptrs[i], values[i].c_str(), 
-                    (values[i].length() + 1) * sizeof(char), cudaMemcpyHostToDevice)) != cudaSuccess) {
+            if ((err = cudaMemcpy(
+                     dev_ptrs[i], values[i].c_str(), (values[i].length() + 1) * sizeof(char), cudaMemcpyHostToDevice))
+                != cudaSuccess) {
                 TLOG(thread_id_, "failed to do cudaMemcpy for " << i << "th: " << cudaGetErrorString(err));
             }
         }
         TIMER_END(thread_id_, H2D, "H2D");
         TIMER_END(thread_id_, OriginGet, "OriginGet");
-        
+
         if (rc.IsError()) {
             TLOG(thread_id_, "get failed " << rc.GetMsg());
             return;
         }
-        
+
         if (delete_value_) {
             rc = client_->Del(keys, failkeys);
             if (rc.IsError()) {
@@ -373,21 +400,24 @@ public:
                 return;
             }
         }
-        
+
         for (int i = 0; i < count; i++) {
             if (values[i] != data_[i].second) {
-                TLOG(thread_id_, "############################## " << i << " th data is not same ###############################");
-                std::ofstream a("/tmp/expect_T" + std::to_string(thread_id_)), 
-                              b("/tmp/real_T" + std::to_string(thread_id_));
-                auto& data = data_[i].second;
+                TLOG(thread_id_,
+                     "############################## " << i << " th data is not same ###############################");
+                std::ofstream a("/tmp/expect_T" + std::to_string(thread_id_)),
+                    b("/tmp/real_T" + std::to_string(thread_id_));
+                auto &data = data_[i].second;
                 for (size_t j = 0; j < data.size(); j += 80) {
                     size_t len = (j + 80 < data.size()) ? 80 : (data.size() - j);
                     a << data.substr(j, len) << std::endl;
                     b << values[i].substr(j, len) << std::endl;
                 }
-                a.close(); b.close();
-                std::system(("diff /tmp/expect_T" + std::to_string(thread_id_) + 
-                           " /tmp/real_T" + std::to_string(thread_id_)).c_str());
+                a.close();
+                b.close();
+                std::system(
+                    ("diff /tmp/expect_T" + std::to_string(thread_id_) + " /tmp/real_T" + std::to_string(thread_id_))
+                        .c_str());
             }
         }
         for (auto ptr : dev_ptrs) {
@@ -395,35 +425,43 @@ public:
         }
     }
 
-    int GetThreadId() const { return thread_id_; }
+    int GetThreadId() const
+    {
+        return thread_id_;
+    }
 
 private:
-    void CheckData(int count, const std::vector<std::pair<void*, size_t>>& devShmChunks) {
+    void CheckData(int count, const std::vector<std::pair<void *, size_t>> &devShmChunks)
+    {
         bool is_failed = false;
         for (int i = 0; i < count; i++) {
-            void* ptr = devShmChunks[i].first;
+            void *ptr = devShmChunks[i].first;
             size_t size = devShmChunks[i].second;
-            auto& data = data_[i].second;
+            auto &data = data_[i].second;
             std::string readOutData;
             cudaError_t err;
 
             readOutData.resize(size);
-            if ((err = cudaMemcpy(reinterpret_cast<void*>(readOutData.data()), ptr, size, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+            if ((err = cudaMemcpy(reinterpret_cast<void *>(readOutData.data()), ptr, size, cudaMemcpyDeviceToHost))
+                != cudaSuccess) {
                 TLOG(thread_id_, "failed to do cudaMemcpy for " << i << "th: " << cudaGetErrorString(err));
                 is_failed = true;
             }
             if (readOutData != data) {
-                TLOG(thread_id_, "############################## " << i << " th data is not same ###############################");
-                std::ofstream a("/tmp/expect_T" + std::to_string(thread_id_)), 
-                              b("/tmp/real_T" + std::to_string(thread_id_));
+                TLOG(thread_id_,
+                     "############################## " << i << " th data is not same ###############################");
+                std::ofstream a("/tmp/expect_T" + std::to_string(thread_id_)),
+                    b("/tmp/real_T" + std::to_string(thread_id_));
                 for (size_t j = 0; j < data.size(); j += 80) {
                     size_t len = (j + 80 < data.size()) ? 80 : (data.size() - j);
                     a << data.substr(j, len) << std::endl;
                     b << readOutData.substr(j, len) << std::endl;
                 }
-                a.close(); b.close();
-                std::system(("diff /tmp/expect_T" + std::to_string(thread_id_) + 
-                           " /tmp/real_T" + std::to_string(thread_id_)).c_str());
+                a.close();
+                b.close();
+                std::system(
+                    ("diff /tmp/expect_T" + std::to_string(thread_id_) + " /tmp/real_T" + std::to_string(thread_id_))
+                        .c_str());
                 is_failed = true;
             }
         }
@@ -434,22 +472,26 @@ private:
         }
     }
 
-    void CheckDataBatch(int startIdx, const std::vector<std::pair<void*, size_t>>& devShmChunks) {
+    void CheckDataBatch(int startIdx, const std::vector<std::pair<void *, size_t>> &devShmChunks)
+    {
         bool is_failed = false;
         for (size_t i = 0; i < devShmChunks.size(); i++) {
-            void* ptr = devShmChunks[i].first;
+            void *ptr = devShmChunks[i].first;
             size_t size = devShmChunks[i].second;
-            auto& data = data_[startIdx + i].second;
+            auto &data = data_[startIdx + i].second;
             std::string readOutData;
             cudaError_t err;
 
             readOutData.resize(size);
-            if ((err = cudaMemcpy(reinterpret_cast<void*>(readOutData.data()), ptr, size, cudaMemcpyDeviceToHost)) != cudaSuccess) {
+            if ((err = cudaMemcpy(reinterpret_cast<void *>(readOutData.data()), ptr, size, cudaMemcpyDeviceToHost))
+                != cudaSuccess) {
                 TLOG(thread_id_, "failed to do cudaMemcpy for " << (startIdx + i) << "th: " << cudaGetErrorString(err));
                 is_failed = true;
             }
             if (readOutData != data) {
-                TLOG(thread_id_, "############################## " << (startIdx + i) << " th data is not same ###############################");
+                TLOG(thread_id_,
+                     "############################## " << (startIdx + i)
+                                                       << " th data is not same ###############################");
                 is_failed = true;
             }
         }
@@ -461,10 +503,10 @@ private:
     }
 
     std::shared_ptr<KVClient> client_;
-    std::vector<std::pair<void*, size_t>> devShmChunks_;
+    std::vector<std::pair<void *, size_t>> devShmChunks_;
     std::vector<std::pair<std::string, std::string>> data_;
     std::vector<long long> records;
-    
+
     std::string base_value_prefix_ = "0";
     std::vector<std::string> custom_keys_;
     int count_ = 10;
@@ -476,17 +518,22 @@ private:
 };
 
 void RunWorker(std::shared_ptr<KVClient> shared_client,
-               const std::string& cmd,
-               int count, int batch, const std::string& value_prefix,
-               const std::vector<std::string>& keys, size_t value_size,
-               bool delete_value, int thread_id,
+               const std::string &cmd,
+               int count,
+               int batch,
+               const std::string &value_prefix,
+               const std::vector<std::string> &keys,
+               size_t value_size,
+               bool delete_value,
+               int thread_id,
                std::shared_ptr<Barrier> barrier,
-               int gpu_id) {
+               int gpu_id)
+{
     try {
         H2DTest bench(shared_client, thread_id, gpu_id);
         bench.SetDataParams(value_prefix, keys, count, value_size, delete_value);
         bench.SetBarrier(barrier);
-        
+
         if (cmd == "set") {
             bench.RunSet(count);
         } else if (cmd == "get" || cmd == "mgeth2d") {
@@ -498,12 +545,13 @@ void RunWorker(std::shared_ptr<KVClient> shared_client,
         } else {
             TLOG(thread_id, "Unknown command: " << cmd);
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         TLOG(thread_id, "Error: " << e.what());
     }
 }
 
-void PrintUsage(const char* prog) {
+void PrintUsage(const char *prog)
+{
     std::cout << "Usage: " << prog << " <host> [options] [command]" << std::endl;
     std::cout << "  host    : Server IP address (required, positional)" << std::endl;
     std::cout << "  command : set | get | mgeth2d | batchget | originget" << std::endl;
@@ -519,10 +567,22 @@ void PrintUsage(const char* prog) {
     std::cout << "  --gpu_id=N                         : GPU device ID to use (default: 0)" << std::endl;
     std::cout << "  --help or -h                        : Show this help message (can be placed anywhere)" << std::endl;
     std::cout << "Examples:" << std::endl;
-    std::cout << "  " << prog << " 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4" << std::endl;
-    std::cout << "  " << prog << " 141.61.91.189 --port=18581 get --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false" << std::endl;
-    std::cout << "  " << prog << " 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4" << std::endl;
-    std::cout << "  " << prog << " 141.61.91.189 --port=18581 originget --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false" << std::endl;
+    std::cout
+        << "  " << prog
+        << " 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4"
+        << std::endl;
+    std::cout
+        << "  " << prog
+        << " 141.61.91.189 --port=18581 get --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false"
+        << std::endl;
+    std::cout
+        << "  " << prog
+        << " 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4"
+        << std::endl;
+    std::cout
+        << "  " << prog
+        << " 141.61.91.189 --port=18581 originget --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false"
+        << std::endl;
 }
 
 struct CmdArgs {
@@ -541,39 +601,50 @@ struct CmdArgs {
     bool help = false;
 };
 
-CmdArgs ParseArgs(int argc, char* argv[]) {
+CmdArgs ParseArgs(int argc, char *argv[])
+{
     CmdArgs args;
-    if (argc < 2) return args;
-    
+    if (argc < 2)
+        return args;
+
     args.host = argv[1];
-    
+
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         std::string key, value;
-        
+
         // 【修改点1】优先检查 --help，支持在任何位置触发
         if (arg == "--help" || arg == "-h") {
             args.help = true;
             return args;
         }
-        
+
         if (ParseKeyValue(arg, key, value)) {
-            if (key == "count") args.count = std::stoi(value);
-            else if (key == "batch") args.batch = std::stoi(value);
-            else if (key == "value_prefix") args.value_prefix = value;
-            else if (key == "keys") args.keys = SplitString(value, ',');
-            else if (key == "value_size") args.value_size = std::stoull(value);
-            else if (key == "thread") args.thread_count = std::stoi(value);
-            else if (key == "delete_value") args.delete_value = ParseBool(value);
-            else if (key == "gpu_id" || key == "gpu_num") args.gpu_id_str = value;
-            else if (key == "port") args.port = std::stoi(value);
+            if (key == "count")
+                args.count = std::stoi(value);
+            else if (key == "batch")
+                args.batch = std::stoi(value);
+            else if (key == "value_prefix")
+                args.value_prefix = value;
+            else if (key == "keys")
+                args.keys = SplitString(value, ',');
+            else if (key == "value_size")
+                args.value_size = std::stoull(value);
+            else if (key == "thread")
+                args.thread_count = std::stoi(value);
+            else if (key == "delete_value")
+                args.delete_value = ParseBool(value);
+            else if (key == "gpu_id" || key == "gpu_num")
+                args.gpu_id_str = value;
+            else if (key == "port")
+                args.port = std::stoi(value);
             continue;
         }
-        
+
         // 解析 --key value 格式
         if (arg.size() >= 3 && arg[0] == '-' && arg[1] == '-') {
             key = arg.substr(2);
-            
+
             // 【修改点1】先检查下一个参数是否为 --help，避免被误解析为 value
             if (i + 1 < argc) {
                 std::string next_arg = argv[i + 1];
@@ -582,40 +653,50 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                     return args;
                 }
             }
-            
+
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 value = argv[++i];
-                if (key == "count") args.count = std::stoi(value);
-                else if (key == "batch") args.batch = std::stoi(value);
-                else if (key == "value_prefix") args.value_prefix = value;
-                else if (key == "keys") args.keys = SplitString(value, ',');
-                else if (key == "value_size") args.value_size = std::stoull(value);
-                else if (key == "thread") args.thread_count = std::stoi(value);
-                else if (key == "delete_value") args.delete_value = ParseBool(value);
-                else if (key == "gpu_id") args.gpu_id_str = value;
-                else if (key == "port") args.port = std::stoi(value);
+                if (key == "count")
+                    args.count = std::stoi(value);
+                else if (key == "batch")
+                    args.batch = std::stoi(value);
+                else if (key == "value_prefix")
+                    args.value_prefix = value;
+                else if (key == "keys")
+                    args.keys = SplitString(value, ',');
+                else if (key == "value_size")
+                    args.value_size = std::stoull(value);
+                else if (key == "thread")
+                    args.thread_count = std::stoi(value);
+                else if (key == "delete_value")
+                    args.delete_value = ParseBool(value);
+                else if (key == "gpu_id")
+                    args.gpu_id_str = value;
+                else if (key == "port")
+                    args.port = std::stoi(value);
             }
         } else if (arg[0] != '-' && args.cmd == "full") {
             args.cmd = arg;
         }
     }
-    
+
     return args;
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[])
+{
     if (argc < 2) {
         PrintUsage(argv[0]);
         return 1;
     }
 
     CmdArgs args = ParseArgs(argc, argv);
-    
+
     if (args.help) {
         PrintUsage(argv[0]);
         return 0;
     }
-    
+
     // 解析 GPU 索引，默认为 0
     try {
         args.gpu_id = std::stoi(args.gpu_id_str);
@@ -627,24 +708,24 @@ int main(int argc, char* argv[]) {
         std::cerr << "[WARN] Failed to parse gpu_id, defaulting to 0" << std::endl;
         args.gpu_id = 0;
     }
-    
+
     // 端口合法性检查
     if (args.port <= 0 || args.port > 65535) {
         std::cerr << "[ERROR] Invalid port: " << args.port << ", must be 1-65535" << std::endl;
         return 1;
     }
-    
+
     if (args.cmd == "batchget" && args.count % args.batch != 0) {
         std::cout << "ERROR: count % batch != 0" << std::endl;
         return 1;
     }
-    
+
     if (args.thread_count < 1) {
         std::cout << "ERROR: thread count must be >= 1" << std::endl;
         return 1;
     }
 
-    std::cout << "[Main] Starting with " << args.thread_count << " thread(s), " 
+    std::cout << "[Main] Starting with " << args.thread_count << " thread(s), "
               << "target GPU: " << args.gpu_id << ", "
               << "port: " << args.port << ", "
               << "command=" << args.cmd << std::endl;
@@ -659,31 +740,39 @@ int main(int argc, char* argv[]) {
         connectOptions.fastTransportMemSize = 1024 * 1024 * 1024;
 
         auto sharedClient = std::make_shared<KVClient>(connectOptions);
-        sharedClient->Init();
+        auto ret = sharedClient->Init();
+        if (ret.IsError()) {
+            std::err << "init client failed for host " << args.host << " port " << args.port
+                     << " reason: " << ret.GetMsg();
+        }
 
-        std::cout << "[Main] Shared KVClient initialized once: " << sharedClient.get()
-                  << ", host=" << args.host
-                  << ", port=" << args.port
-                  << ", gpu=" << args.gpu_id
-                  << std::endl;
+        std::cout << "[Main] Shared KVClient initialized once: " << sharedClient.get() << ", host=" << args.host
+                  << ", port=" << args.port << ", gpu=" << args.gpu_id << std::endl;
 
         auto barrier = std::make_shared<Barrier>(args.thread_count);
         std::vector<std::thread> threads;
-        
+
         for (int tid = 0; tid < args.thread_count; ++tid) {
             threads.emplace_back(RunWorker,
-                               sharedClient,
-                               args.cmd,
-                               args.count, args.batch,
-                               args.value_prefix, args.keys, args.value_size,
-                               args.delete_value, tid, barrier, args.gpu_id);
+                                 sharedClient,
+                                 args.cmd,
+                                 args.count,
+                                 args.batch,
+                                 args.value_prefix,
+                                 args.keys,
+                                 args.value_size,
+                                 args.delete_value,
+                                 tid,
+                                 barrier,
+                                 args.gpu_id);
         }
-        
-        for (auto& t : threads) {
-            if (t.joinable()) t.join();
+
+        for (auto &t : threads) {
+            if (t.joinable())
+                t.join();
         }
-        
-    } catch (const std::exception& e) {
+
+    } catch (const std::exception &e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
