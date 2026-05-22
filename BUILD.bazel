@@ -37,6 +37,12 @@ cc_library(
 )
 
 cc_library(
+    name = "os_transport_log_unit_textual_src",
+    textual_hdrs = ["src/os_transport_log.c"],
+    deps = [":os_transport_hdrs"],
+)
+
+cc_library(
     name = "os_transport_lib",
     srcs = COMMON_SRCS,
     hdrs = glob(["include/*.h"]),
@@ -85,9 +91,15 @@ cc_test(
         "test/test_os_transport_log_unit.c",
     ],
     copts = COMMON_COPTS,
-    includes = ["include"],
+    includes = [
+        "include",
+        "src",
+    ],
     linkopts = ["-lpthread"],
-    deps = [":os_transport_hdrs"],
+    deps = [
+        ":os_transport_hdrs",
+        ":os_transport_log_unit_textual_src",
+    ],
 )
 
 cc_test(

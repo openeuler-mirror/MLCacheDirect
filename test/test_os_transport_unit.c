@@ -422,6 +422,70 @@ static void test_update_and_validate_and_build(void)
 }
 
 /*
+ * Recv queue limiter and wake-up tests.
+ * Verify queue resource reuse/release accounting and completion opcode handling.
+ */
+static void test_recv_queue_limiter_and_wake_up(void)
+{
+    os_transport_handle_t handle = {0};
+    uint32_t reused = 0;
+    uint32_t posted = 0;
+    os_transport_user_data_t user_data = {0};
+    urma_cr_t cr = {0};
+
+    reset_mocks();
+    assert(init_recv_queue_limiter(&handle, 2) == 0);
+    handle.thread_pool = (ThreadPoolHandle)0x1234;
+
+    assert(acquire_recv_queue_resources(NULL, 1, &reused, &posted) == -1);
+    assert(acquire_recv_queue_resources(&handle, 1, NULL, &posted) == -1);
+    assert(acquire_recv_queue_resources(&handle, 1, &reused, NULL) == -1);
+
+    handle.recv_queue_acquired = 1;
+    assert(acquire_recv_queue_resources(&handle, 3, &reused, &posted) == 0);
+    assert(reused == 1);
+    assert(posted == 2);
+    assert(handle.recv_queue_available == 0);
+    assert(handle.recv_queue_acquired == 0);
+
+    assert(acquire_recv_queue_resources(&handle, 1, &reused, &posted) == -1);
+    release_recv_queue_resources(NULL, 1, 1);
+    release_recv_queue_resources(&handle, 0, 0);
+    release_recv_queue_resources(&handle, 1, 2);
+    assert(handle.recv_queue_available == 1);
+    assert(handle.recv_queue_acquired == 2);
+
+    assert(os_transport_wake_up_task(NULL, &cr) == -1);
+    assert(os_transport_wake_up_task(&handle, NULL) == -1);
+
+    cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+    assert(os_transport_wake_up_task(&handle, &cr) == -1);
+
+    user_data.bs.request_id = 0x1234;
+    user_data.bs.chunk_id = 7;
+    user_data.bs.chunk_type = LAST_CHUNK;
+    cr.opcode = URMA_CR_OPC_SEND;
+    cr.user_ctx = user_data.user_ctx;
+    assert(os_transport_wake_up_task(&handle, &cr) == 0);
+    assert(g_mock_wake_calls == 1);
+    assert(g_mock_wake_last_request_id == 0x1234);
+    assert(g_mock_wake_last_user_data.user_ctx == user_data.user_ctx);
+    assert(handle.recv_queue_available == 1);
+
+    cr.opcode = URMA_CR_OPC_WRITE_WITH_IMM;
+    cr.imm_data = user_data.user_ctx;
+    assert(os_transport_wake_up_task(&handle, &cr) == 0);
+    assert(g_mock_wake_calls == 2);
+    assert(handle.recv_queue_available == 2);
+
+    handle.thread_pool = NULL;
+    assert(os_transport_wake_up_task(&handle, &cr) == -1);
+    assert(handle.recv_queue_available == 3);
+
+    destroy_recv_queue_limiter(&handle);
+}
+
+/*
  * Chunk split tests.
  * Verify split counts, address arithmetic, and invalid-argument guards.
  */
@@ -575,6 +639,9 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(do_send_chunk_for_worker(write_info, &chunk) == 7);
     assert(g_mock_urma_write_calls == 1);
 
+    assert(send_task_worker_func(NULL) == -1);
+    assert(recv_task_worker_func(NULL) == -1);
+
     assert(init_task_sync(&sync_send) == 0);
     sync_send->total_tasks = 1;
     write_info.user_ctx_server.bs.request_id = 1;
@@ -599,6 +666,17 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(g_mock_last_notify_user_data.user_ctx == notify_data.user_ctx);
     assert(sync_recv->completed_tasks == 1);
     assert(sync_recv->request_completed == 1);
+
+    g_mock_notify_ret = 0;
+    assert(init_task_sync(&sync_recv_fail) == 0);
+    sync_recv_fail->total_tasks = 1;
+    construct_recv_task_arg(&recv_fail_arg, recv_info, &chunk, true, sync_recv_fail, NULL, 0);
+    prepare_recv_task_user_data(&recv_fail_arg, &notify_data);
+    assert(recv_task_worker_func(&recv_fail_arg) == -1);
+    assert(sync_recv_fail->request_canceled == 1);
+    assert(sync_recv_fail->request_completed == 1);
+    free_sync_owned_resources(sync_recv_fail);
+    sync_recv_fail = NULL;
 
     assert(init_task_sync(&sync_recv_fail) == 0);
     sync_recv_fail->total_tasks = 1;
@@ -944,6 +1022,10 @@ static void test_wait_and_free_sync(void)
     assert(wait_and_free_sync(NULL, NULL) == (uint32_t)-1);
     assert(wait_and_free_sync(&handle, NULL) == (uint32_t)-1);
 
+    assert(init_task_sync(&sync) == 0);
+    assert(wait_and_free_sync(&handle, sync) == (uint32_t)-1);
+    free_sync_owned_resources(sync);
+
     sync = create_sync_with_tasks(1, 1);
     sync->completed_tasks = 1;
     sync->task_group->tasks[0].is_completed = true;
@@ -959,6 +1041,48 @@ static void test_wait_and_free_sync(void)
     assert(wait_and_free_sync(&handle, sync) == (uint32_t)-1);
     assert(g_mock_cancel_calls == 1);
     assert(g_mock_cancel_last_request_id == 202);
+
+    sync = create_sync_with_tasks(1, 0);
+    sync->task_group->tasks[0].request_id = 303;
+    reset_mocks();
+    assert(wait_and_free_sync_timeout(&handle, sync, 0) == OS_TRANSPORT_WAIT_TIMEOUT);
+    assert(g_mock_cancel_calls == 1);
+    assert(g_mock_cancel_last_request_id == 303);
+    assert(sync->request_timedout == 1);
+    free_sync_owned_resources(sync);
+}
+
+/*
+ * Cancel API tests.
+ * Verify initialization gates, thread-pool cancellation errors, and sync ownership transfer.
+ */
+static void test_os_transport_cancel_tasks(void)
+{
+    os_transport_handle_t handle = {0};
+    task_sync_t *sync = NULL;
+
+    handle.thread_pool = (ThreadPoolHandle)0x1234;
+    reset_mocks();
+
+    g_inited = 0;
+    assert(os_transport_cancel_tasks(NULL, NULL, 10) == (uint32_t)-1);
+    assert(os_transport_cancel_tasks(&handle, NULL, 10) == (uint32_t)-1);
+
+    g_inited = 1;
+    g_mock_cancel_ret = -1;
+    assert(os_transport_cancel_tasks(&handle, NULL, 10) == (uint32_t)-1);
+    assert(g_mock_cancel_calls == 1);
+
+    g_mock_cancel_ret = 0;
+    assert(os_transport_cancel_tasks(&handle, NULL, 11) == 0);
+
+    sync = create_sync_with_tasks(1, 0);
+    sync->task_group->tasks[0].request_id = 12;
+    g_mock_cancel_ret = 1;
+    assert(os_transport_cancel_tasks(&handle, &sync, 12) == 0);
+    assert(sync == NULL);
+
+    g_inited = 0;
 }
 
 #define RUN_TEST(fn)                                                                                                   \
@@ -973,6 +1097,7 @@ int main(void)
     RUN_TEST(test_init_task_sync_and_free_helpers);
     RUN_TEST(test_wait_for_task_complete_and_mark);
     RUN_TEST(test_update_and_validate_and_build);
+    RUN_TEST(test_recv_queue_limiter_and_wake_up);
     RUN_TEST(test_split_chunk_functions);
     RUN_TEST(test_construct_and_worker_helper_functions);
     RUN_TEST(test_user_data_bitfield_limits);
@@ -984,6 +1109,7 @@ int main(void)
     RUN_TEST(test_send_single_chunk_and_reg_jfc);
     RUN_TEST(test_init_destroy_and_send_recv_api);
     RUN_TEST(test_wait_and_free_sync);
+    RUN_TEST(test_os_transport_cancel_tasks);
 
     printf("test_os_transport_unit passed\n");
     return 0;

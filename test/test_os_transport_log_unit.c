@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 #define OST_LOG_ENABLE_TEST_HOOKS 1
-#include "../src/os_transport_log.c"
+#include "os_transport_log.c"
 
 static int g_callback_calls = 0;
 static int g_callback_level = 0;

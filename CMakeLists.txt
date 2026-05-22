@@ -114,6 +114,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
     target_include_directories(test_os_transport_log_unit
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     target_link_libraries(test_os_transport_log_unit pthread)
 

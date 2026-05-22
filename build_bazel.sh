@@ -139,7 +139,7 @@ BAZEL_FLAGS=(
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[INFO] Building and running tests...${NC}"
     cd "${ROOT_DIR}"
-    bazel test "${BAZEL_FLAGS[@]}"         //:test_thread_pool         //:test_os_transport_unit         --test_output=all 2>&1
+    bazel test "${BAZEL_FLAGS[@]}"         //:test_thread_pool         //:test_os_transport_log_unit         //:test_os_transport_unit         --test_output=all 2>&1
     echo -e "${GREEN}[OK] Tests done.${NC}"
     exit 0
 fi
