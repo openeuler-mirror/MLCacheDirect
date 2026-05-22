@@ -38,10 +38,16 @@ NC='\033[0m'
 # 默认不编译测试、不启用故障注入；仅显式传入 -t/--test 时只运行测试并退出
 DO_TEST=0
 WITH_INJECT=OFF
+USE_BEAR=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--test)
             DO_TEST=1
+            shift
+            ;;
+        --bear|--compile-commands)
+            USE_BEAR=1
+            echo -e "${YELLOW}✅ 启用bear生成compile_commands.json${NC}"
             shift
             ;;
         --with-inject)
@@ -50,9 +56,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "用法: $0 [-t|--test] [--with-inject]"
-            echo "  -t, --test       只编译并运行测试"
-            echo "  --with-inject    启用故障注入功能"
+            echo "用法: $0 [-t|--test] [--with-inject] [--bear|--compile-commands]"
+            echo "  -t, --test                 只编译并运行测试"
+            echo "  --with-inject              启用故障注入功能"
+            echo "  --bear, --compile-commands 使用bear生成compile_commands.json"
             exit 0
             ;;
         *)
@@ -67,6 +74,7 @@ ARCH=$(detect_arch)
 echo -e "${YELLOW}🔍 检测到当前架构：${ARCH}${NC}"
 echo -e "${YELLOW}🧪 仅运行测试：${DO_TEST}${NC}"
 echo -e "${YELLOW}💉 故障注入：${WITH_INJECT}${NC}"
+echo -e "${YELLOW}🐻 生成编译命令：${USE_BEAR}${NC}"
 BUILD_TYPE="Release"
 if [ ${DO_TEST} -eq 1 ]; then
     BUILD_TYPE="Debug"
@@ -106,6 +114,9 @@ echo -e "${YELLOW}[1/6] 检查编译/打包依赖...${NC}"
 deps=("cmake" "gcc" "make")
 if [ ${DO_TEST} -eq 0 ]; then
     deps+=("rpmbuild" "file")
+fi
+if [ ${USE_BEAR} -eq 1 ]; then
+    deps+=("bear")
 fi
 for dep in "${deps[@]}"; do
     if ! command -v "${dep}" &> /dev/null; then
@@ -169,7 +180,11 @@ fi
 
 # ===================== 步骤4：编译生成库 =====================
 echo -e "${YELLOW}[4/6] 编译生成libos_transport.so（架构：${ARCH}）...${NC}"
-make -j$(nproc 2>/dev/null || echo 4)
+if [ ${USE_BEAR} -eq 1 ]; then
+    bear -- make -j$(nproc 2>/dev/null || echo 4)
+else
+    make -j$(nproc 2>/dev/null || echo 4)
+fi
 
 # ===================== 步骤5：临时安装 =====================
 echo -e "${YELLOW}[5/6] 临时安装到 ${INSTALL_DIR}...${NC}"
