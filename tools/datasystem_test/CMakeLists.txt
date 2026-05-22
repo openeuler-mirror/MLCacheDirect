@@ -19,12 +19,6 @@ if(NOT PIP_SHOW_PATH_RESULT EQUAL 0 OR NOT OPENYUANRONG_SITE_PACKAGES)
 endif()
 set(OPENYUANRONG_DATASYSTEM_PATH "${OPENYUANRONG_SITE_PACKAGES}/yr")
 
-# target
-add_executable(pipeline_h2d pipeline_h2d.cpp)
-
-# debug mode
-target_compile_options(pipeline_h2d PRIVATE -g -O0)
-
 # header
 file(GLOB_RECURSE
     DATASYSTEM_INCLUDE_PATH "${OPENYUANRONG_DATASYSTEM_PATH}/*/kv_client.h"
@@ -33,30 +27,55 @@ get_filename_component(
     DATASYSTEM_INCLUDE_DIR "${DATASYSTEM_INCLUDE_PATH}"
     DIRECTORY
 )
-target_include_directories(pipeline_h2d PRIVATE
-    ${DATASYSTEM_INCLUDE_DIR}/..
-)
+set(COMMON_HEADER ${DATASYSTEM_INCLUDE_DIR}/..)
 
 # lib
 file(GLOB_RECURSE
     DATASYSTEM_LIB_PATH "${OPENYUANRONG_DATASYSTEM_PATH}/*/libdatasystem.so"
 )
+set(COMMON_LIB ${DATASYSTEM_LIB_PATH} CUDA::cudart)
+
+#################### feature test util ##################
+
+add_executable(pipeline_h2d pipeline_h2d.cpp)
+target_include_directories(pipeline_h2d PRIVATE
+    ${COMMON_HEADER}/
+)
 target_link_libraries(pipeline_h2d PRIVATE 
-    ${DATASYSTEM_LIB_PATH}
-    CUDA::cudart
+    ${COMMON_LIB}
+)
+target_compile_options(pipeline_h2d PRIVATE
+    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
 )
 
-# fault injection H2D test
-add_executable(pipeline_h2d_fault_test pipeline_h2d_fault_test.cpp)
-target_compile_options(pipeline_h2d_fault_test PRIVATE -g -O0 -Wall)
-target_include_directories(pipeline_h2d_fault_test PRIVATE
-    ${DATASYSTEM_INCLUDE_DIR}/..
+
+#################### batch test util ##################
+
+add_executable(batch_test batch_test.cpp)
+target_include_directories(batch_test PRIVATE
+    ${COMMON_HEADER}/
 )
-target_link_libraries(pipeline_h2d_fault_test PRIVATE
-    ${DATASYSTEM_LIB_PATH}
-    CUDA::cudart
+target_link_libraries(batch_test PRIVATE 
+    ${COMMON_LIB}
+)
+target_compile_options(batch_test PRIVATE
+    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
+)
+
+#################### fault injection test util ##################
+
+add_executable(pipeline_h2d_fault_test pipeline_h2d_fault_test.cpp)
+target_include_directories(pipeline_h2d_fault_test PRIVATE
+    ${COMMON_HEADER}/
+)
+target_link_libraries(pipeline_h2d_fault_test PRIVATE 
+    ${COMMON_LIB}
     dl
 )
+target_compile_options(pipeline_h2d_fault_test PRIVATE
+    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
+)
+
 
 # standalone injection CLI
 add_executable(mlcd_inject_cli
