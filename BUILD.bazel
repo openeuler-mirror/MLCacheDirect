@@ -80,6 +80,17 @@ cc_test(
 )
 
 cc_test(
+    name = "test_os_transport_log_unit",
+    srcs = [
+        "test/test_os_transport_log_unit.c",
+    ],
+    copts = COMMON_COPTS,
+    includes = ["include"],
+    linkopts = ["-lpthread"],
+    deps = [":os_transport_hdrs"],
+)
+
+cc_test(
     name = "test_os_transport_unit",
     srcs = [
         "test/test_os_transport_unit.c",

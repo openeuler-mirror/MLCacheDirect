@@ -8,11 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,18 +18,19 @@
 #include "os_transport_log_internal.h"
 #include "os_transport.h"
 
-#define OST_LOG_SOCKET_ENV        "OST_LOG_SOCKET_PATH"
-#define OST_LOG_FILE_ENV          "OST_LOG_FILE_PATH"
-#define OST_LOG_DEFAULT_FILE_PATH "/tmp/os_transport.log"
+#define OST_LOG_FILE_ENV "OST_LOG_FILE_PATH"
 
 // 全局日志级别控制（可通过编译宏/配置修改）
 #ifndef GLOBAL_LOG_LEVEL
 #define GLOBAL_LOG_LEVEL LOG_LEVEL_DEBUG
 #endif
 
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
+
 typedef enum {
     OST_LOG_BACKEND_UNINITIALIZED = 0,
-    OST_LOG_BACKEND_SOCKET,
     OST_LOG_BACKEND_FILE,
     OST_LOG_BACKEND_SYSLOG,
     OST_LOG_BACKEND_CALLBACK,
@@ -40,7 +39,6 @@ typedef enum {
 
 typedef struct {
     pthread_mutex_t mutex;
-    bool initialized;
     bool syslog_opened;
     int fd;
     log_callback_t callback;
@@ -48,11 +46,16 @@ typedef struct {
     OstLogBackend backend;
 } OstLogState;
 
+typedef struct {
+    OstLogBackend backend;
+    int fd;
+    log_callback_t callback;
+} OstLogEmitTarget;
+
 static inline OstLogState *ost_log_state(void)
 {
     static OstLogState state = {
         .mutex = PTHREAD_MUTEX_INITIALIZER,
-        .initialized = false,
         .syslog_opened = false,
         .fd = -1,
         .callback = NULL,
@@ -115,14 +118,6 @@ static inline bool ost_log_path_exists(const char *path)
     return stat(path, &st) == 0;
 }
 
-#ifdef OST_LOG_ENABLE_TEST_HOOKS
-static inline int *ost_log_syslog_probe_override(void)
-{
-    static int override_available = -1;
-
-    return &override_available;
-}
-
 static inline void ost_log_close_locked(OstLogState *state)
 {
     if (state->fd >= 0) {
@@ -136,7 +131,14 @@ static inline void ost_log_close_locked(OstLogState *state)
     }
 
     state->backend = OST_LOG_BACKEND_UNINITIALIZED;
-    state->initialized = false;
+}
+
+#ifdef OST_LOG_ENABLE_TEST_HOOKS
+static inline int *ost_log_syslog_probe_override(void)
+{
+    static int override_available = -1;
+
+    return &override_available;
 }
 #endif
 
@@ -167,76 +169,54 @@ static inline int ost_log_open_file_fd(const char *path)
     return fd;
 }
 
-static inline int ost_log_open_socket_fd(const char *path)
+static bool ost_log_install_file_backend_locked(OstLogState *state)
 {
-    int fd = -1;
-    struct sockaddr_un addr;
+    const char *file_path = getenv(OST_LOG_FILE_ENV);
+    int fd;
 
-    if (path == NULL || path[0] == '\0' || strlen(path) >= sizeof(addr.sun_path)) {
-        return -1;
-    }
-
-    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    fd = ost_log_open_file_fd(file_path);
     if (fd < 0) {
-        return -1;
-    }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    (void)snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-
-    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return -1;
+        return false;
     }
 
-    return fd;
+    if (state->syslog_opened) {
+        closelog();
+        state->syslog_opened = false;
+    }
+    if (state->fd >= 0) {
+        close(state->fd);
+    }
+    state->fd = fd;
+    state->backend = OST_LOG_BACKEND_FILE;
+    return true;
 }
 
-static void ost_log_init_locked(OstLogState *state)
+static void ost_log_select_backend_locked(OstLogState *state)
 {
-    const char *socket_path = getenv(OST_LOG_SOCKET_ENV);
-    const char *file_path = getenv(OST_LOG_FILE_ENV);
-
-    state->backend = OST_LOG_BACKEND_DISABLED;
-    state->fd = -1;
-
-    if (socket_path != NULL && socket_path[0] != '\0') {
-        state->fd = ost_log_open_socket_fd(socket_path);
-        if (state->fd >= 0) {
-            state->backend = OST_LOG_BACKEND_SOCKET;
-            state->initialized = true;
-            return;
-        }
+    /*
+     * Backend priority is monotonic upward:
+     * callback > file > syslog > disabled/uninitialized.
+     */
+    if (state->backend == OST_LOG_BACKEND_CALLBACK || state->backend == OST_LOG_BACKEND_FILE) {
+        return;
     }
 
-    if (file_path != NULL && file_path[0] != '\0') {
-        state->fd = ost_log_open_file_fd(file_path);
-        if (state->fd >= 0) {
-            state->backend = OST_LOG_BACKEND_FILE;
-            state->initialized = true;
-            return;
-        }
+    if (ost_log_install_file_backend_locked(state)) {
+        return;
+    }
+
+    if (state->backend == OST_LOG_BACKEND_SYSLOG) {
+        return;
     }
 
     if (ost_log_syslog_available_probe()) {
         openlog("os_transport", LOG_PID | LOG_NDELAY, LOG_USER);
         state->syslog_opened = true;
         state->backend = OST_LOG_BACKEND_SYSLOG;
-        state->initialized = true;
-        return;
-    }
-
-    state->fd = ost_log_open_file_fd(OST_LOG_DEFAULT_FILE_PATH);
-    if (state->fd >= 0) {
-        state->backend = OST_LOG_BACKEND_FILE;
-        state->initialized = true;
         return;
     }
 
     state->backend = OST_LOG_BACKEND_DISABLED;
-    state->initialized = true;
 }
 
 int os_transport_log_reg(int level, log_callback_t cb)
@@ -248,39 +228,48 @@ int os_transport_log_reg(int level, log_callback_t cb)
     OstLogState *state = ost_log_state();
 
     pthread_mutex_lock(&state->mutex);
-    if (!state->initialized) {
-        state->callback = cb;
-        state->log_level = (LogLevel)level;
-        state->backend = OST_LOG_BACKEND_CALLBACK;
-        state->initialized = true;
-    }
+    ost_log_close_locked(state);
+    state->callback = cb;
+    state->log_level = (LogLevel)level;
+    state->backend = OST_LOG_BACKEND_CALLBACK;
     pthread_mutex_unlock(&state->mutex);
     return 0;
 }
 
 static size_t
-ost_log_format_line(char *buf, size_t buf_size, LogLevel level, const char *file, int line, const char *message)
+ost_log_format_line(char *buf,
+                    size_t buf_size,
+                    OstLogBackend backend,
+                    LogLevel level,
+                    const char *file,
+                    int line,
+                    const char *message)
 {
-    struct timespec ts;
-    struct tm tm_info;
-    char time_buf[32];
     int prefix_len;
     int body_len;
 
-    (void)clock_gettime(CLOCK_REALTIME, &ts);
-    (void)localtime_r(&ts.tv_sec, &tm_info);
-    (void)strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", &tm_info);
+    if (likely(backend != OST_LOG_BACKEND_FILE)) {
+        prefix_len = snprintf(buf, buf_size, "[ost:%s:%d] ", file, line);
+    } else {
+        struct timespec ts;
+        struct tm tm_info;
+        char time_buf[32];
 
-    prefix_len = snprintf(buf,
-                          buf_size,
-                          "%s.%03ld [%s] [pid=%ld tid=%ld] [ost:%s:%d] ",
-                          time_buf,
-                          ts.tv_nsec / 1000000L,
-                          ost_log_level_name(level),
-                          (long)getpid(),
-                          ost_log_get_tid(),
-                          file,
-                          line);
+        (void)clock_gettime(CLOCK_REALTIME, &ts);
+        (void)localtime_r(&ts.tv_sec, &tm_info);
+        (void)strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", &tm_info);
+
+        prefix_len = snprintf(buf,
+                              buf_size,
+                              "%s.%03ld [%s] [pid=%ld tid=%ld] [ost:%s:%d] ",
+                              time_buf,
+                              ts.tv_nsec / 1000000L,
+                              ost_log_level_name(level),
+                              (long)getpid(),
+                              ost_log_get_tid(),
+                              file,
+                              line);
+    }
     if (prefix_len < 0) {
         return 0;
     }
@@ -321,22 +310,23 @@ static inline void ost_log_write_fd_best_effort(int fd, const char *buf, size_t 
     }
 }
 
-static void ost_log_emit_locked(OstLogState *state, LogLevel level, const char *formatted_line)
+static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *formatted_line)
 {
     size_t len = strlen(formatted_line);
 
-    switch (state->backend) {
-    case OST_LOG_BACKEND_SOCKET:
+    switch (target.backend) {
     case OST_LOG_BACKEND_FILE:
-        if (state->fd >= 0) {
-            ost_log_write_fd_best_effort(state->fd, formatted_line, len);
+        if (target.fd >= 0) {
+            ost_log_write_fd_best_effort(target.fd, formatted_line, len);
         }
         break;
     case OST_LOG_BACKEND_SYSLOG:
         syslog(ost_log_syslog_priority(level), "%s", formatted_line);
         break;
     case OST_LOG_BACKEND_CALLBACK:
-        state->callback(level, formatted_line);
+        if (target.callback) {
+            target.callback(level, formatted_line);
+        }
         break;
     case OST_LOG_BACKEND_DISABLED:
     case OST_LOG_BACKEND_UNINITIALIZED:
@@ -350,24 +340,33 @@ static void ost_log_vwrite(LogLevel level, const char *file, int line, const cha
     char msg_buf[1024];
     char line_buf[1408];
     OstLogState *state = ost_log_state();
-
-    (void)vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
-    (void)ost_log_format_line(line_buf, sizeof(line_buf), level, file, line, msg_buf);
+    OstLogEmitTarget target = {.backend = OST_LOG_BACKEND_DISABLED, .fd = -1, .callback = NULL};
 
     pthread_mutex_lock(&state->mutex);
-    if (!state->initialized) {
-        ost_log_init_locked(state);
+    ost_log_select_backend_locked(state);
+    if (level < state->log_level) {
+        pthread_mutex_unlock(&state->mutex);
+        return;
     }
-    ost_log_emit_locked(state, level, line_buf);
+    target.backend = state->backend;
+    if (state->backend == OST_LOG_BACKEND_FILE && state->fd >= 0) {
+        target.fd = dup(state->fd);
+    } else if (state->backend == OST_LOG_BACKEND_CALLBACK) {
+        target.callback = state->callback;
+    }
     pthread_mutex_unlock(&state->mutex);
+
+    (void)vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
+    (void)ost_log_format_line(line_buf, sizeof(line_buf), target.backend, level, file, line, msg_buf);
+
+    ost_log_emit(target, level, line_buf);
+    if (target.fd >= 0) {
+        close(target.fd);
+    }
 }
 
 void ost_log_write(LogLevel level, const char *file, int line, const char *fmt, ...)
 {
-    if (level < ost_log_state()->log_level) {
-        return;
-    }
-
     va_list args;
     va_start(args, fmt);
     ost_log_vwrite(level, file, line, fmt, args);

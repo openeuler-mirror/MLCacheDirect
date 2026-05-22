@@ -110,6 +110,13 @@ if(OS_TRANSPORT_BUILD_TESTS)
     )
     target_link_libraries(test_thread_pool pthread)
 
+    add_executable(test_os_transport_log_unit test/test_os_transport_log_unit.c)
+    target_include_directories(test_os_transport_log_unit
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_os_transport_log_unit pthread)
+
     # os_transport.c 白盒单元测试（使用mock隔离外部依赖）
     add_executable(test_os_transport_unit test/test_os_transport_unit.c)
     target_include_directories(test_os_transport_unit

@@ -164,12 +164,13 @@ cmake \
 
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[4/6] 编译并运行测试...${NC}"
-    TEST_TARGETS="test_thread_pool test_os_transport_unit"
+    TEST_TARGETS="test_thread_pool test_os_transport_log_unit test_os_transport_unit"
     if [ "${WITH_INJECT}" = "ON" ]; then
         TEST_TARGETS="${TEST_TARGETS} test_inject_unit"
     fi
     make ${TEST_TARGETS} -j$(nproc 2>/dev/null || echo 4)
     ./test_thread_pool
+    ./test_os_transport_log_unit
     ./test_os_transport_unit
     if [ "${WITH_INJECT}" = "ON" ]; then
         ./test_inject_unit
