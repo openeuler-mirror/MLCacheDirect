@@ -166,28 +166,77 @@ static bool worker_queue_push(WorkerThread *worker, ThreadPoolTask *task)
     return true;
 }
 
-// 从 worker 队列中取出指定 request_id 的第一个任务（必须已持有 worker->mutex）
-static ThreadPoolTask *worker_queue_pop_by_req(WorkerThread *worker, uint32_t req_id)
+static uint64_t thread_pool_user_data_raw64(const TransportData *data)
 {
+    return data ? data->user_ctx : 0;
+}
+
+static uint32_t thread_pool_user_data_chunk_id(const TransportData *data)
+{
+    return data ? (uint32_t)data->bs.chunk_id : 0;
+}
+
+static uint32_t thread_pool_user_data_chunk_type(const TransportData *data)
+{
+    return data ? (uint32_t)data->bs.chunk_type : 0;
+}
+
+static uint32_t thread_pool_user_data_chunk_size(const TransportData *data)
+{
+    return data ? (uint32_t)data->bs.chunk_size : 0;
+}
+
+// 从 worker 队列中取出匹配 request_id 和 completion user_data 的任务（必须已持有 worker->mutex）。
+// Pipeline H2D recv 同一 request_id 下会注册多个 chunk task，completion 可以乱序到达。
+// 对设置了 has_match_user_ctx 的任务，必须同时匹配 request_id + full imm64，避免 chunk1 completion
+// 错配到 chunk0 task。没有 match key 的历史任务保持原 request_id 匹配语义。
+static ThreadPoolTask *worker_queue_pop_by_req_and_user_data(WorkerThread *worker,
+                                                             uint32_t req_id,
+                                                             const TransportData *notify_data)
+{
+    uint64_t notify_raw64 = thread_pool_user_data_raw64(notify_data);
     TaskNode *prev = NULL;
     TaskNode *curr = worker->queue_head;
+    TaskNode *first_req_node = NULL;
+
     while (curr) {
-        if (curr->task->request_id == req_id) {
-            ThreadPoolTask *task = curr->task;
-            if (prev) {
-                prev->next = curr->next;
-            } else {
-                worker->queue_head = curr->next;
+        ThreadPoolTask *task = curr->task;
+        if (task && task->request_id == req_id) {
+            if (!first_req_node) {
+                first_req_node = curr;
             }
-            if (curr == worker->queue_tail) {
-                worker->queue_tail = prev;
+            if (!task->has_match_user_ctx || task->match_user_ctx == notify_raw64) {
+                ThreadPoolTask *matched = task;
+                if (prev) {
+                    prev->next = curr->next;
+                } else {
+                    worker->queue_head = curr->next;
+                }
+                if (curr == worker->queue_tail) {
+                    worker->queue_tail = prev;
+                }
+                worker->queue_size--;
+                free(curr);
+                return matched;
             }
-            worker->queue_size--;
-            free(curr);
-            return task;
         }
         prev = curr;
         curr = curr->next;
+    }
+
+    if (first_req_node && first_req_node->task && first_req_node->task->has_match_user_ctx) {
+        OST_LOG_WARN("No exact matched task for completion (worker=%d, request_id=%u, notify_imm64=0x%016llx, "
+                     "notify_chunk=%u, notify_type=%u, notify_size=%u, first_expected_imm64=0x%016llx, "
+                     "queue_size=%u, pending_count=%u).",
+                     worker ? worker->worker_idx : -1,
+                     req_id,
+                     (unsigned long long)notify_raw64,
+                     thread_pool_user_data_chunk_id(notify_data),
+                     thread_pool_user_data_chunk_type(notify_data),
+                     thread_pool_user_data_chunk_size(notify_data),
+                     (unsigned long long)first_req_node->task->match_user_ctx,
+                     worker ? worker->queue_size : 0,
+                     worker ? worker->pending_req_count : 0);
     }
     return NULL;
 }
@@ -453,16 +502,22 @@ static void *worker_routine(void *arg)
             continue;
         }
 
-        ThreadPoolTask *task = worker_queue_pop_by_req(worker, req_to_exec);
+        ThreadPoolTask *task = worker_queue_pop_by_req_and_user_data(worker, req_to_exec, &user_data);
         if (task) {
             worker->state = WORKER_STATE_BUSY;
             pthread_mutex_unlock(&worker->mutex);
             worker_process_task(worker, task, req_to_exec, &user_data);
             pthread_mutex_lock(&worker->mutex);
         } else {
-            OST_LOG_WARN("Wakeup received without matching queued task (worker=%d, request_id=%u).",
+            OST_LOG_WARN("Wakeup received without matching queued task (worker=%d, request_id=%u, chunk_id=%u, "
+                         "chunk_type=%u, chunk_size=%u, queue_size=%u, pending_count=%u).",
                          worker->worker_idx,
-                         req_to_exec);
+                         req_to_exec,
+                         (uint32_t)user_data.bs.chunk_id,
+                         (uint32_t)user_data.bs.chunk_type,
+                         (uint32_t)user_data.bs.chunk_size,
+                         worker->queue_size,
+                         worker->pending_req_count);
             worker->state = WORKER_STATE_IDLE;
         }
     }
@@ -741,6 +796,9 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     task->task_func = internal_task_wrapper;
     task->task_arg = itask;
     task->is_completed = false;
+    task->free_task_self = false;
+    task->has_match_user_ctx = false;
+    task->match_user_ctx = 0;
     itask->task_id = task->task_id;
 
     WorkerThread *worker = select_best_worker(handle);
@@ -827,6 +885,9 @@ static bool create_batch_node(ThreadPoolHandle handle,
     task->task_func = internal_task_wrapper;
     task->task_arg = itask;
     task->is_completed = false;
+    task->free_task_self = false;
+    task->has_match_user_ctx = src->has_match_user_ctx;
+    task->match_user_ctx = src->match_user_ctx;
     itask->task_id = task->task_id;
     *task_id = task->task_id;
 

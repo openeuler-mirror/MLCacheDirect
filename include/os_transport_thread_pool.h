@@ -22,6 +22,15 @@ typedef struct {
     void *task_arg;              // 任务参数（用户自行管理内存）
     bool is_completed;           // 任务完成标记
     bool free_task_self;         // 任务结构体是否由线程池释放
+    /*
+     * Optional exact match key for wakeup. Pipeline H2D recv registers multiple
+     * chunk tasks with the same request_id. WRITE_WITH_IMM completions may arrive
+     * out of order, so request_id alone is not sufficient to select the correct
+     * chunk task. When has_match_user_ctx is true, match_user_ctx stores the full
+     * 64-bit immediate value expected by this task.
+     */
+    bool has_match_user_ctx;
+    uint64_t match_user_ctx;
 } ThreadPoolTask;
 
 /**

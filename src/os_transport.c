@@ -18,6 +18,16 @@ static int g_inited = 0;
 #define OS_TRANSPORT_WAIT_TIMEOUT 1U
 #define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
 
+static uint64_t make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
+{
+    os_transport_user_data_t user_data = {0};
+    user_data.bs.request_id = request_id;
+    user_data.bs.chunk_type = chunk_type;
+    user_data.bs.chunk_id = chunk_id;
+    user_data.bs.chunk_size = len;
+    return user_data.user_ctx;
+}
+
 // init和destroy接收队列限制器，ost_handle外部调用时已校验非空
 static int init_recv_queue_limiter(os_transport_handle_t *ost_handle, uint32_t recv_queue_capacity)
 {
@@ -605,7 +615,8 @@ static void construct_recv_task_arg(recv_task_arg_t *arg,
                                     chunk_info_t *chunk_info,
                                     bool is_last_chunk,
                                     task_sync_t *sync,
-                                    notify_callback_t notify_callback)
+                                    notify_callback_t notify_callback,
+                                    uint64_t expected_imm64)
 {
     memset(arg, 0, sizeof(*arg));
     arg->recv_info = recv_info;
@@ -613,6 +624,7 @@ static void construct_recv_task_arg(recv_task_arg_t *arg,
     arg->is_last_chunk = is_last_chunk;
     arg->sync = sync;
     arg->notify_callback = notify_callback;
+    arg->expected_imm64 = expected_imm64;
 }
 
 // 构建供worker取用的task信息
@@ -628,6 +640,8 @@ static ThreadPoolTask construct_worker_task(
     task.task_arg = task_arg;
     task.is_completed = false;
     task.free_task_self = false;
+    task.has_match_user_ctx = false;
+    task.match_user_ctx = 0;
     return task;
 }
 
@@ -653,6 +667,17 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
         return;
     }
 
+    if (recv_task_arg->expected_imm64 != 0 && recv_task_arg->expected_imm64 != notify_user_data->user_ctx) {
+        OST_LOG_ERROR("Recv task completion mismatch (request_id=%u, expected_imm64=0x%016llx, "
+                      "notify_imm64=0x%016llx, expected_chunk=%u, notify_chunk=%u, notify_type=%u, notify_size=%u).",
+                      recv_task_arg->recv_info.request_id,
+                      (unsigned long long)recv_task_arg->expected_imm64,
+                      (unsigned long long)notify_user_data->user_ctx,
+                      (uint32_t)((recv_task_arg->expected_imm64 >> 2) & 0x3f),
+                      (uint32_t)notify_user_data->bs.chunk_id,
+                      (uint32_t)notify_user_data->bs.chunk_type,
+                      (uint32_t)notify_user_data->bs.chunk_size);
+    }
     recv_task_arg->notify_user_data = *notify_user_data;
 }
 
@@ -834,9 +859,14 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
     for (uint32_t i = 0; i < chunk_num; i++) {
         bool is_last_chunk = (i == chunk_num - 1);
         uint32_t request_id = (uint32_t)(urma_info.recv_info.request_id);
-        construct_recv_task_arg(&task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync, notify_callback);
+        uint32_t chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
+        uint64_t expected_imm64 = make_transport_user_data_raw64(request_id, i, chunk_type, chunks[i].len);
+        construct_recv_task_arg(
+            &task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync, notify_callback, expected_imm64);
         task_group->tasks[i] =
             construct_worker_task(i, request_id, task_func, &task_args[i], prepare_recv_task_user_data);
+        task_group->tasks[i].has_match_user_ctx = true;
+        task_group->tasks[i].match_user_ctx = expected_imm64;
     }
 
     task_ids =
@@ -1312,9 +1342,13 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     }
     if (ret != 0) {
         OST_LOG_WARN("Failed to wake worker for completion event "
-                     "(request_id=%u, opcode=%d).",
+                     "(request_id=%u, opcode=%d, chunk_id=%u, chunk_type=%u, chunk_size=%u, imm64=0x%016llx).",
                      request_id,
-                     opcode);
+                     opcode,
+                     (uint32_t)user_data.bs.chunk_id,
+                     (uint32_t)user_data.bs.chunk_type,
+                     (uint32_t)user_data.bs.chunk_size,
+                     (unsigned long long)user_data.user_ctx);
     }
 
     return ret;

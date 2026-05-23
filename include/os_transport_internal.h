@@ -79,6 +79,8 @@ typedef struct {
     urma_recv_info_t recv_info;
     // 上层注册的notify回调；后续worker应使用wake_up阶段带来的user_data调用它
     notify_callback_t notify_callback;
+    // 当前 recv task 期望收到的完整 64-bit immediate 数据，用于精确匹配 request/chunk。
+    uint64_t expected_imm64;
     // 保存每次wake_up解析出的user_data副本，notify_callback的入参应传该字段地址
     os_transport_user_data_t notify_user_data;
 } recv_task_arg_t;
