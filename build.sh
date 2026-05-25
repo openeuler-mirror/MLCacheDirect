@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             echo "用法: $0 [-t|--test] [--gcov] [--gcov-ut] [--with-inject] [--bear|--compile-commands]"
             echo "  -t, --test                 只编译并运行测试"
             echo "  --gcov                     只编译生成带覆盖率插桩的libos_transport.so，不运行测试、不打包RPM"
-            echo "  --gcov-ut                  编译并运行单元测试，打印src目录源码覆盖率"
+            echo "  --gcov-ut                  编译并运行单元测试，打印src目录源码覆盖率并生成lcov结果"
             echo "  --with-inject              启用故障注入功能"
             echo "  --bear, --compile-commands 使用bear生成compile_commands.json"
             exit 0
@@ -133,7 +133,7 @@ fi
 echo -e "${YELLOW}[1/6] 检查编译/打包依赖...${NC}"
 deps=("cmake" "gcc" "make")
 if [ ${DO_GCOV_UT} -eq 1 ]; then
-    deps+=("gcov")
+    deps+=("gcov" "lcov" "genhtml")
 fi
 if [ ${DO_TEST} -eq 0 ] && [ ${DO_GCOV_SO} -eq 0 ]; then
     deps+=("rpmbuild" "file")
@@ -258,6 +258,27 @@ print_cmake_gcov_report() {
     print_gcov_summary_from_output "${output}" "src/os_transport_thread_pool.c"
 }
 
+generate_cmake_lcov_report() {
+    local raw_info="${BUILD_DIR}/coverage-all.info"
+    local src_info="${BUILD_DIR}/coverage-src.info"
+    local html_dir="${BUILD_DIR}/coverage-html"
+
+    echo -e "${YELLOW}[LCOV] 生成src目录源码覆盖率结果：${NC}"
+    lcov --capture \
+        --directory "${BUILD_DIR}" \
+        --output-file "${raw_info}" \
+        --rc branch_coverage=1
+    lcov --extract "${raw_info}" "${ROOT_DIR}/src/*" \
+        --output-file "${src_info}" \
+        --rc branch_coverage=1
+    rm -f "${raw_info}"
+
+    echo -e "${GREEN}📊 LCOV结果：${src_info}${NC}"
+    echo -e "${YELLOW}[GENHTML] 生成HTML覆盖率报告：${NC}"
+    genhtml --branch-coverage "${src_info}" -o "${html_dir}"
+    echo -e "${GREEN}📈 HTML报告目录：${html_dir}${NC}"
+}
+
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[4/6] 编译并运行测试...${NC}"
     TEST_TARGETS="test_thread_pool test_os_transport_log_unit test_os_transport_unit"
@@ -273,6 +294,7 @@ if [ ${DO_TEST} -eq 1 ]; then
     fi
     if [ ${DO_GCOV_UT} -eq 1 ]; then
         print_cmake_gcov_report
+        generate_cmake_lcov_report
     fi
     echo -e "${GREEN}✅ 测试通过。${NC}"
     exit 0
