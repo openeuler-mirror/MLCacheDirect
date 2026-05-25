@@ -513,7 +513,6 @@ int main(int argc, char* argv[]) {
     }
 
     int keys_per_thread = args.count / args.thread_count;
-    int batches_per_thread = keys_per_thread / args.batch;
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;

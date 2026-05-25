@@ -742,8 +742,9 @@ int main(int argc, char *argv[])
         auto sharedClient = std::make_shared<KVClient>(connectOptions);
         auto ret = sharedClient->Init();
         if (ret.IsError()) {
-            std::err << "init client failed for host " << args.host << " port " << args.port
-                     << " reason: " << ret.GetMsg();
+            std::cerr << "init client failed for host " << args.host << " port " << args.port
+                     << " reason: " << ret.GetMsg() << std::endl;
+            return 1;
         }
 
         std::cout << "[Main] Shared KVClient initialized once: " << sharedClient.get() << ", host=" << args.host
