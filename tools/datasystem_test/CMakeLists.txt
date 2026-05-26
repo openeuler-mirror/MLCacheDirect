@@ -51,7 +51,7 @@ target_compile_options(pipeline_h2d PRIVATE
 
 #################### batch test util ##################
 
-add_executable(batch_test batch_test.cpp)
+add_executable(batch_test pipeline_rh2d_batch_test.cpp)
 target_include_directories(batch_test PRIVATE
     ${COMMON_HEADER}/
 )
