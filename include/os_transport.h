@@ -42,8 +42,9 @@ typedef struct {
 } ost_buffer_info_t;
 
 typedef struct {
-    urma_jfr_t *jfr; // 用于接收的jfr
-    void *dst;       // 数据缓冲区地址
+    urma_jfr_t *jfr;     // 兼容旧版本：用于接收的JFR
+    urma_jetty_t *jetty; // 最新版本：用于接收的Jetty，优先使用urma_post_jetty_recv_wr
+    void *dst;           // 数据缓冲区地址
 } ost_device_info_t;
 
 typedef enum jetty_mode { JETTY_MODE_SIMPLEX = 0, JETTY_MODE_DUPLEX } jetty_mode_t;

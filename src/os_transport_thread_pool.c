@@ -116,7 +116,7 @@ static int internal_task_wrapper(void *arg)
         OST_LOG_WARN(
             "Worker task returned error (task_id=%lu, request_id=%u, ret=%d).", itask->task_id, itask->request_id, ret);
     }
-    OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id);
+    OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id, itask->request_id);
     free(itask);
     return ret;
 }

@@ -470,6 +470,10 @@ static int validate_recv_input(void *handle,
                       (void *)notify_callback);
         return -1;
     }
+    if (!device_dst->jetty && !device_dst->jfr) {
+        OST_LOG_ERROR("Failed: neither jetty nor jfr is available for os_transport_recv().");
+        return -1;
+    }
     if (!g_inited) {
         OST_LOG_ERROR("Failed: os_transport is not initialized. "
                       "Call os_transport_init() before os_transport_recv().");
@@ -1251,7 +1255,11 @@ uint32_t os_transport_recv(void *handle,
     }
 
     urma_info.recv_info = (urma_recv_info_t){
-        .jfr = device_dst->jfr, .local_tseg = host_src->tseg, .device_info = *device_dst, .request_id = client_key};
+        .jfr = device_dst->jfr,
+        .jetty = device_dst->jetty,
+        .local_tseg = host_src->tseg,
+        .device_info = *device_dst,
+        .request_id = client_key};
 
     if (acquire_recv_queue_resources(ost_handle, chunks_num, &reused_recv_queue_count, &post_recv_queue_count) != 0) {
         OST_LOG_ERROR("Failed: unable to acquire recv queue resources "
