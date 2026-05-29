@@ -10,7 +10,7 @@
 #include <sys/types.h>
 
 typedef enum {
-    NOT_SPLIT = 0,
+    SPLIT_UNSET = 0,
     MIDDLE_CHUNK,
     LAST_CHUNK,
 } os_transport_chunk_type_t;

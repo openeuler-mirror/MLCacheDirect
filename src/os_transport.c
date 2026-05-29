@@ -14,11 +14,14 @@
 // 全局初始化状态
 static int g_inited = 0;
 
-#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 6) - 1)
-#define OS_TRANSPORT_WAIT_TIMEOUT 1U
-#define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
+#define OS_TRANSPORT_WAIT_TIMEOUT    1U
+#define OS_TRANSPORT_WAIT_ERROR      ((uint32_t) - 1)
+#define OS_TRANSPORT_MAX_CHUNK_COUNT (1ULL << OS_TRANSPORT_CHUNK_ID_BITS)
+#define OS_TRANSPORT_MAX_CHUNK_ID    (OS_TRANSPORT_MAX_CHUNK_COUNT - 1ULL)
+#define OS_TRANSPORT_MAX_RECV_LEN    ((uint64_t)OS_TRANSPORT_MAX_CHUNK_COUNT * DEFAULT_CHUNK_SIZE)
 
-static uint64_t make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
+static uint64_t
+make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
 {
     os_transport_user_data_t user_data = {0};
     user_data.bs.request_id = request_id;
@@ -475,6 +478,13 @@ static int validate_recv_input(void *handle,
                       "Call os_transport_init() before os_transport_recv().");
         return -1;
     }
+    if ((uint64_t)len > OS_TRANSPORT_MAX_RECV_LEN) {
+        OST_LOG_ERROR("Failed: recv length exceeds maximum supported size "
+                      "(len=%u, max_len=%lu).",
+                      len,
+                      (unsigned long)OS_TRANSPORT_MAX_RECV_LEN);
+        return -1;
+    }
     return 0;
 }
 
@@ -587,7 +597,7 @@ static void construct_send_task_arg(send_task_arg_t *arg,
 
     user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
     user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
-    if (chunk_id == OS_TRANSPORT_MAX_CHUNK_ID) {
+    if (chunk_id >= OS_TRANSPORT_MAX_CHUNK_COUNT) {
         OST_LOG_WARN("chunk_id=%lu exceeds user data bitfield range (max=%lu), value will be truncated.",
                      (unsigned long)chunk_id,
                      (unsigned long)OS_TRANSPORT_MAX_CHUNK_ID);
