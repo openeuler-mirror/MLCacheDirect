@@ -90,7 +90,7 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
     urma_jfr_wr_t *bad_wr = NULL;
 
     if (recv_info.jetty) {
-        for (uint32 loop = 0; loop < RQE_PREFILL_MULTIPLE_DUPLEX; loop++) {
+        for (int loop = 0; loop < RQE_PREFILL_MULTIPLE_DUPLEX; loop++) {
             ret = urma_post_jetty_recv_wr(recv_info.jetty, &wr, &bad_wr);
             if (ret != URMA_SUCCESS) {
                 OST_LOG_ERROR("Failed: URMA jetty recv post returned %d (request_id=%u, index=%u).", (int)ret, recv_info.request_id, loop);
