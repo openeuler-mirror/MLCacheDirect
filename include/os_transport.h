@@ -28,10 +28,11 @@ typedef int (*notify_callback_t)(void *user_data);
 
 typedef union {
     struct {
-        uint64_t chunk_type : 2;
-        uint64_t chunk_id : 6;
-        uint64_t chunk_size : 24;
-        uint64_t request_id : 32;
+        uint64_t chunk_type : 1; // 1位：0表示非尾片，1表示尾片
+        uint64_t chunk_id : 4;   // 4位：最多支持16个分片
+        uint64_t chunk_size : 1; // 1位：0表示2MB，1表示4MB
+        uint64_t request_id : 10; // 10位
+        uint64_t rsv : 48;
     } bs;
     uint64_t user_ctx;
 } os_transport_user_data_t;
