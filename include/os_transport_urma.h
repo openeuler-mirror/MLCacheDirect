@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* 1个vjerry对应4个pjetty，需要遍历下发 */
+#define RQE_PREFILL_MULTIPLE_DUPLEX 4
+
 struct chunk_info;
 
 typedef struct {
