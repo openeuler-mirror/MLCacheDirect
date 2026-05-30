@@ -45,10 +45,8 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_
     urma_jfs_wr_t *bad_wr;
 
     if (write_info.jfs) {
-        OST_LOG_INFO("urma_write_with_notify:use jfs");
         ret = urma_post_jfs_wr(write_info.jfs, &wr, &bad_wr);
     } else if (write_info.jetty) {
-        OST_LOG_INFO("urma_write_with_notify:ust jetty");
         ret = urma_post_jetty_send_wr(write_info.jetty, &wr, &bad_wr);
     } else {
         OST_LOG_ERROR("Failed: neither jfs nor jetty is available for write request "
@@ -67,7 +65,6 @@ urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_
                       write_info.user_ctx_client.bs.chunk_id,
                       chunk_info->len);
     }
-    OST_LOG_INFO("urma_write_with_notify success");
 
     return ret;
 }
@@ -114,6 +111,5 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
                       recv_info.request_id,
                       chunk_info->len);
     }
-    OST_LOG_INFO("urma_recv_with_notify success");
     return ret;
 }
