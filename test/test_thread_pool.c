@@ -49,6 +49,40 @@ static void wake_request(ThreadPoolHandle pool, uint32_t req_id)
     assert(thread_pool_wake_up_worker_by_req_id(pool, req_id, NULL) == 0);
 }
 
+static RequestContext *find_test_req_context(ThreadPoolHandle pool, uint32_t req_id)
+{
+    for (int i = 0; i < REQ_HASH_SIZE; i++) {
+        RequestContext *ctx = pool->req_hash[i];
+        while (ctx) {
+            if (ctx->request_id == req_id) {
+                return ctx;
+            }
+            ctx = ctx->next;
+        }
+    }
+    return NULL;
+}
+
+static void append_test_pending_req(WorkerThread *worker, uint32_t req_id, const TransportData *user_data)
+{
+    PendingReqNode *node = calloc(1, sizeof(PendingReqNode));
+    assert(node != NULL);
+    node->request_id = req_id;
+    if (user_data) {
+        node->user_data = *user_data;
+    }
+
+    pthread_mutex_lock(&worker->mutex);
+    if (worker->pending_req_tail) {
+        worker->pending_req_tail->next = node;
+    } else {
+        worker->pending_req_head = node;
+    }
+    worker->pending_req_tail = node;
+    worker->pending_req_count++;
+    pthread_mutex_unlock(&worker->mutex);
+}
+
 static void test_state_wait_completion(void)
 {
     pthread_mutex_lock(&g_state.lock);
@@ -78,6 +112,34 @@ static int test_task(void *arg)
     pthread_mutex_unlock(&g_state.lock);
 
     free(arg);
+    return 0;
+}
+
+typedef struct {
+    int seq;
+    uint64_t observed_user_ctx;
+} MatchTaskArg;
+
+static void prepare_match_task(void *task_arg, void *user_data)
+{
+    MatchTaskArg *arg = (MatchTaskArg *)task_arg;
+    TransportData *data = (TransportData *)user_data;
+    assert(arg != NULL);
+    assert(data != NULL);
+    arg->observed_user_ctx = data->user_ctx;
+}
+
+static int matched_task(void *arg)
+{
+    MatchTaskArg *match_arg = (MatchTaskArg *)arg;
+    assert(match_arg != NULL);
+    assert(match_arg->observed_user_ctx != 0);
+
+    pthread_mutex_lock(&g_state.lock);
+    g_state.exec_order[g_state.exec_index++] = match_arg->seq;
+    pthread_mutex_unlock(&g_state.lock);
+
+    free(match_arg);
     return 0;
 }
 
@@ -310,12 +372,163 @@ static void test_cancel(ThreadPoolHandle pool)
     printf("Test 5 passed.\n");
 }
 
-// 测试6：销毁
+// 测试6：非法参数和未启动状态
+static void test_invalid_inputs(void)
+{
+    printf("\n=== Test 6: Invalid inputs ===\n");
+
+    assert(thread_pool_init(0, 0) == NULL);
+    assert(thread_pool_start(NULL) == -1);
+    assert(thread_pool_wake_up_worker_by_req_id(NULL, 1, NULL) == -1);
+    assert(thread_pool_submit_task(NULL, 1, test_task, NULL, test_complete_cb, NULL) == 0);
+    assert(thread_pool_submit_batch_tasks(NULL, NULL, 0, NULL, NULL, NULL, NULL) == NULL);
+    assert(thread_pool_cancel_tasks_by_req(NULL, 1) == -1);
+    thread_pool_destroy(NULL);
+
+    ThreadPoolHandle stopped = thread_pool_init(1, 0);
+    assert(stopped != NULL);
+    int *arg = malloc(sizeof(int));
+    assert(arg != NULL);
+    *arg = 600;
+    assert(thread_pool_submit_task(stopped, 6001, test_task, arg, test_complete_cb, NULL) == 0);
+    free(arg);
+    assert(thread_pool_cancel_tasks_by_req(stopped, 6001) == -1);
+    thread_pool_destroy(stopped);
+
+    ThreadPoolHandle started = thread_pool_init(1, 0);
+    assert(started != NULL);
+    assert(thread_pool_start(started) == 0);
+    assert(thread_pool_start(started) == -1);
+    assert(thread_pool_submit_task(started, 6002, NULL, NULL, test_complete_cb, NULL) == 0);
+
+    ThreadPoolTask bad_tasks[2] = {0};
+    bad_tasks[0].request_id = 6003;
+    bad_tasks[0].task_func = test_task;
+    bad_tasks[1].request_id = 6004;
+    bad_tasks[1].task_func = test_task;
+    assert(thread_pool_submit_batch_tasks(started, NULL, 1, test_complete_cb, NULL, NULL, NULL) == NULL);
+    assert(thread_pool_submit_batch_tasks(started, bad_tasks, 0, test_complete_cb, NULL, NULL, NULL) == NULL);
+    assert(thread_pool_submit_batch_tasks(started, bad_tasks, 2, test_complete_cb, NULL, NULL, NULL) == NULL);
+    assert(thread_pool_wake_up_worker_by_req_id(started, 6005, NULL) == -1);
+    assert(thread_pool_cancel_tasks_by_req(started, 6005) == 0);
+    thread_pool_destroy(started);
+
+    printf("Test 6 passed.\n");
+}
+
+// 测试7：completion user_data 精确匹配和乱序唤醒
+static void test_match_user_ctx(ThreadPoolHandle pool)
+{
+    printf("\n=== Test 7: Match user ctx ===\n");
+    uint32_t req = 7001;
+    ThreadPoolTask tasks[3];
+    MatchTaskArg *args[3];
+    TransportData data[3];
+
+    test_state_init(3);
+    memset(tasks, 0, sizeof(tasks));
+    memset(data, 0, sizeof(data));
+
+    for (int i = 0; i < 3; i++) {
+        args[i] = calloc(1, sizeof(MatchTaskArg));
+        assert(args[i] != NULL);
+        args[i]->seq = i + 1;
+        data[i].bs.request_id = req;
+        data[i].bs.chunk_id = (uint64_t)(i + 1);
+        data[i].bs.chunk_type = (i == 2) ? 2U : 1U;
+        data[i].bs.chunk_size = 128U + (uint64_t)i;
+
+        tasks[i].request_id = req;
+        tasks[i].prepare_cb = prepare_match_task;
+        tasks[i].task_func = matched_task;
+        tasks[i].task_arg = args[i];
+        tasks[i].has_match_user_ctx = true;
+        tasks[i].match_user_ctx = data[i].user_ctx;
+    }
+
+    uint64_t *ids = thread_pool_submit_batch_tasks(
+        pool, tasks, 3, test_complete_cb, NULL, batch_complete_cb, (void *)(uintptr_t)req);
+    assert(ids != NULL);
+    free(ids);
+
+    TransportData wrong = data[0];
+    wrong.bs.chunk_id = 63;
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req, &wrong) == 0);
+    usleep(50000);
+
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req, &data[2]) == 0);
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req, &data[0]) == 0);
+    assert(thread_pool_wake_up_worker_by_req_id(pool, req, &data[1]) == 0);
+
+    test_state_wait_completion();
+    test_state_wait_batch(1);
+    assert(g_state.exec_order[0] == 3);
+    assert(g_state.exec_order[1] == 1);
+    assert(g_state.exec_order[2] == 2);
+    printf("Test 7 passed.\n");
+}
+
+// 测试8：取消时清理pending wakeup和销毁残留队列
+static void test_cancel_pending_and_destroy_queued(void)
+{
+    printf("\n=== Test 8: Cancel pending and destroy queued ===\n");
+
+    ThreadPoolHandle cancel_pool = thread_pool_init(1, 0);
+    assert(cancel_pool != NULL);
+    assert(thread_pool_start(cancel_pool) == 0);
+
+    uint32_t req = 8001;
+    ThreadPoolTask tasks[2] = {0};
+    int *args[2];
+    for (int i = 0; i < 2; i++) {
+        args[i] = malloc(sizeof(int));
+        assert(args[i] != NULL);
+        *args[i] = i;
+        tasks[i].request_id = req;
+        tasks[i].task_func = test_task;
+        tasks[i].task_arg = args[i];
+    }
+
+    uint64_t *ids =
+        thread_pool_submit_batch_tasks(cancel_pool, tasks, 2, test_complete_cb, NULL, batch_complete_cb, NULL);
+    assert(ids != NULL);
+    free(ids);
+
+    pthread_mutex_lock(&cancel_pool->req_hash_mutex);
+    RequestContext *ctx = find_test_req_context(cancel_pool, req);
+    assert(ctx != NULL);
+    int worker_idx = ctx->worker_idx;
+    pthread_mutex_unlock(&cancel_pool->req_hash_mutex);
+
+    TransportData pending_data = {0};
+    pending_data.bs.request_id = req;
+    pending_data.bs.chunk_id = 9;
+    append_test_pending_req(&cancel_pool->workers[worker_idx], req, &pending_data);
+
+    int canceled = thread_pool_cancel_tasks_by_req(cancel_pool, req);
+    assert(canceled == 2);
+    assert(cancel_pool->workers[worker_idx].pending_req_count == 0);
+    thread_pool_destroy(cancel_pool);
+
+    ThreadPoolHandle destroy_pool = thread_pool_init(1, 0);
+    assert(destroy_pool != NULL);
+    assert(thread_pool_start(destroy_pool) == 0);
+    int *queued_arg = malloc(sizeof(int));
+    assert(queued_arg != NULL);
+    *queued_arg = 42;
+    uint64_t queued_id = thread_pool_submit_task(destroy_pool, 8002, test_task, queued_arg, test_complete_cb, NULL);
+    assert(queued_id != 0);
+    thread_pool_destroy(destroy_pool);
+
+    printf("Test 8 passed.\n");
+}
+
+// 测试9：销毁
 static void test_destroy(ThreadPoolHandle pool)
 {
-    printf("\n=== Test 6: Destroy ===\n");
+    printf("\n=== Test 9: Destroy ===\n");
     thread_pool_destroy(pool);
-    printf("Test 6 passed.\n");
+    printf("Test 9 passed.\n");
 }
 
 /* ---------- 主函数 ---------- */
@@ -336,6 +549,9 @@ int main(void)
     test_interleaved(pool);
     test_many(pool);
     test_cancel(pool);
+    test_invalid_inputs();
+    test_match_user_ctx(pool);
+    test_cancel_pending_and_destroy_queued();
     test_destroy(pool);
 
     free(g_state.exec_order);
