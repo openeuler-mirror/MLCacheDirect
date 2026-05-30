@@ -23,17 +23,16 @@ int os_transport_log_reg(int level, log_callback_t cb);
  */
 typedef int (*notify_callback_t)(void *user_data);
 
-#define DEFAULT_CHUNK_SIZE           (2 * 1024 * 1024) // 2MB
-#define DEFAULT_RECV_QUEUE_CAPACITY  256               // 默认接收队列容量
-#define OS_TRANSPORT_CHUNK_ID_BITS   6U
-#define OS_TRANSPORT_CHUNK_SIZE_BITS 24U
+#define DEFAULT_CHUNK_SIZE          (2 * 1024 * 1024) // 2MB
+#define DEFAULT_RECV_QUEUE_CAPACITY 256               // 默认接收队列容量
 
 typedef union {
     struct {
-        uint64_t chunk_type : 2;
-        uint64_t chunk_id : OS_TRANSPORT_CHUNK_ID_BITS;
-        uint64_t chunk_size : OS_TRANSPORT_CHUNK_SIZE_BITS;
-        uint64_t request_id : 32;
+        uint64_t chunk_type : 1; // 1位：0表示非尾片，1表示尾片
+        uint64_t chunk_id : 4;   // 4位：最多支持16个分片
+        uint64_t chunk_size : 1; // 1位：0表示2MB，1表示4MB
+        uint64_t request_id : 10; // 10位
+        uint64_t rsv : 48;
     } bs;
     uint64_t user_ctx;
 } os_transport_user_data_t;
@@ -44,8 +43,9 @@ typedef struct {
 } ost_buffer_info_t;
 
 typedef struct {
-    urma_jfr_t *jfr; // 用于接收的jfr
-    void *dst;       // 数据缓冲区地址
+    urma_jfr_t *jfr;     // 兼容旧版本：用于接收的JFR
+    urma_jetty_t *jetty; // 最新版本：用于接收的Jetty，优先使用urma_post_jetty_recv_wr
+    void *dst;           // 数据缓冲区地址
 } ost_device_info_t;
 
 typedef enum jetty_mode { JETTY_MODE_SIMPLEX = 0, JETTY_MODE_DUPLEX } jetty_mode_t;

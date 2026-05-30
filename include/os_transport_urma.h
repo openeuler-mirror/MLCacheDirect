@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* 1个vjerry对应4个pjetty，需要遍历下发 */
+#define RQE_PREFILL_MULTIPLE_DUPLEX 4
+
 struct chunk_info;
 
 typedef struct {
@@ -20,6 +23,7 @@ typedef struct {
 
 typedef struct {
     urma_jfr_t *jfr;
+    urma_jetty_t *jetty;
     urma_target_seg_t *local_tseg;
     ost_device_info_t device_info; // 设备信息
     uint32_t request_id;           // 请求ID

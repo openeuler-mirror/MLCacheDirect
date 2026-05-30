@@ -10,9 +10,9 @@
 #include <sys/types.h>
 
 typedef enum {
-    SPLIT_UNSET = 0,
-    MIDDLE_CHUNK,
-    LAST_CHUNK,
+    MIDDLE_CHUNK = 0, // 非尾片
+    LAST_CHUNK = 1,   // 尾片
+    NOT_SPLIT = LAST_CHUNK,
 } os_transport_chunk_type_t;
 
 typedef struct {

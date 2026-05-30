@@ -14,20 +14,24 @@
 // 全局初始化状态
 static int g_inited = 0;
 
-#define OS_TRANSPORT_WAIT_TIMEOUT    1U
-#define OS_TRANSPORT_WAIT_ERROR      ((uint32_t) - 1)
-#define OS_TRANSPORT_MAX_CHUNK_COUNT (1ULL << OS_TRANSPORT_CHUNK_ID_BITS)
-#define OS_TRANSPORT_MAX_CHUNK_ID    (OS_TRANSPORT_MAX_CHUNK_COUNT - 1ULL)
-#define OS_TRANSPORT_MAX_RECV_LEN    ((uint64_t)OS_TRANSPORT_MAX_CHUNK_COUNT * DEFAULT_CHUNK_SIZE)
+#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 4) - 1)
+#define OS_TRANSPORT_MAX_CHUNK_NUM ((uint32_t)(OS_TRANSPORT_MAX_CHUNK_ID + 1))
+#define OS_TRANSPORT_WAIT_TIMEOUT 1U
+#define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
 
-static uint64_t
-make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
+static uint32_t encode_transport_chunk_size(uint32_t len)
+{
+    (void)len;
+    return 0; // Fixed 2MB chunk unit. The last chunk real size is computed by upper layer.
+}
+
+static uint64_t make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
 {
     os_transport_user_data_t user_data = {0};
     user_data.bs.request_id = request_id;
     user_data.bs.chunk_type = chunk_type;
     user_data.bs.chunk_id = chunk_id;
-    user_data.bs.chunk_size = len;
+    user_data.bs.chunk_size = encode_transport_chunk_size(len);
     return user_data.user_ctx;
 }
 
@@ -473,16 +477,13 @@ static int validate_recv_input(void *handle,
                       (void *)notify_callback);
         return -1;
     }
+    if (!device_dst->jetty && !device_dst->jfr) {
+        OST_LOG_ERROR("Failed: neither jetty nor jfr is available for os_transport_recv().");
+        return -1;
+    }
     if (!g_inited) {
         OST_LOG_ERROR("Failed: os_transport is not initialized. "
                       "Call os_transport_init() before os_transport_recv().");
-        return -1;
-    }
-    if ((uint64_t)len > OS_TRANSPORT_MAX_RECV_LEN) {
-        OST_LOG_ERROR("Failed: recv length exceeds maximum supported size "
-                      "(len=%u, max_len=%lu).",
-                      len,
-                      (unsigned long)OS_TRANSPORT_MAX_RECV_LEN);
         return -1;
     }
     return 0;
@@ -497,9 +498,9 @@ static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
                                           uint32_t client_key)
 {
     os_transport_user_data_t server_user_data = {
-        .bs.request_id = server_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = server_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = encode_transport_chunk_size(len)};
     os_transport_user_data_t client_user_data = {
-        .bs.request_id = client_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = len};
+        .bs.request_id = client_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = encode_transport_chunk_size(len)};
     urma_write_info_t write_info = {.jfs = jetty_info->jfs,
                                     .jetty = jetty_info->jetty,
                                     .target_jfr = jetty_info->tjetty,
@@ -516,9 +517,19 @@ static uint32_t common_split_chunks(
 {
     uint32_t remain_len = len;
     uint32_t chunks_num;
+    uint32_t split_chunk_size;
     chunk_info_t *chunks;
 
-    chunks_num = (remain_len + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE;
+    split_chunk_size = DEFAULT_CHUNK_SIZE;
+    chunks_num = (remain_len + split_chunk_size - 1) / split_chunk_size;
+    if (chunks_num > OS_TRANSPORT_MAX_CHUNK_NUM) {
+        OST_LOG_ERROR("Failed: chunk count exceeds transport tag limit (len=%u, fixed_chunk_size=%u, chunk_count=%u, max=%u).",
+                      len,
+                      split_chunk_size,
+                      chunks_num,
+                      OS_TRANSPORT_MAX_CHUNK_NUM);
+        return -1;
+    }
     chunks = (chunk_info_t *)malloc(sizeof(chunk_info_t) * chunks_num);
     if (!chunks) {
         OST_LOG_ERROR("Failed: unable to allocate chunk array "
@@ -531,11 +542,10 @@ static uint32_t common_split_chunks(
     }
 
     for (uint32_t i = 0; i < chunks_num; i++) {
-        chunks[i].src = src_addr + i * DEFAULT_CHUNK_SIZE;
-        chunks[i].dst = dst_addr + i * DEFAULT_CHUNK_SIZE;
-        chunks[i].len = (remain_len - i * DEFAULT_CHUNK_SIZE) > DEFAULT_CHUNK_SIZE ?
-                            DEFAULT_CHUNK_SIZE :
-                            (remain_len - i * DEFAULT_CHUNK_SIZE);
+        uint32_t offset = i * split_chunk_size;
+        chunks[i].src = src_addr + offset;
+        chunks[i].dst = dst_addr + offset;
+        chunks[i].len = (remain_len - offset) > split_chunk_size ? split_chunk_size : (remain_len - offset);
     }
     *ret_chunks = chunks;
     *ret_chunk_num = chunks_num;
@@ -597,18 +607,18 @@ static void construct_send_task_arg(send_task_arg_t *arg,
 
     user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
     user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
-    if (chunk_id >= OS_TRANSPORT_MAX_CHUNK_COUNT) {
+    if (chunk_id == OS_TRANSPORT_MAX_CHUNK_ID) {
         OST_LOG_WARN("chunk_id=%lu exceeds user data bitfield range (max=%lu), value will be truncated.",
                      (unsigned long)chunk_id,
                      (unsigned long)OS_TRANSPORT_MAX_CHUNK_ID);
     }
     user_data_server.bs.chunk_id = chunk_id;
-    user_data_server.bs.chunk_size = chunk_info->len;
+    user_data_server.bs.chunk_size = encode_transport_chunk_size(chunk_info->len);
 
     user_data_client.bs.request_id = write_info.user_ctx_client.bs.request_id; // 将client_key作为request_id传入
     user_data_client.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
     user_data_client.bs.chunk_id = chunk_id;
-    user_data_client.bs.chunk_size = chunk_info->len;
+    user_data_client.bs.chunk_size = encode_transport_chunk_size(chunk_info->len);
 
     arg->write_info = write_info;
     arg->write_info.user_ctx_server = user_data_server;
@@ -683,7 +693,7 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
                       recv_task_arg->recv_info.request_id,
                       (unsigned long long)recv_task_arg->expected_imm64,
                       (unsigned long long)notify_user_data->user_ctx,
-                      (uint32_t)((recv_task_arg->expected_imm64 >> 2) & 0x3f),
+                      (uint32_t)((os_transport_user_data_t){ .user_ctx = recv_task_arg->expected_imm64 }).bs.chunk_id,
                       (uint32_t)notify_user_data->bs.chunk_id,
                       (uint32_t)notify_user_data->bs.chunk_type,
                       (uint32_t)notify_user_data->bs.chunk_size);
@@ -1261,7 +1271,11 @@ uint32_t os_transport_recv(void *handle,
     }
 
     urma_info.recv_info = (urma_recv_info_t){
-        .jfr = device_dst->jfr, .local_tseg = host_src->tseg, .device_info = *device_dst, .request_id = client_key};
+        .jfr = device_dst->jfr,
+        .jetty = device_dst->jetty,
+        .local_tseg = host_src->tseg,
+        .device_info = *device_dst,
+        .request_id = client_key};
 
     if (acquire_recv_queue_resources(ost_handle, chunks_num, &reused_recv_queue_count, &post_recv_queue_count) != 0) {
         OST_LOG_ERROR("Failed: unable to acquire recv queue resources "

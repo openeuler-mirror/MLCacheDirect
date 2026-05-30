@@ -84,22 +84,32 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
     urma_sge_t src_sge = {.addr = (uint64_t)chunk_info->src, .len = chunk_info->len, .tseg = recv_info.local_tseg};
     urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
     urma_jfr_wr_t wr = {.src = src_sg, .user_ctx = recv_info.request_id, .next = NULL};
-    urma_jfr_wr_t *bad_wr;
+    urma_jfr_wr_t *bad_wr = NULL;
 
-    if (!recv_info.jfr) {
-        OST_LOG_ERROR(
-            "Failed: jfr is NULL for recv request (request_id=%u, len=%u).", recv_info.request_id, chunk_info->len);
+    if (recv_info.jetty) {
+        for (int loop = 0; loop < RQE_PREFILL_MULTIPLE_DUPLEX; loop++) {
+            ret = urma_post_jetty_recv_wr(recv_info.jetty, &wr, &bad_wr);
+            if (ret != URMA_SUCCESS) {
+                OST_LOG_ERROR("Failed: URMA jetty recv post returned %d (request_id=%u, index=%u).", (int)ret, recv_info.request_id, loop);
+                break;
+            }
+        }
+    } else if (recv_info.jfr) {
+        ret = urma_post_jfr_wr(recv_info.jfr, &wr, &bad_wr);
+    } else {
+        OST_LOG_ERROR("Failed: neither jetty nor jfr is available for recv request "
+                      "(request_id=%u, len=%u).",
+                      recv_info.request_id,
+                      chunk_info->len);
         return URMA_FAIL;
     }
 
-    // 目前先只实现jfr的recv接口，后续如果jetty也需要支持再加
-    ret = urma_post_jfr_wr(recv_info.jfr, &wr, &bad_wr);
     if (ret != URMA_SUCCESS) {
-        OST_LOG_ERROR("Failed: URMA recv post returned %d (request_id=%u, len=%u).",
+        OST_LOG_ERROR("Failed: URMA recv post returned %d via %s (request_id=%u, len=%u).",
                       (int)ret,
+                      recv_info.jetty ? "jetty" : "jfr",
                       recv_info.request_id,
                       chunk_info->len);
     }
-
     return ret;
 }
