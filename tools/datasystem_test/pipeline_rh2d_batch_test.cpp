@@ -61,18 +61,26 @@ bool ParseKeyValue(const std::string& arg, std::string& key, std::string& value)
 
 class Barrier {
 public:
-    Barrier(int count) : total_(count), count_(count), generation_(0) {}
+    Barrier(int count) : total_(count), count_(count), generation_(0), stop_(false)
+    {}
 
-    void Wait() {
+    bool Wait()
+    {
         std::unique_lock<std::mutex> lock(mutex_);
         int gen = generation_;
         if (--count_ == 0) {
             generation_++;
             count_ = total_;
             cv_.notify_all();
-        } else {
+        } else if (!stop_) {
             cv_.wait(lock, [this, gen] { return gen != generation_; });
         }
+        return stop_;
+    }
+    void Stop()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        stop_ = true;
     }
 
 private:
@@ -81,6 +89,7 @@ private:
     int total_;
     int count_;
     int generation_;
+    bool stop_;
 };
 
 struct Stats {
@@ -144,7 +153,8 @@ public:
     }
 
     void RunRh2DBatch(int batch, Stats& stats) {
-        if (barrier_) barrier_->Wait();
+        if (barrier_ && barrier_->Wait())
+            return;
 
         cudaError_t err;
         if ((err = cudaSetDevice(gpu_id_)) != cudaSuccess) {
@@ -202,7 +212,8 @@ public:
     }
 
     void RunGetBatch(int batch, Stats& stats) {
-        if (barrier_) barrier_->Wait();
+        if (barrier_ && barrier_->Wait())
+            return;
 
         cudaError_t err;
         if ((err = cudaSetDevice(gpu_id_)) != cudaSuccess) {
