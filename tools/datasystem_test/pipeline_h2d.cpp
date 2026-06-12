@@ -87,23 +87,40 @@ public:
     Barrier(int count) : total_(count), count_(count), generation_(0), stop_(false)
     {}
 
-    bool Wait()
+    bool Wait(const char *stage = "unknown", int tid = -1, int timeoutMs = 30000)
     {
         std::unique_lock<std::mutex> lock(mutex_);
+        if (stop_) {
+            return true;
+        }
+
         int gen = generation_;
         if (--count_ == 0) {
             generation_++;
             count_ = total_;
             cv_.notify_all();
-        } else if (!stop_) {
-            cv_.wait(lock, [this, gen] { return gen != generation_; });
+            return stop_;
+        }
+
+        bool ready = cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this, gen] {
+            return stop_ || gen != generation_;
+        });
+        if (!ready) {
+            stop_ = true;
+            TLOG(tid, "[BARRIER_TIMEOUT] stage=" << stage << ", waiting=" << count_ << ", total=" << total_);
+            cv_.notify_all();
         }
         return stop_;
     }
+
     void Stop()
     {
         std::unique_lock<std::mutex> lock(mutex_);
+        if (stop_) {
+            return;
+        }
         stop_ = true;
+        cv_.notify_all();
     }
 
 private:
@@ -232,7 +249,7 @@ public:
     {
         GenerateData(count);
 
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("RunMGetH2D.afterGenerateData", thread_id_))
             return;
 
         std::vector<std::string> keys;
@@ -243,7 +260,9 @@ public:
         int gpu_id = gpu_id_;
         if ((err = cudaSetDevice(gpu_id)) != cudaSuccess) {
             TLOG(thread_id_, "cudaSetDevice(" << gpu_id << ") failed: " << cudaGetErrorString(err));
-            barrier_->Stop();
+            if (barrier_) {
+                barrier_->Stop();
+            }
             return;
         }
         TLOG(thread_id_, "Using GPU " << gpu_id);
@@ -253,19 +272,26 @@ public:
             keys.push_back(it.first);
             if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
-                barrier_->Stop();
+                FreeCudaChunks(devShmChunks);
+                if (barrier_) {
+                    barrier_->Stop();
+                }
                 return;
             }
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             devShmChunks.push_back({dev_ptr, it.second.size()});
         }
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("RunMGetH2D.beforeMGetH2D", thread_id_)) {
+            FreeCudaChunks(devShmChunks);
             return;
+        }
         TIMER_START(Mget);
         auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
         TIMER_END(thread_id_, Mget, "MGETH2D");
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("RunMGetH2D.afterMGetH2D", thread_id_)) {
+            FreeCudaChunks(devShmChunks);
             return;
+        }
 
         if (ret == datasystem::Status::OK()) {
             TLOG(thread_id_, "MGetH2D success!");
@@ -279,6 +305,7 @@ public:
             Status rc = client_->Del(keys, failkeys);
             if (rc.IsError()) {
                 TLOG(thread_id_, "del failed " << rc.GetMsg());
+                FreeCudaChunks(devShmChunks);
                 return;
             }
         }
@@ -287,16 +314,14 @@ public:
             CheckData(count, devShmChunks);
         }
 
-        for (auto &chunk : devShmChunks) {
-            cudaFree(chunk.first);
-        }
+        FreeCudaChunks(devShmChunks);
     }
 
     void MGetH2DBatch(int count, int batch, int timeout_ms = 60000)
     {
         GenerateData(count);
 
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("MGetH2DBatch.afterGenerateData", thread_id_))
             return;
 
         std::vector<std::string> keys;
@@ -307,6 +332,9 @@ public:
         int gpu_id = gpu_id_;
         if ((err = cudaSetDevice(gpu_id)) != cudaSuccess) {
             TLOG(thread_id_, "cudaSetDevice(" << gpu_id << ") failed: " << cudaGetErrorString(err));
+            if (barrier_) {
+                barrier_->Stop();
+            }
             return;
         }
 
@@ -322,6 +350,10 @@ public:
                 void *dev_ptr = nullptr;
                 if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
+                    FreeCudaChunks(devShmChunks);
+                    if (barrier_) {
+                        barrier_->Stop();
+                    }
                     return;
                 }
                 TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
@@ -343,9 +375,7 @@ public:
                 CheckDataBatch(round * batch, devShmChunks);
             }
 
-            for (auto &chunk : devShmChunks) {
-                cudaFree(chunk.first);
-            }
+            FreeCudaChunks(devShmChunks);
         }
     }
 
@@ -353,7 +383,7 @@ public:
     {
         GenerateData(count);
 
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("Get.afterGenerateData", thread_id_))
             return;
 
         std::vector<std::string> keys;
@@ -365,7 +395,9 @@ public:
         int gpu_id = gpu_id_;
         if ((err = cudaSetDevice(gpu_id)) != cudaSuccess) {
             TLOG(thread_id_, "cudaSetDevice(" << gpu_id << ") failed: " << cudaGetErrorString(err));
-            barrier_->Stop();
+            if (barrier_) {
+                barrier_->Stop();
+            }
             return;
         }
 
@@ -374,22 +406,44 @@ public:
             void *dev_ptr = nullptr;
             if ((err = cudaMalloc(&dev_ptr, it.second.size() + 1)) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
-                barrier_->Stop();
+                FreeCudaPtrs(dev_ptrs);
+                if (barrier_) {
+                    barrier_->Stop();
+                }
                 return;
             }
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
             dev_ptrs.push_back(dev_ptr);
         }
-        if (barrier_ && barrier_->Wait())
+        if (barrier_ && barrier_->Wait("Get.beforeGet", thread_id_)) {
+            FreeCudaPtrs(dev_ptrs);
             return;
+        }
 
         TIMER_START(Get);
         TIMER_START(OriginGet);
         Status rc = client_->Get(keys, values, timeout_ms);
         TIMER_END(thread_id_, Get, "Get");
 
+        if (rc.IsError()) {
+            TLOG(thread_id_, "get failed " << rc.GetMsg());
+            FreeCudaPtrs(dev_ptrs);
+            if (barrier_) {
+                barrier_->Stop();
+            }
+            return;
+        }
+        if (values.size() != keys.size()) {
+            TLOG(thread_id_, "get response size mismatch, keys=" << keys.size() << ", values=" << values.size());
+            FreeCudaPtrs(dev_ptrs);
+            if (barrier_) {
+                barrier_->Stop();
+            }
+            return;
+        }
+
         TIMER_START(H2D);
-        for (int i = 0; i < count; i++) {
+        for (size_t i = 0; i < keys.size(); i++) {
             if ((err = cudaMemcpy(
                      dev_ptrs[i], values[i].c_str(), (values[i].length() + 1) * sizeof(char), cudaMemcpyHostToDevice))
                 != cudaSuccess) {
@@ -399,20 +453,16 @@ public:
         TIMER_END(thread_id_, H2D, "H2D");
         TIMER_END(thread_id_, OriginGet, "OriginGet");
 
-        if (rc.IsError()) {
-            TLOG(thread_id_, "get failed " << rc.GetMsg());
-            return;
-        }
-
         if (delete_value_) {
             rc = client_->Del(keys, failkeys);
             if (rc.IsError()) {
                 TLOG(thread_id_, "del failed " << rc.GetMsg());
+                FreeCudaPtrs(dev_ptrs);
                 return;
             }
         }
 
-        for (int i = 0; i < count; i++) {
+        for (size_t i = 0; i < data_.size(); i++) {
             if (values[i] != data_[i].second) {
                 TLOG(thread_id_,
                      "############################## " << i << " th data is not same ###############################");
@@ -431,9 +481,7 @@ public:
                         .c_str());
             }
         }
-        for (auto ptr : dev_ptrs) {
-            cudaFree(ptr);
-        }
+        FreeCudaPtrs(dev_ptrs);
     }
 
     int GetThreadId() const
@@ -442,6 +490,26 @@ public:
     }
 
 private:
+    static void FreeCudaChunks(std::vector<std::pair<void *, size_t>> &devShmChunks)
+    {
+        for (auto &chunk : devShmChunks) {
+            if (chunk.first != nullptr) {
+                cudaFree(chunk.first);
+            }
+        }
+        devShmChunks.clear();
+    }
+
+    static void FreeCudaPtrs(std::vector<void *> &devPtrs)
+    {
+        for (auto ptr : devPtrs) {
+            if (ptr != nullptr) {
+                cudaFree(ptr);
+            }
+        }
+        devPtrs.clear();
+    }
+
     void CheckData(int count, const std::vector<std::pair<void *, size_t>> &devShmChunks)
     {
         bool is_failed = false;
@@ -558,6 +626,9 @@ void RunWorker(std::shared_ptr<KVClient> shared_client,
         }
     } catch (const std::exception &e) {
         TLOG(thread_id, "Error: " << e.what());
+        if (barrier) {
+            barrier->Stop();
+        }
     }
 }
 
