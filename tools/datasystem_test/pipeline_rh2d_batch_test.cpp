@@ -171,7 +171,7 @@ public:
 
         for (int round = 0; round < num_batches; ++round) {
             std::vector<std::string> keys;
-            std::vector<std::pair<void*, size_t>> devShmChunks;
+            std::vector<Blob> devShmChunks;
             std::vector<std::string> outFailedKeys;
 
             int start = round * batch;
@@ -182,14 +182,26 @@ public:
                 void* dev_ptr = nullptr;
                 if ((err = cudaMalloc(&dev_ptr, data_[i].second.size())) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
-                    for (auto& chunk : devShmChunks) cudaFree(chunk.first);
+                    for (auto& chunk : devShmChunks) cudaFree(chunk.pointer);
                     return;
                 }
-                devShmChunks.push_back({dev_ptr, data_[i].second.size()});
+                devShmChunks.push_back(Blob{ dev_ptr, static_cast<uint64_t>(data_[i].second.size()) });
             }
 
+            cudaStream_t h2dStream = nullptr;
+            if ((err = cudaStreamCreateWithFlags(&h2dStream, cudaStreamNonBlocking)) != cudaSuccess) {
+                TLOG(thread_id_, "cudaStreamCreateWithFlags failed: " << cudaGetErrorString(err));
+                for (auto& chunk : devShmChunks) cudaFree(chunk.pointer);
+                return;
+            }
             auto start_time = std::chrono::high_resolution_clock::now();
-            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, 6000000);
+            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+            err = cudaStreamSynchronize(h2dStream);
+            cudaStreamDestroy(h2dStream);
+            if (err != cudaSuccess) {
+                TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
+                ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+            }
             auto end_time = std::chrono::high_resolution_clock::now();
 
             double duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -206,7 +218,7 @@ public:
             }
 
             for (auto& chunk : devShmChunks) {
-                cudaFree(chunk.first);
+                cudaFree(chunk.pointer);
             }
         }
     }
@@ -286,11 +298,11 @@ public:
     }
 
 private:
-    void CheckDataBatch(int startIdx, const std::vector<std::pair<void*, size_t>>& devShmChunks) {
+    void CheckDataBatch(int startIdx, const std::vector<Blob>& devShmChunks) {
         bool is_failed = false;
         for (size_t i = 0; i < devShmChunks.size(); i++) {
-            void* ptr = devShmChunks[i].first;
-            size_t size = devShmChunks[i].second;
+            void* ptr = devShmChunks[i].pointer;
+            size_t size = devShmChunks[i].size;
             auto& expected = data_[startIdx + i].second;
             std::string readOutData;
             cudaError_t err;

@@ -32,6 +32,16 @@
 
 using namespace datasystem;
 
+static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
+{
+    if (stream == nullptr) {
+        return cudaSuccess;
+    }
+    cudaError_t syncErr = cudaStreamSynchronize(stream);
+    cudaError_t destroyErr = cudaStreamDestroy(stream);
+    return syncErr != cudaSuccess ? syncErr : destroyErr;
+}
+
 std::vector<std::string> SplitString(const std::string &str, char delimiter)
 {
     std::vector<std::string> tokens;
@@ -394,15 +404,15 @@ private:
 // CUDA 内存自动释放器（RAII）
 class CudaMemoryGuard {
 public:
-    explicit CudaMemoryGuard(std::vector<std::pair<void *, size_t>> &chunks) : chunks_(chunks)
+    explicit CudaMemoryGuard(std::vector<Blob> &chunks) : chunks_(chunks)
     {}
 
     ~CudaMemoryGuard()
     {
         for (auto &chunk : chunks_) {
-            if (chunk.first) {
-                cudaFree(chunk.first);
-                chunk.first = nullptr;
+            if (chunk.pointer) {
+                cudaFree(chunk.pointer);
+                chunk.pointer = nullptr;
             }
         }
     }
@@ -411,12 +421,12 @@ public:
     void Release()
     {
         for (auto &chunk : chunks_) {
-            chunk.first = nullptr;
+            chunk.pointer = nullptr;
         }
     }
 
 private:
-    std::vector<std::pair<void *, size_t>> &chunks_;
+    std::vector<Blob> &chunks_;
 };
 
 // 性能统计结构体
@@ -910,7 +920,7 @@ public:
         }
 
         // 准备测试
-        std::vector<std::pair<void *, size_t>> devShmChunks;
+        std::vector<Blob> devShmChunks;
         std::vector<std::string> outFailedKeys;
 
         cudaError_t err;
@@ -929,7 +939,7 @@ public:
                 alloc_failed = true;
                 break;
             }
-            devShmChunks.push_back({dev_ptr, it.second.size()});
+            devShmChunks.push_back(Blob{ dev_ptr, static_cast<uint64_t>(it.second.size()) });
         }
 
         // RAII 守卫，确保显存被释放
@@ -940,12 +950,25 @@ public:
             return false;
         }
 
+        cudaStream_t h2dStream = nullptr;
+        if ((err = cudaStreamCreateWithFlags(&h2dStream, cudaStreamNonBlocking)) != cudaSuccess) {
+            std::cerr << "cudaStreamCreateWithFlags failed: " << cudaGetErrorString(err) << std::endl;
+            ClearFaultScenario();
+            return false;
+        }
+
         // 执行测试
         FaultTestStats stats;
         stats.start_time = std::chrono::steady_clock::now();
 
         auto start = std::chrono::high_resolution_clock::now();
-        Status ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, static_cast<int32_t>(timeout_ms));
+        Status ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+        cudaError_t syncErr = WaitAndDestroyH2DStream(h2dStream);
+        h2dStream = nullptr;
+        if (syncErr != cudaSuccess) {
+            std::cerr << "cudaStreamSynchronize/Destroy failed: " << cudaGetErrorString(syncErr) << std::endl;
+            ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(syncErr));
+        }
         auto end = std::chrono::high_resolution_clock::now();
 
         auto latency = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -989,8 +1012,8 @@ public:
 
         // 手动释放并禁用 RAII 自动释放
         for (auto &chunk : devShmChunks) {
-            if (chunk.first) {
-                cudaFree(chunk.first);
+            if (chunk.pointer) {
+                cudaFree(chunk.pointer);
             }
         }
         cudaGuard.Release();
