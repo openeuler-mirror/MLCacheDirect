@@ -312,12 +312,14 @@ public:
             return;
         }
         TIMER_START(Mget);
+        TIMER_START(Mgeth2d);
         auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
         TIMER_END(thread_id_, Mget, "MGETH2D_SUBMIT");
         TIMER_START(waitCopy);
         err = WaitAndDestroyH2DStream(h2dStream);
         h2dStream = nullptr;
         TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
+        TIMER_END(thread_id_, Mgeth2d, "MGETH2D");
         if (err != cudaSuccess) {
             TLOG(thread_id_, "cudaStreamSynchronize/Destroy failed: " << cudaGetErrorString(err));
             ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
@@ -405,11 +407,13 @@ public:
             }
 
             TIMER_START(round);
+            TIMER_START(mgeth2d);
             auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
             TIMER_END(thread_id_, round, "MGETH2D_SUBMIT");
             TIMER_START(waitCopy);
             err = cudaStreamSynchronize(h2dStream);
             TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
+            TIMER_END(thread_id_, mgeth2d, "MGETH2D_COPY_WAIT");
             if (err != cudaSuccess) {
                 TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
                 ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
