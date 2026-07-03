@@ -842,7 +842,7 @@ public:
     }
 
     // 运行指定场景的故障测试
-    bool RunFaultTest(FaultScenario scenario, int count = 10, int timeout_ms = 60000, int inject_delay_ms = -1)
+    bool RunFaultTest(FaultScenario scenario, int count = 10, int inject_delay_ms = -1)
     {
         std::cout << "\n========================================" << std::endl;
         std::cout << "Running Fault Test: " << g_scenarioDesc[scenario] << std::endl;
@@ -977,7 +977,7 @@ public:
 
         std::cout << "[MGetH2DResult] ret=" << ret.ToString() << ", failedKeys=" << outFailedKeys.size()
                   << ", latency_ms=" << std::fixed << std::setprecision(3) << (static_cast<double>(latency) / 1000.0)
-                  << ", timeout_ms=" << timeout_ms << std::endl;
+                  << std::endl;
 
         // 防伪验证：确认注入点确实触发了
         bool inject_verified = VerifyInjection(scenario, latency);
@@ -1001,13 +1001,12 @@ public:
             std::cout << "[PASS] MGetH2D result matches expectation. " << "ret=" << ret.ToString()
                       << ", failedKeys=" << outFailedKeys.size() << ", expected=" << ExpectedResultToString(expected)
                       << ", latency_ms=" << std::fixed << std::setprecision(3) << latency_ms
-                      << ", inject_delay_ms=" << expected_delay_ms << ", timeout_ms=" << timeout_ms << std::endl;
+                      << ", inject_delay_ms=" << expected_delay_ms << std::endl;
         } else {
             stats.failed_requests++;
             std::cerr << "[FAIL] Unexpected result. ret=" << ret.ToString() << ", failedKeys=" << outFailedKeys.size()
                       << ", expected=" << ExpectedResultToString(expected) << ", latency_ms=" << std::fixed
-                      << std::setprecision(3) << latency_ms << ", inject_delay_ms=" << expected_delay_ms
-                      << ", timeout_ms=" << timeout_ms << std::endl;
+                      << std::setprecision(3) << latency_ms << ", inject_delay_ms=" << expected_delay_ms << std::endl;
         }
 
         // 手动释放并禁用 RAII 自动释放
@@ -1059,7 +1058,7 @@ public:
         }
 
         // 运行MLCacheDirect层的故障场景（流程4、6、7、8）
-        if (RunFaultTest(FaultScenario::RECV_SERVICE_START_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::RECV_SERVICE_START_DELAY, count))
             passed++;
         else
             failed++;
@@ -1067,7 +1066,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::SEND_SERVICE_START_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::SEND_SERVICE_START_DELAY, count))
             passed++;
         else
             failed++;
@@ -1075,7 +1074,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::URMA_WRITE_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::URMA_WRITE_DELAY, count))
             passed++;
         else
             failed++;
@@ -1083,7 +1082,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::NOTIFY_CALLBACK_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::NOTIFY_CALLBACK_DELAY, count))
             passed++;
         else
             failed++;
@@ -1091,7 +1090,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::MLCD_FAULT_CHAIN, count, 30000))
+        if (RunFaultTest(FaultScenario::MLCD_FAULT_CHAIN, count))
             passed++;
         else
             failed++;
@@ -1192,7 +1191,6 @@ void PrintUsage(const char *prog)
     std::cout << "  --scenario=N or --scenario N      : Run specific fault scenario (0-9,20-22)" << std::endl;
     std::cout << "  --all                             : Run all fault scenarios" << std::endl;
     std::cout << "  --count=N or --count N            : Number of keys to test (default: 10)" << std::endl;
-    std::cout << "  --timeout=N or --timeout N        : Timeout in milliseconds (default: 60000)" << std::endl;
     std::cout << "  --inject_delay_ms=N or --inject_delay_ms N" << std::endl;
     std::cout << "                                    : Override sleep injection delay for a specific scenario"
               << std::endl;
@@ -1250,7 +1248,6 @@ struct CmdArgs {
     bool run_all = false;
     bool list_scenarios = false;
     int count = 10;
-    int timeout = 60000;
     int inject_delay_ms = -1;
     std::string value_prefix = "0";
     std::vector<std::string> keys;
@@ -1301,8 +1298,6 @@ CmdArgs ParseArgs(int argc, char *argv[])
                 args.scenario = std::stoi(value);
             else if (key == "count")
                 args.count = std::stoi(value);
-            else if (key == "timeout")
-                args.timeout = std::stoi(value);
             else if (key == "inject_delay_ms" || key == "inject-delay-ms")
                 args.inject_delay_ms = std::stoi(value);
             else if (key == "value_prefix")
@@ -1340,8 +1335,6 @@ CmdArgs ParseArgs(int argc, char *argv[])
                     args.scenario = std::stoi(value);
                 else if (key == "count")
                     args.count = std::stoi(value);
-                else if (key == "timeout")
-                    args.timeout = std::stoi(value);
                 else if (key == "inject_delay_ms" || key == "inject-delay-ms")
                     args.inject_delay_ms = std::stoi(value);
                 else if (key == "value_prefix")
@@ -1485,10 +1478,9 @@ int main(int argc, char *argv[])
         if (args.run_all) {
             result = tester.RunAllFaultTests(args.count);
         } else if (args.scenario >= 0 && IsValidScenario(args.scenario)) {
-            result = tester.RunFaultTest(
-                static_cast<FaultScenario>(args.scenario), args.count, args.timeout, args.inject_delay_ms);
+            result = tester.RunFaultTest(static_cast<FaultScenario>(args.scenario), args.count, args.inject_delay_ms);
         } else if (args.scenario < 0) {
-            result = tester.RunFaultTest(FaultScenario::NO_FAULT, args.count, args.timeout);
+            result = tester.RunFaultTest(FaultScenario::NO_FAULT, args.count);
         } else {
             std::cerr << "Error: Invalid scenario ID " << args.scenario << std::endl;
             PrintUsage(argv[0]);

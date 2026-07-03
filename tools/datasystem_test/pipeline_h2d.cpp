@@ -260,7 +260,7 @@ public:
         std::cout << std::endl;
     }
 
-    void RunMGetH2D(int count, int timeout_ms = 60000)
+    void RunMGetH2D(int count)
     {
         GenerateData(count);
 
@@ -353,7 +353,7 @@ public:
         FreeCudaChunks(devShmChunks);
     }
 
-    void MGetH2DBatch(int count, int batch, int timeout_ms = 60000)
+    void MGetH2DBatch(int count, int batch)
     {
         GenerateData(count);
 
@@ -413,7 +413,7 @@ public:
             TIMER_START(waitCopy);
             err = cudaStreamSynchronize(h2dStream);
             TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
-            TIMER_END(thread_id_, mgeth2d, "MGETH2D_COPY_WAIT");
+            TIMER_END(thread_id_, mgeth2d, "MGETH2D");
             if (err != cudaSuccess) {
                 TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
                 ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
