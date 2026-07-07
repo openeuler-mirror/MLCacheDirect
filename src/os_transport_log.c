@@ -310,7 +310,7 @@ static inline void ost_log_write_fd_best_effort(int fd, const char *buf, size_t 
     }
 }
 
-static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *formatted_line)
+static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *formatted_line, int vlevel)
 {
     size_t len = strlen(formatted_line);
 
@@ -325,7 +325,9 @@ static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *fo
         break;
     case OST_LOG_BACKEND_CALLBACK:
         if (target.callback) {
-            target.callback(level, formatted_line);
+            static mask = 0xff;
+            int logLevel = (level & mask) | ((vlevel & mask) << 8);
+            target.callback(logLevel, formatted_line);
         }
         break;
     case OST_LOG_BACKEND_DISABLED:
@@ -335,7 +337,7 @@ static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *fo
     }
 }
 
-static void ost_log_vwrite(LogLevel level, const char *file, int line, const char *fmt, va_list args)
+static void ost_log_vwrite(LogLevel level, int vlevel, const char *file, int line, const char *fmt, va_list args)
 {
     char msg_buf[1024];
     char line_buf[1408];
@@ -359,17 +361,17 @@ static void ost_log_vwrite(LogLevel level, const char *file, int line, const cha
     (void)vsnprintf(msg_buf, sizeof(msg_buf), fmt, args);
     (void)ost_log_format_line(line_buf, sizeof(line_buf), target.backend, level, file, line, msg_buf);
 
-    ost_log_emit(target, level, line_buf);
+    ost_log_emit(target, level, line_buf, vlevel);
     if (target.fd >= 0) {
         close(target.fd);
     }
 }
 
-void ost_log_write(LogLevel level, const char *file, int line, const char *fmt, ...)
+void ost_log_write(LogLevel level, int vlevel, const char *file, int line, const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    ost_log_vwrite(level, file, line, fmt, args);
+    ost_log_vwrite(level, vlevel, file, line, fmt, args);
     va_end(args);
 }
 
