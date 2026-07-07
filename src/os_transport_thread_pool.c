@@ -116,7 +116,7 @@ static int internal_task_wrapper(void *arg)
         OST_LOG_WARN(
             "Worker task returned error (task_id=%lu, request_id=%u, ret=%d).", itask->task_id, itask->request_id, ret);
     }
-    OST_LOG_INFO("Taskid = %lu request_id=%u completed", itask->task_id, itask->request_id);
+    OST_LOG_DEBUG(2, "Taskid = %lu request_id=%u completed", itask->task_id, itask->request_id);
     free(itask);
     return ret;
 }
@@ -447,7 +447,7 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
 
         if (batch_cb) {
             batch_cb(0, true, batch_data);
-            OST_LOG_INFO("Request batch completed (request_id=%u, worker=%d).", req_id, worker->worker_idx);
+            OST_LOG_DEBUG(1, "Request batch completed (request_id=%u, worker=%d).", req_id, worker->worker_idx);
         }
     } else {
         pthread_mutex_unlock(&pool->req_hash_mutex);
@@ -735,7 +735,7 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
     pthread_mutex_unlock(&handle->req_hash_mutex);
 
     if (worker_idx < 0) {
-        OST_LOG_WARN("No context for request_id %u", request_id);
+        OST_LOG_DEBUG(2, "No context for request_id %u", request_id);
         return -1;
     }
     WorkerThread *worker = &handle->workers[worker_idx];
@@ -847,7 +847,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
         insert_req_context_locked(handle, new_ctx);
         pthread_mutex_unlock(&handle->req_hash_mutex);
     }
-    OST_LOG_INFO("Task %lu (req=%u) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
+    OST_LOG_DEBUG(1, "Task %lu (req=%u) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
     return task->task_id;
 }
 
@@ -1075,7 +1075,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
             handle, req_id, target_worker->worker_idx, task_count, batch_complete_cb, batch_user_data)) {
         OST_LOG_ERROR("Failed to update context for req %u", req_id);
     }
-    OST_LOG_INFO("Batch of %u tasks (req=%u) submitted to worker %d", task_count, req_id, target_worker->worker_idx);
+    OST_LOG_DEBUG(1, "Batch of %u tasks (req=%u) submitted to worker %d", task_count, req_id, target_worker->worker_idx);
     return task_ids;
 }
 
@@ -1111,7 +1111,7 @@ static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
     uint32_t removed_pending = worker_pending_req_remove_by_req(worker, req_id);
     pthread_mutex_unlock(&worker->mutex);
     if (removed_pending > 0) {
-        OST_LOG_INFO(
+        OST_LOG_DEBUG(2,
             "Removed %u pending wakeups for req %u from worker %d.", removed_pending, req_id, worker->worker_idx);
     }
     return removed;
@@ -1154,16 +1154,16 @@ int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id
     pthread_mutex_unlock(&handle->req_hash_mutex);
 
     if (worker_idx < 0) {
-        OST_LOG_INFO("No request context found when canceling request_id=%u.", request_id);
+        OST_LOG_DEBUG(1, "No request context found when canceling request_id=%u.", request_id);
         return 0;
     }
 
     uint32_t removed = cancel_in_worker_queue(&handle->workers[worker_idx], request_id);
     if (removed > 0) {
         update_context_after_cancel(handle, request_id, removed);
-        OST_LOG_INFO("Canceled %u queued tasks for request_id=%u.", removed, request_id);
+        OST_LOG_DEBUG(1, "Canceled %u queued tasks for request_id=%u.", removed, request_id);
     } else {
-        OST_LOG_INFO("No queued tasks needed cancellation for request_id=%u.", request_id);
+        OST_LOG_DEBUG(1, "No queued tasks needed cancellation for request_id=%u.", request_id);
     }
     return (int)removed;
 }

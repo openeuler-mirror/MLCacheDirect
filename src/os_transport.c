@@ -402,7 +402,7 @@ static void mark_task_group_completed(task_sync_t *sync, bool task_success)
     } else {
         sync->completed_tasks++;
         if (sync_all_tasks_accounted_locked(sync)) {
-            OST_LOG_INFO("Task group completed successfully (completed=%lu, canceled=%lu, total_tasks=%lu).",
+            OST_LOG_DEBUG(1, "Task group completed successfully (completed=%lu, canceled=%lu, total_tasks=%lu).",
                          sync->completed_tasks,
                          sync->canceled_tasks,
                          sync->total_tasks);
@@ -847,7 +847,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_INFO("Registered async send tasks (request_id=%u, task_num=%u, chunk_num=%u).",
+    OST_LOG_DEBUG(1, "Registered async send tasks (request_id=%u, task_num=%u, chunk_num=%u).",
                  (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
                  task_num,
                  chunk_num);
@@ -904,7 +904,7 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_INFO("Registered async recv tasks (request_id=%u, task_num=%u).",
+    OST_LOG_DEBUG(1, "Registered async recv tasks (request_id=%u, task_num=%u).",
                  (uint32_t)(urma_info.recv_info.request_id),
                  chunk_num);
     return 0;
@@ -1167,7 +1167,7 @@ uint32_t os_transport_send(void *handle,
         *ret_sync_handle = NULL;
     }
 
-    OST_LOG_INFO("Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
+    OST_LOG_DEBUG(1, "Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
 
     if (validate_send_input(handle, jetty_info, local_src, remote_dst, len, ret_sync_handle) != 0) {
         return ret;
@@ -1178,7 +1178,7 @@ uint32_t os_transport_send(void *handle,
 #endif
 
     if (len <= DEFAULT_CHUNK_SIZE) {
-        OST_LOG_INFO(
+        OST_LOG_DEBUG(1,
             "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
         return send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
     }
@@ -1203,7 +1203,7 @@ uint32_t os_transport_send(void *handle,
         return ret;
     }
     *ret_sync_handle = sync_handle;
-    OST_LOG_INFO("Async send request registered successfully "
+    OST_LOG_DEBUG(1, "Async send request registered successfully "
                  "(server_key=%u, client_key=%u, chunk_count=%u).",
                  server_key,
                  client_key,
@@ -1257,7 +1257,7 @@ uint32_t os_transport_recv(void *handle,
         *ret_sync_handle = NULL;
     }
 
-    OST_LOG_INFO("Submitting recv request (len=%u, client_key=%u).", len, client_key);
+    OST_LOG_DEBUG(1, "Submitting recv request (len=%u, client_key=%u).", len, client_key);
 
     if (validate_recv_input(handle, host_src, device_dst, len, ret_sync_handle, notify_callback) != 0) {
         return -1;
@@ -1286,7 +1286,7 @@ uint32_t os_transport_recv(void *handle,
         free(chunks);
         return -1;
     }
-    OST_LOG_INFO("Recv queue resources prepared (client_key=%u, chunk_count=%u, reused=%u, need_post=%u).",
+    OST_LOG_DEBUG(1, "Recv queue resources prepared (client_key=%u, chunk_count=%u, reused=%u, need_post=%u).",
                  client_key,
                  chunks_num,
                  reused_recv_queue_count,
@@ -1304,7 +1304,7 @@ uint32_t os_transport_recv(void *handle,
         return -1;
     }
 
-    OST_LOG_INFO("Async recv request registered successfully (client_key=%u, chunk_count=%u).", client_key, chunks_num);
+    OST_LOG_DEBUG(1, "Async recv request registered successfully (client_key=%u, chunk_count=%u).", client_key, chunks_num);
     for (uint32_t i = reused_recv_queue_count; i < chunks_num; i++) {
         if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
             uint32_t successful_post_count = i - reused_recv_queue_count;
@@ -1362,10 +1362,10 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     ret = thread_pool_wake_up_worker_by_req_id(pool, request_id, &user_data);
     if (opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
         release_recv_queue_resources(ost_handle, 1, 0);
-        OST_LOG_INFO("Recv queue resource released after completion (request_id=%u).", request_id);
+        OST_LOG_DEBUG(1, "Recv queue resource released after completion (request_id=%u).", request_id);
     }
     if (ret != 0) {
-        OST_LOG_WARN("Failed to wake worker for completion event "
+        OST_LOG_DEBUG(2, "Failed to wake worker for completion event "
                      "(request_id=%u, opcode=%d, chunk_id=%u, chunk_type=%u, chunk_size=%u, imm64=0x%016llx).",
                      request_id,
                      opcode,
@@ -1400,7 +1400,7 @@ static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle
 
     request_id = task_group->tasks[0].request_id;
 
-    OST_LOG_INFO("Waiting for request completion (request_id=%u, total_tasks=%lu, timeout_ms=%ld).",
+    OST_LOG_DEBUG(1, "Waiting for request completion (request_id=%u, total_tasks=%lu, timeout_ms=%ld).",
                  request_id,
                  sync_handle->total_tasks,
                  (long)timeout_ms);
@@ -1441,7 +1441,7 @@ static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle
     }
 
     if (wait_ret == 0) {
-        OST_LOG_INFO("Request completed and resources released successfully (request_id=%u).", request_id);
+        OST_LOG_DEBUG(1, "Request completed and resources released successfully (request_id=%u).", request_id);
     } else {
         OST_LOG_WARN("Request finished with non-success status; release requested "
                      "(request_id=%u, completed=%lu, canceled=%lu, total=%lu, ret=%u).",
@@ -1500,7 +1500,7 @@ uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint
         }
     }
 
-    OST_LOG_INFO("Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
+    OST_LOG_DEBUG(1, "Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
     return 0;
 }
 
