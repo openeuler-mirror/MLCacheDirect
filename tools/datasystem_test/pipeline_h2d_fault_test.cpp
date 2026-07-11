@@ -32,6 +32,16 @@
 
 using namespace datasystem;
 
+static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
+{
+    if (stream == nullptr) {
+        return cudaSuccess;
+    }
+    cudaError_t syncErr = cudaStreamSynchronize(stream);
+    cudaError_t destroyErr = cudaStreamDestroy(stream);
+    return syncErr != cudaSuccess ? syncErr : destroyErr;
+}
+
 std::vector<std::string> SplitString(const std::string &str, char delimiter)
 {
     std::vector<std::string> tokens;
@@ -394,15 +404,15 @@ private:
 // CUDA 内存自动释放器（RAII）
 class CudaMemoryGuard {
 public:
-    explicit CudaMemoryGuard(std::vector<std::pair<void *, size_t>> &chunks) : chunks_(chunks)
+    explicit CudaMemoryGuard(std::vector<Blob> &chunks) : chunks_(chunks)
     {}
 
     ~CudaMemoryGuard()
     {
         for (auto &chunk : chunks_) {
-            if (chunk.first) {
-                cudaFree(chunk.first);
-                chunk.first = nullptr;
+            if (chunk.pointer) {
+                cudaFree(chunk.pointer);
+                chunk.pointer = nullptr;
             }
         }
     }
@@ -411,12 +421,12 @@ public:
     void Release()
     {
         for (auto &chunk : chunks_) {
-            chunk.first = nullptr;
+            chunk.pointer = nullptr;
         }
     }
 
 private:
-    std::vector<std::pair<void *, size_t>> &chunks_;
+    std::vector<Blob> &chunks_;
 };
 
 // 性能统计结构体
@@ -832,7 +842,7 @@ public:
     }
 
     // 运行指定场景的故障测试
-    bool RunFaultTest(FaultScenario scenario, int count = 10, int timeout_ms = 60000, int inject_delay_ms = -1)
+    bool RunFaultTest(FaultScenario scenario, int count = 10, int inject_delay_ms = -1)
     {
         std::cout << "\n========================================" << std::endl;
         std::cout << "Running Fault Test: " << g_scenarioDesc[scenario] << std::endl;
@@ -910,7 +920,7 @@ public:
         }
 
         // 准备测试
-        std::vector<std::pair<void *, size_t>> devShmChunks;
+        std::vector<Blob> devShmChunks;
         std::vector<std::string> outFailedKeys;
 
         cudaError_t err;
@@ -929,7 +939,7 @@ public:
                 alloc_failed = true;
                 break;
             }
-            devShmChunks.push_back({dev_ptr, it.second.size()});
+            devShmChunks.push_back(Blob{ dev_ptr, static_cast<uint64_t>(it.second.size()) });
         }
 
         // RAII 守卫，确保显存被释放
@@ -940,12 +950,25 @@ public:
             return false;
         }
 
+        cudaStream_t h2dStream = nullptr;
+        if ((err = cudaStreamCreateWithFlags(&h2dStream, cudaStreamNonBlocking)) != cudaSuccess) {
+            std::cerr << "cudaStreamCreateWithFlags failed: " << cudaGetErrorString(err) << std::endl;
+            ClearFaultScenario();
+            return false;
+        }
+
         // 执行测试
         FaultTestStats stats;
         stats.start_time = std::chrono::steady_clock::now();
 
         auto start = std::chrono::high_resolution_clock::now();
-        Status ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, static_cast<int32_t>(timeout_ms));
+        Status ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+        cudaError_t syncErr = WaitAndDestroyH2DStream(h2dStream);
+        h2dStream = nullptr;
+        if (syncErr != cudaSuccess) {
+            std::cerr << "cudaStreamSynchronize/Destroy failed: " << cudaGetErrorString(syncErr) << std::endl;
+            ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(syncErr));
+        }
         auto end = std::chrono::high_resolution_clock::now();
 
         auto latency = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -954,7 +977,7 @@ public:
 
         std::cout << "[MGetH2DResult] ret=" << ret.ToString() << ", failedKeys=" << outFailedKeys.size()
                   << ", latency_ms=" << std::fixed << std::setprecision(3) << (static_cast<double>(latency) / 1000.0)
-                  << ", timeout_ms=" << timeout_ms << std::endl;
+                  << std::endl;
 
         // 防伪验证：确认注入点确实触发了
         bool inject_verified = VerifyInjection(scenario, latency);
@@ -978,19 +1001,18 @@ public:
             std::cout << "[PASS] MGetH2D result matches expectation. " << "ret=" << ret.ToString()
                       << ", failedKeys=" << outFailedKeys.size() << ", expected=" << ExpectedResultToString(expected)
                       << ", latency_ms=" << std::fixed << std::setprecision(3) << latency_ms
-                      << ", inject_delay_ms=" << expected_delay_ms << ", timeout_ms=" << timeout_ms << std::endl;
+                      << ", inject_delay_ms=" << expected_delay_ms << std::endl;
         } else {
             stats.failed_requests++;
             std::cerr << "[FAIL] Unexpected result. ret=" << ret.ToString() << ", failedKeys=" << outFailedKeys.size()
                       << ", expected=" << ExpectedResultToString(expected) << ", latency_ms=" << std::fixed
-                      << std::setprecision(3) << latency_ms << ", inject_delay_ms=" << expected_delay_ms
-                      << ", timeout_ms=" << timeout_ms << std::endl;
+                      << std::setprecision(3) << latency_ms << ", inject_delay_ms=" << expected_delay_ms << std::endl;
         }
 
         // 手动释放并禁用 RAII 自动释放
         for (auto &chunk : devShmChunks) {
-            if (chunk.first) {
-                cudaFree(chunk.first);
+            if (chunk.pointer) {
+                cudaFree(chunk.pointer);
             }
         }
         cudaGuard.Release();
@@ -1036,7 +1058,7 @@ public:
         }
 
         // 运行MLCacheDirect层的故障场景（流程4、6、7、8）
-        if (RunFaultTest(FaultScenario::RECV_SERVICE_START_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::RECV_SERVICE_START_DELAY, count))
             passed++;
         else
             failed++;
@@ -1044,7 +1066,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::SEND_SERVICE_START_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::SEND_SERVICE_START_DELAY, count))
             passed++;
         else
             failed++;
@@ -1052,7 +1074,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::URMA_WRITE_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::URMA_WRITE_DELAY, count))
             passed++;
         else
             failed++;
@@ -1060,7 +1082,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::NOTIFY_CALLBACK_DELAY, count, 30000))
+        if (RunFaultTest(FaultScenario::NOTIFY_CALLBACK_DELAY, count))
             passed++;
         else
             failed++;
@@ -1068,7 +1090,7 @@ public:
             passed++;
         else
             failed++;
-        if (RunFaultTest(FaultScenario::MLCD_FAULT_CHAIN, count, 30000))
+        if (RunFaultTest(FaultScenario::MLCD_FAULT_CHAIN, count))
             passed++;
         else
             failed++;
@@ -1169,7 +1191,6 @@ void PrintUsage(const char *prog)
     std::cout << "  --scenario=N or --scenario N      : Run specific fault scenario (0-9,20-22)" << std::endl;
     std::cout << "  --all                             : Run all fault scenarios" << std::endl;
     std::cout << "  --count=N or --count N            : Number of keys to test (default: 10)" << std::endl;
-    std::cout << "  --timeout=N or --timeout N        : Timeout in milliseconds (default: 60000)" << std::endl;
     std::cout << "  --inject_delay_ms=N or --inject_delay_ms N" << std::endl;
     std::cout << "                                    : Override sleep injection delay for a specific scenario"
               << std::endl;
@@ -1227,7 +1248,6 @@ struct CmdArgs {
     bool run_all = false;
     bool list_scenarios = false;
     int count = 10;
-    int timeout = 60000;
     int inject_delay_ms = -1;
     std::string value_prefix = "0";
     std::vector<std::string> keys;
@@ -1278,8 +1298,6 @@ CmdArgs ParseArgs(int argc, char *argv[])
                 args.scenario = std::stoi(value);
             else if (key == "count")
                 args.count = std::stoi(value);
-            else if (key == "timeout")
-                args.timeout = std::stoi(value);
             else if (key == "inject_delay_ms" || key == "inject-delay-ms")
                 args.inject_delay_ms = std::stoi(value);
             else if (key == "value_prefix")
@@ -1317,8 +1335,6 @@ CmdArgs ParseArgs(int argc, char *argv[])
                     args.scenario = std::stoi(value);
                 else if (key == "count")
                     args.count = std::stoi(value);
-                else if (key == "timeout")
-                    args.timeout = std::stoi(value);
                 else if (key == "inject_delay_ms" || key == "inject-delay-ms")
                     args.inject_delay_ms = std::stoi(value);
                 else if (key == "value_prefix")
@@ -1462,10 +1478,9 @@ int main(int argc, char *argv[])
         if (args.run_all) {
             result = tester.RunAllFaultTests(args.count);
         } else if (args.scenario >= 0 && IsValidScenario(args.scenario)) {
-            result = tester.RunFaultTest(
-                static_cast<FaultScenario>(args.scenario), args.count, args.timeout, args.inject_delay_ms);
+            result = tester.RunFaultTest(static_cast<FaultScenario>(args.scenario), args.count, args.inject_delay_ms);
         } else if (args.scenario < 0) {
-            result = tester.RunFaultTest(FaultScenario::NO_FAULT, args.count, args.timeout);
+            result = tester.RunFaultTest(FaultScenario::NO_FAULT, args.count);
         } else {
             std::cerr << "Error: Invalid scenario ID " << args.scenario << std::endl;
             PrintUsage(argv[0]);

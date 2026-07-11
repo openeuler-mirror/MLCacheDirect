@@ -19,6 +19,21 @@
 
 using namespace datasystem;
 
+static cudaError_t CreateH2DStream(cudaStream_t *stream)
+{
+    return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+}
+
+static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
+{
+    if (stream == nullptr) {
+        return cudaSuccess;
+    }
+    cudaError_t syncErr = cudaStreamSynchronize(stream);
+    cudaError_t destroyErr = cudaStreamDestroy(stream);
+    return syncErr != cudaSuccess ? syncErr : destroyErr;
+}
+
 #define TLOG(tid, ...)                                                                                                 \
     do {                                                                                                               \
         static std::mutex print_mutex;                                                                                 \
@@ -245,7 +260,7 @@ public:
         std::cout << std::endl;
     }
 
-    void RunMGetH2D(int count, int timeout_ms = 60000)
+    void RunMGetH2D(int count)
     {
         GenerateData(count);
 
@@ -253,7 +268,7 @@ public:
             return;
 
         std::vector<std::string> keys;
-        std::vector<std::pair<void *, size_t>> devShmChunks;
+        std::vector<Blob> devShmChunks;
         std::vector<std::string> outFailedKeys;
         cudaError_t err;
 
@@ -267,27 +282,48 @@ public:
         }
         TLOG(thread_id_, "Using GPU " << gpu_id);
 
+        cudaStream_t h2dStream = nullptr;
+        if ((err = CreateH2DStream(&h2dStream)) != cudaSuccess) {
+            TLOG(thread_id_, "cudaStreamCreateWithFlags failed: " << cudaGetErrorString(err));
+            if (barrier_) {
+                barrier_->Stop();
+            }
+            return;
+        }
+
         void *dev_ptr = nullptr;
         for (const auto &it : data_) {
             keys.push_back(it.first);
             if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
                 FreeCudaChunks(devShmChunks);
+                cudaStreamDestroy(h2dStream);
                 if (barrier_) {
                     barrier_->Stop();
                 }
                 return;
             }
             TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
-            devShmChunks.push_back({dev_ptr, it.second.size()});
+            devShmChunks.push_back(Blob{ dev_ptr, static_cast<uint64_t>(it.second.size()) });
         }
         if (barrier_ && barrier_->Wait("RunMGetH2D.beforeMGetH2D", thread_id_)) {
             FreeCudaChunks(devShmChunks);
+            cudaStreamDestroy(h2dStream);
             return;
         }
         TIMER_START(Mget);
-        auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
-        TIMER_END(thread_id_, Mget, "MGETH2D");
+        TIMER_START(Mgeth2d);
+        auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+        TIMER_END(thread_id_, Mget, "MGETH2D_SUBMIT");
+        TIMER_START(waitCopy);
+        err = WaitAndDestroyH2DStream(h2dStream);
+        h2dStream = nullptr;
+        TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
+        TIMER_END(thread_id_, Mgeth2d, "MGETH2D");
+        if (err != cudaSuccess) {
+            TLOG(thread_id_, "cudaStreamSynchronize/Destroy failed: " << cudaGetErrorString(err));
+            ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+        }
         if (barrier_ && barrier_->Wait("RunMGetH2D.afterMGetH2D", thread_id_)) {
             FreeCudaChunks(devShmChunks);
             return;
@@ -317,7 +353,7 @@ public:
         FreeCudaChunks(devShmChunks);
     }
 
-    void MGetH2DBatch(int count, int batch, int timeout_ms = 60000)
+    void MGetH2DBatch(int count, int batch)
     {
         GenerateData(count);
 
@@ -325,13 +361,22 @@ public:
             return;
 
         std::vector<std::string> keys;
-        std::vector<std::pair<void *, size_t>> devShmChunks;
+        std::vector<Blob> devShmChunks;
         std::vector<std::string> outFailedKeys;
         cudaError_t err;
 
         int gpu_id = gpu_id_;
         if ((err = cudaSetDevice(gpu_id)) != cudaSuccess) {
             TLOG(thread_id_, "cudaSetDevice(" << gpu_id << ") failed: " << cudaGetErrorString(err));
+            if (barrier_) {
+                barrier_->Stop();
+            }
+            return;
+        }
+
+        cudaStream_t h2dStream = nullptr;
+        if ((err = CreateH2DStream(&h2dStream)) != cudaSuccess) {
+            TLOG(thread_id_, "cudaStreamCreateWithFlags failed: " << cudaGetErrorString(err));
             if (barrier_) {
                 barrier_->Stop();
             }
@@ -351,18 +396,28 @@ public:
                 if ((err = cudaMalloc(&dev_ptr, it.second.size())) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
                     FreeCudaChunks(devShmChunks);
+                    cudaStreamDestroy(h2dStream);
                     if (barrier_) {
                         barrier_->Stop();
                     }
                     return;
                 }
                 TLOG(thread_id_, "Allocated device memory at: " << dev_ptr);
-                devShmChunks.push_back({dev_ptr, it.second.size()});
+                devShmChunks.push_back(Blob{ dev_ptr, static_cast<uint64_t>(it.second.size()) });
             }
 
             TIMER_START(round);
-            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, timeout_ms);
-            TIMER_END(thread_id_, round, "MGETH2D");
+            TIMER_START(mgeth2d);
+            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+            TIMER_END(thread_id_, round, "MGETH2D_SUBMIT");
+            TIMER_START(waitCopy);
+            err = cudaStreamSynchronize(h2dStream);
+            TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
+            TIMER_END(thread_id_, mgeth2d, "MGETH2D");
+            if (err != cudaSuccess) {
+                TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
+                ret = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+            }
 
             if (ret == datasystem::Status::OK()) {
                 TLOG(thread_id_, "MGetH2D success!");
@@ -377,6 +432,7 @@ public:
 
             FreeCudaChunks(devShmChunks);
         }
+        cudaStreamDestroy(h2dStream);
     }
 
     void Get(int count, int timeout_ms = 60000)
@@ -490,11 +546,11 @@ public:
     }
 
 private:
-    static void FreeCudaChunks(std::vector<std::pair<void *, size_t>> &devShmChunks)
+    static void FreeCudaChunks(std::vector<Blob> &devShmChunks)
     {
         for (auto &chunk : devShmChunks) {
-            if (chunk.first != nullptr) {
-                cudaFree(chunk.first);
+            if (chunk.pointer != nullptr) {
+                cudaFree(chunk.pointer);
             }
         }
         devShmChunks.clear();
@@ -510,12 +566,12 @@ private:
         devPtrs.clear();
     }
 
-    void CheckData(int count, const std::vector<std::pair<void *, size_t>> &devShmChunks)
+    void CheckData(int count, const std::vector<Blob> &devShmChunks)
     {
         bool is_failed = false;
         for (int i = 0; i < count; i++) {
-            void *ptr = devShmChunks[i].first;
-            size_t size = devShmChunks[i].second;
+            void *ptr = devShmChunks[i].pointer;
+            size_t size = devShmChunks[i].size;
             auto &data = data_[i].second;
             std::string readOutData;
             cudaError_t err;
@@ -551,12 +607,12 @@ private:
         }
     }
 
-    void CheckDataBatch(int startIdx, const std::vector<std::pair<void *, size_t>> &devShmChunks)
+    void CheckDataBatch(int startIdx, const std::vector<Blob> &devShmChunks)
     {
         bool is_failed = false;
         for (size_t i = 0; i < devShmChunks.size(); i++) {
-            void *ptr = devShmChunks[i].first;
-            size_t size = devShmChunks[i].second;
+            void *ptr = devShmChunks[i].pointer;
+            size_t size = devShmChunks[i].size;
             auto &data = data_[startIdx + i].second;
             std::string readOutData;
             cudaError_t err;
@@ -582,7 +638,7 @@ private:
     }
 
     std::shared_ptr<KVClient> client_;
-    std::vector<std::pair<void *, size_t>> devShmChunks_;
+    std::vector<Blob> devShmChunks_;
     std::vector<std::pair<std::string, std::string>> data_;
     std::vector<long long> records;
 
