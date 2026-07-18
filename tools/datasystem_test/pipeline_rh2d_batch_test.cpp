@@ -195,7 +195,10 @@ public:
                 return;
             }
             auto start_time = std::chrono::high_resolution_clock::now();
-            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream));
+            // Keep the RH2D host source buffers alive until the external CUDA stream completes.
+            std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
+            auto ret = client_->MGetH2D(keys, devShmChunks, outFailedKeys, reinterpret_cast<void *>(h2dStream),
+                                        &readOnlyBuffers);
             err = cudaStreamSynchronize(h2dStream);
             cudaStreamDestroy(h2dStream);
             if (err != cudaSuccess) {
