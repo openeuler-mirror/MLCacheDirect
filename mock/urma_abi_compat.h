@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -122,6 +123,7 @@ struct urma_jfs {
         urma_obj_id_t jetty_id;
     };
     uint32_t state;
+    uint32_t depth;
     void *priv;
 };
 typedef struct urma_jfs urma_jfs_t;
