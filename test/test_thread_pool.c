@@ -452,7 +452,7 @@ static void test_match_user_ctx(ThreadPoolHandle pool)
     free(ids);
 
     TransportData wrong = data[0];
-    wrong.bs.chunk_id = 63;
+    wrong.bs.chunk_id = 15;
     assert(thread_pool_wake_up_worker_by_req_id(pool, req, &wrong) == 0);
     usleep(50000);
 

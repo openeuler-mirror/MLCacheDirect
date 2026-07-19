@@ -89,7 +89,7 @@ static void test_file_backend_takes_priority_over_syslog(void)
     build_tmp_log_path(path, sizeof(path), "priority");
     assert(setenv("OST_LOG_FILE_PATH", path, 1) == 0);
 
-    ost_log_write(LOG_LEVEL_WARN, "unit.c", 45, "file priority message");
+    ost_log_write(LOG_LEVEL_WARN, 0, "unit.c", 45, "file priority message");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_FILE);
     assert(ost_log_state()->fd >= 0);
@@ -115,12 +115,12 @@ static void test_callback_registration_overrides_existing_file_backend(void)
     build_tmp_log_path(path, sizeof(path), "callback");
     assert(setenv("OST_LOG_FILE_PATH", path, 1) == 0);
 
-    ost_log_write(LOG_LEVEL_WARN, "unit.c", 56, "file before callback");
+    ost_log_write(LOG_LEVEL_WARN, 0, "unit.c", 56, "file before callback");
     assert(ost_log_state()->backend == OST_LOG_BACKEND_FILE);
     assert(ost_log_state()->fd >= 0);
 
     assert(os_transport_log_reg(LOG_LEVEL_DEBUG, test_log_callback) == 0);
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 57, "callback after file");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 57, "callback after file");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_CALLBACK);
     assert(ost_log_state()->fd == -1);
@@ -139,7 +139,7 @@ static void test_callback_backend_omits_process_context(void)
     ost_log_reset_for_tests();
 
     assert(os_transport_log_reg(LOG_LEVEL_DEBUG, test_log_callback) == 0);
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 57, "callback compact message");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 57, "callback compact message");
 
     assert(g_callback_calls == 1);
     assert(strcmp(g_callback_msg, "[ost:unit.c:57] callback compact message\n") == 0);
@@ -154,12 +154,12 @@ static void test_callback_registration_overrides_existing_syslog_backend(void)
     ost_log_reset_for_tests();
     ost_log_force_syslog_available_for_tests(true);
 
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 68, "syslog before callback");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 68, "syslog before callback");
     assert(ost_log_state()->backend == OST_LOG_BACKEND_SYSLOG);
     assert(ost_log_state()->syslog_opened == true);
 
     assert(os_transport_log_reg(LOG_LEVEL_DEBUG, test_log_callback) == 0);
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 69, "callback after syslog");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 69, "callback after syslog");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_CALLBACK);
     assert(ost_log_state()->syslog_opened == false);
@@ -175,14 +175,14 @@ static void test_file_backend_overrides_existing_syslog_backend(void)
     ost_log_reset_for_tests();
     ost_log_force_syslog_available_for_tests(true);
 
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 70, "syslog before file");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 70, "syslog before file");
     assert(ost_log_state()->backend == OST_LOG_BACKEND_SYSLOG);
     assert(ost_log_state()->syslog_opened == true);
 
     build_tmp_log_path(path, sizeof(path), "syslog_to_file");
     assert(setenv("OST_LOG_FILE_PATH", path, 1) == 0);
 
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 71, "file after syslog");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 71, "file after syslog");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_FILE);
     assert(ost_log_state()->fd >= 0);
@@ -202,13 +202,13 @@ static void test_file_backend_overrides_existing_disabled_backend(void)
     ost_log_reset_for_tests();
     ost_log_force_syslog_available_for_tests(false);
 
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 72, "disabled before file");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 72, "disabled before file");
     assert(ost_log_state()->backend == OST_LOG_BACKEND_DISABLED);
 
     build_tmp_log_path(path, sizeof(path), "disabled_to_file");
     assert(setenv("OST_LOG_FILE_PATH", path, 1) == 0);
 
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 73, "file after disabled");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 73, "file after disabled");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_FILE);
     assert(ost_log_state()->fd >= 0);
@@ -225,7 +225,7 @@ static void test_callback_runs_without_state_mutex_held(void)
     ost_log_reset_for_tests();
 
     assert(os_transport_log_reg(LOG_LEVEL_DEBUG, test_lock_probe_callback) == 0);
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 70, "callback lock probe");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 70, "callback lock probe");
 
     assert(g_callback_saw_unlocked_mutex == true);
 }
@@ -242,7 +242,7 @@ static void test_callback_backend_ignores_later_file_env(void)
 
     assert(os_transport_log_reg(LOG_LEVEL_DEBUG, test_log_callback) == 0);
     assert(setenv("OST_LOG_FILE_PATH", path, 1) == 0);
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 71, "callback despite env");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 71, "callback despite env");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_CALLBACK);
     assert(ost_log_state()->fd == -1);
@@ -260,10 +260,10 @@ static void test_log_level_filter_applies_to_callback_backend(void)
     ost_log_reset_for_tests();
 
     assert(os_transport_log_reg(LOG_LEVEL_ERROR, test_log_callback) == 0);
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 72, "filtered info message");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 72, "filtered info message");
     assert(g_callback_calls == 0);
 
-    ost_log_write(LOG_LEVEL_ERROR, "unit.c", 73, "visible error message");
+    ost_log_write(LOG_LEVEL_ERROR, 0, "unit.c", 73, "visible error message");
     assert(g_callback_calls == 1);
     assert(g_callback_level == LOG_LEVEL_ERROR);
     assert(strstr(g_callback_msg, "visible error message") != NULL);
@@ -275,7 +275,7 @@ static void test_no_default_file_fallback_without_file_env(void)
     ost_log_reset_for_tests();
     ost_log_force_syslog_available_for_tests(false);
 
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 56, "disabled message");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 56, "disabled message");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_DISABLED);
     assert(ost_log_state()->fd == -1);
@@ -288,7 +288,7 @@ static void test_syslog_backend_when_available(void)
     ost_log_reset_for_tests();
     ost_log_force_syslog_available_for_tests(true);
 
-    ost_log_write(LOG_LEVEL_INFO, "unit.c", 78, "syslog message");
+    ost_log_write(LOG_LEVEL_INFO, 0, "unit.c", 78, "syslog message");
 
     assert(ost_log_state()->backend == OST_LOG_BACKEND_SYSLOG);
     assert(ost_log_state()->syslog_opened == true);
