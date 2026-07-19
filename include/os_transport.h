@@ -5,9 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+
+#ifdef OS_TRANSPORT_MOCK_MODE
+#include "urma_abi_compat.h"
+#else
 #include <ub/umdk/urma/urma_api.h>
 #ifdef URMA_OVER_UB
 #include <ub/umdk/urma/urma_ubagg.h>
+#endif
 #endif
 
 #ifdef __cplusplus

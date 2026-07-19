@@ -3,7 +3,6 @@
 
 #include "os_transport.h"
 #include "os_transport_thread_pool.h"
-#include <ub/umdk/urma/urma_api.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>

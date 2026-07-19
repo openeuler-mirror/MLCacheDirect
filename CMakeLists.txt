@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(OS_TRANSPORT VERSION 1.0.0 LANGUAGES C)
 option(OS_TRANSPORT_BUILD_TESTS "Build OS_TRANSPORT test binaries" OFF)
 option(OS_TRANSPORT_WITH_INJECT "Enable fault injection for os_transport" OFF)
+option(OS_TRANSPORT_MOCK_MODE "Use mock URMA implementation" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -14,18 +15,34 @@ if(OS_TRANSPORT_WITH_INJECT)
     message(STATUS "Fault injection enabled for os_transport (with shared memory)")
 endif()
 
+# Mock模式配置
+if(OS_TRANSPORT_MOCK_MODE)
+    add_definitions(-DOS_TRANSPORT_MOCK_MODE=1)
+    message(STATUS "URMA mock mode enabled")
+endif()
+
 # 收集所有源码
 file(GLOB SRC_FILES src/*.c)
 
-# 查找 URMA 库
-find_library(URMA_LIB urma
-    HINTS /usr/lib64 /usr/local/lib /opt/urma/lib /opt/urma/lib64
-    DOC "URMA library path"
-)
-if(NOT URMA_LIB)
-    message(WARNING "URMA library not found. Please ensure liburma.so is installed.")
+# Mock模式下添加mock源码
+if(OS_TRANSPORT_MOCK_MODE)
+    file(GLOB MOCK_SRC_FILES mock/*.c)
+    list(APPEND SRC_FILES ${MOCK_SRC_FILES})
+endif()
+
+# Mock模式下不需要查找URMA库
+if(NOT OS_TRANSPORT_MOCK_MODE)
+    find_library(URMA_LIB urma
+        HINTS /usr/lib64 /usr/local/lib /opt/urma/lib /opt/urma/lib64
+        DOC "URMA library path"
+    )
+    if(NOT URMA_LIB)
+        message(WARNING "URMA library not found. Please ensure liburma.so is installed.")
+    else()
+        message(STATUS "Found URMA library: ${URMA_LIB}")
+    endif()
 else()
-    message(STATUS "Found URMA library: ${URMA_LIB}")
+    message(STATUS "Skipping URMA library lookup in mock mode")
 endif()
 
 # 编译动态库
@@ -55,6 +72,7 @@ target_include_directories(os_transport
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/mock
 )
 
 set_target_properties(os_transport PROPERTIES
@@ -93,6 +111,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
         target_include_directories(test_inject_unit
             PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
+                $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
         )
         target_link_libraries(test_inject_unit pthread rt)
         message(STATUS "Fault injection unit test will be built: test_inject_unit")
@@ -107,6 +126,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
     target_include_directories(test_thread_pool
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_thread_pool pthread)
 
@@ -115,6 +135,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src
+            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_os_transport_log_unit pthread)
 
@@ -123,6 +144,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
     target_include_directories(test_os_transport_unit
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_os_transport_unit pthread)
 endif()

@@ -41,6 +41,7 @@ DO_GCOV_SO=0
 DO_GCOV_UT=0
 WITH_INJECT=OFF
 USE_BEAR=0
+USE_MOCK=OFF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--test)
@@ -66,13 +67,19 @@ while [[ $# -gt 0 ]]; do
             echo -e "${YELLOW}✅ 启用故障注入功能${NC}"
             shift
             ;;
+        --mock)
+            USE_MOCK=ON
+            echo -e "${YELLOW}✅ 启用URMA mock模式${NC}"
+            shift
+            ;;
         -h|--help)
-            echo "用法: $0 [-t|--test] [--gcov] [--gcov-ut] [--with-inject] [--bear|--compile-commands]"
+            echo "用法: $0 [-t|--test] [--gcov] [--gcov-ut] [--with-inject] [--bear|--compile-commands] [--mock]"
             echo "  -t, --test                 只编译并运行测试"
             echo "  --gcov                     只编译生成带覆盖率插桩的libos_transport.so，不运行测试、不打包RPM"
             echo "  --gcov-ut                  编译并运行单元测试，打印src目录源码覆盖率并生成lcov结果"
             echo "  --with-inject              启用故障注入功能"
             echo "  --bear, --compile-commands 使用bear生成compile_commands.json"
+            echo "  --mock                     启用URMA mock模式，使用本地模拟实现替代真实URMA SDK"
             exit 0
             ;;
         *)
@@ -95,6 +102,7 @@ echo -e "${YELLOW}📊 覆盖率插桩SO：${DO_GCOV_SO}${NC}"
 echo -e "${YELLOW}📈 单测覆盖率统计：${DO_GCOV_UT}${NC}"
 echo -e "${YELLOW}💉 故障注入：${WITH_INJECT}${NC}"
 echo -e "${YELLOW}🐻 生成编译命令：${USE_BEAR}${NC}"
+echo -e "${YELLOW}🎭 URMA Mock模式：${USE_MOCK}${NC}"
 BUILD_TYPE="Release"
 if [ ${DO_TEST} -eq 1 ] || [ ${DO_GCOV_SO} -eq 1 ]; then
     BUILD_TYPE="Debug"
@@ -194,6 +202,7 @@ cmake \
     -DCMAKE_C_FLAGS="${CMAKE_C_FLAGS}" \
     -DOS_TRANSPORT_BUILD_TESTS="$([ ${DO_TEST} -eq 1 ] && echo ON || echo OFF)" \
     -DOS_TRANSPORT_WITH_INJECT="${WITH_INJECT}" \
+    -DOS_TRANSPORT_MOCK_MODE="${USE_MOCK}" \
     "${ROOT_DIR}"
 
 print_gcov_summary_from_output() {
