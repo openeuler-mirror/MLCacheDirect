@@ -61,6 +61,7 @@ cc_library(
         "include",
         "src",
     ],
+    deps = [":os_transport_hdrs"],
     linkopts = ["-lpthread"],
 )
 
