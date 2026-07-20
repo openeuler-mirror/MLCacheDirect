@@ -67,10 +67,7 @@ cc_library(
 
 cc_library(
     name = "os_transport_lib",
-    srcs = COMMON_SRCS + select({
-        ":mock_mode": MOCK_SRCS,
-        "//conditions:default": [],
-    }),
+    srcs = COMMON_SRCS,
     hdrs = glob(["include/*.h"]) + select({
         ":mock_mode": glob(["mock/*.h"]),
         "//conditions:default": [],
@@ -96,10 +93,7 @@ cc_library(
 
 cc_binary(
     name = "libos_transport.so",
-    srcs = COMMON_SRCS + select({
-        ":mock_mode": MOCK_SRCS,
-        "//conditions:default": [],
-    }),
+    srcs = COMMON_SRCS,
     copts = COMMON_COPTS + ["-Iinclude"],
     linkshared = True,
     deps = [
