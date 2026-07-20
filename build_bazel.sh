@@ -54,6 +54,7 @@ usage() {
     echo "  -t, --test        Build and run tests"
     echo "  -d, --debug       Build in debug mode"
     echo "  -r, --rpm         Build RPM packages (default when no options)"
+    echo "  -m, --mock        Use URMA mock implementation (no real URMA required)"
     echo "  -h, --help        Show this help"
     echo ""
     echo "Environment overrides:"
@@ -64,12 +65,15 @@ usage() {
     echo "  $0"
     echo "  $0 -t"
     echo "  $0 -d"
+    echo "  $0 --mock"
+    echo "  $0 --mock -t"
     echo "  URMA_INCLUDE_DIR=/opt/urma/include URMA_LIB_DIR=/opt/urma/lib64 $0"
 }
 
 DO_CLEAN=0
 DO_TEST=0
 DO_RPM=1
+DO_MOCK=0
 BAZEL_CONFIG="release"
 
 while [[ $# -gt 0 ]]; do
@@ -78,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         -t|--test) DO_TEST=1; DO_RPM=0; shift ;;
         -d|--debug) BAZEL_CONFIG="debug"; shift ;;
         -r|--rpm) DO_RPM=1; shift ;;
+        -m|--mock) DO_MOCK=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo -e "${RED}[ERROR] Unknown option: $1${NC}"
@@ -116,11 +121,14 @@ if [ ${DO_RPM} -eq 1 ]; then
     fi
 fi
 
-check_dir "${URMA_INCLUDE_DIR}" "URMA include directory"
-check_dir "${URMA_LIB_DIR}" "URMA lib directory"
-
-echo -e "${YELLOW}[INFO] URMA_INCLUDE_DIR=${URMA_INCLUDE_DIR}${NC}"
-echo -e "${YELLOW}[INFO] URMA_LIB_DIR=${URMA_LIB_DIR}${NC}"
+if [ ${DO_MOCK} -eq 0 ]; then
+    check_dir "${URMA_INCLUDE_DIR}" "URMA include directory"
+    check_dir "${URMA_LIB_DIR}" "URMA lib directory"
+    echo -e "${YELLOW}[INFO] URMA_INCLUDE_DIR=${URMA_INCLUDE_DIR}${NC}"
+    echo -e "${YELLOW}[INFO] URMA_LIB_DIR=${URMA_LIB_DIR}${NC}"
+else
+    echo -e "${GREEN}[INFO] URMA mock mode enabled - skipping URMA library checks${NC}"
+fi
 
 if [ ${DO_CLEAN} -eq 1 ]; then
     echo -e "${YELLOW}[INFO] Cleaning bazel cache and build artifacts...${NC}"
@@ -135,6 +143,10 @@ BAZEL_FLAGS=(
     "--config=${BAZEL_CONFIG}"
     "--enable_workspace"
 )
+
+if [ ${DO_MOCK} -eq 1 ]; then
+    BAZEL_FLAGS+=("--config=mock")
+fi
 
 if [ ${DO_TEST} -eq 1 ]; then
     echo -e "${YELLOW}[INFO] Building and running tests...${NC}"
