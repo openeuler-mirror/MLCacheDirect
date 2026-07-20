@@ -197,9 +197,10 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
     return g_mock_urma_recv_status;
 }
 
-void ost_log_write(LogLevel level, const char *file, int line, const char *fmt, ...)
+void ost_log_write(LogLevel level, int vlevel, const char *file, int line, const char *fmt, ...)
 {
     (void)level;
+    (void)vlevel;
     (void)file;
     (void)line;
     (void)fmt;
@@ -389,12 +390,9 @@ static void test_update_and_validate_and_build(void)
     assert(validate_recv_input(&handle, &local_src, &device_dst, 0, &sync_handle, test_notify_cb) == -1);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, NULL, test_notify_cb) == -1);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, NULL) == -1);
-    assert(validate_recv_input(
-               &handle, &local_src, &device_dst, (uint32_t)OS_TRANSPORT_MAX_RECV_LEN, &sync_handle, test_notify_cb)
-           == 0);
-    assert(validate_recv_input(
-               &handle, &local_src, &device_dst, (uint32_t)OS_TRANSPORT_MAX_RECV_LEN + 1, &sync_handle, test_notify_cb)
-           == -1);
+
+    device_dst.jetty = (urma_jetty_t *)0x100;
+    assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == 0);
 
     jetty_info.jfs = (urma_jfs_t *)0x10;
     jetty_info.jetty = (urma_jetty_t *)0x20;
@@ -411,10 +409,10 @@ static void test_update_and_validate_and_build(void)
     assert(write_info.flag.value == 0);
     assert(write_info.user_ctx_server.bs.request_id == 456);
     assert(write_info.user_ctx_server.bs.chunk_type == MIDDLE_CHUNK);
-    assert(write_info.user_ctx_server.bs.chunk_size == 123);
+    assert(write_info.user_ctx_server.bs.chunk_size == 0);
     assert(write_info.user_ctx_client.bs.request_id == 789);
     assert(write_info.user_ctx_client.bs.chunk_type == MIDDLE_CHUNK);
-    assert(write_info.user_ctx_client.bs.chunk_size == 123);
+    assert(write_info.user_ctx_client.bs.chunk_size == 0);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == 0);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == 0);
 
@@ -461,14 +459,14 @@ static void test_recv_queue_limiter_and_wake_up(void)
     cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
     assert(os_transport_wake_up_task(&handle, &cr) == -1);
 
-    user_data.bs.request_id = 0x1234;
+    user_data.bs.request_id = 0x3FF;
     user_data.bs.chunk_id = 7;
     user_data.bs.chunk_type = LAST_CHUNK;
     cr.opcode = URMA_CR_OPC_SEND;
     cr.user_ctx = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == 0);
     assert(g_mock_wake_calls == 1);
-    assert(g_mock_wake_last_request_id == 0x1234);
+    assert(g_mock_wake_last_request_id == 0x3FF);
     assert(g_mock_wake_last_user_data.user_ctx == user_data.user_ctx);
     assert(handle.recv_queue_available == 1);
 
@@ -564,7 +562,7 @@ static void test_construct_and_worker_helper_functions(void)
     user_client = send_arg.write_info.user_ctx_client;
     assert(user_server.bs.chunk_type == MIDDLE_CHUNK);
     assert(user_server.bs.chunk_id == 5);
-    assert(user_server.bs.chunk_size == 123);
+    assert(user_server.bs.chunk_size == 0);
     assert(user_server.bs.request_id == 77);
     assert(user_client.bs.chunk_type == MIDDLE_CHUNK);
     assert(user_client.bs.request_id == 99);
@@ -605,16 +603,13 @@ static void test_user_data_bitfield_limits(void)
 {
     os_transport_user_data_t user_data = {0};
 
-    assert(OS_TRANSPORT_CHUNK_ID_BITS == 6U);
-    assert(OS_TRANSPORT_CHUNK_SIZE_BITS == 24U);
-    assert(OS_TRANSPORT_MAX_CHUNK_ID == 63U);
-    assert(OS_TRANSPORT_MAX_CHUNK_COUNT == 64U);
-    assert(OS_TRANSPORT_MAX_RECV_LEN == (uint64_t)OS_TRANSPORT_MAX_CHUNK_COUNT * DEFAULT_CHUNK_SIZE);
+    assert(OS_TRANSPORT_MAX_CHUNK_ID == 15U);
+    assert(OS_TRANSPORT_MAX_CHUNK_NUM == 16U);
 
     user_data.bs.chunk_id = OS_TRANSPORT_MAX_CHUNK_ID;
-    user_data.bs.chunk_size = (1ULL << OS_TRANSPORT_CHUNK_SIZE_BITS) - 1ULL;
+    user_data.bs.chunk_size = 0;
     assert(user_data.bs.chunk_id == OS_TRANSPORT_MAX_CHUNK_ID);
-    assert(user_data.bs.chunk_size == ((1ULL << OS_TRANSPORT_CHUNK_SIZE_BITS) - 1ULL));
+    assert(user_data.bs.chunk_size == 0);
 }
 
 /*
@@ -659,7 +654,7 @@ static void test_do_chunk_and_worker_funcs(void)
     notify_data.bs.request_id = 55;
     notify_data.bs.chunk_id = 3;
     notify_data.bs.chunk_type = LAST_CHUNK;
-    notify_data.bs.chunk_size = 8;
+    notify_data.bs.chunk_size = 0;
     prepare_recv_task_user_data(&recv_arg, &notify_data);
     assert(recv_task_worker_func(&recv_arg) == 0);
     assert(g_mock_notify_calls == 1);
@@ -713,7 +708,7 @@ static void test_register_task_functions(void)
     ost_handle.thread_pool = (ThreadPoolHandle)0x1234;
 
     assert(init_task_sync(&sync) == 0);
-    urma_info.write_info.user_ctx_server.bs.request_id = 0x55AA;
+    urma_info.write_info.user_ctx_server.bs.request_id = 0x3FF;
     assert(register_send_tasks(&ost_handle, chunks, 1, dummy_task_func, urma_info, sync) == -1);
     free_sync_owned_resources(sync);
 
@@ -734,7 +729,7 @@ static void test_register_task_functions(void)
     assert(send_args[0].is_last_chunk == false);
     assert(send_args[1].chunk_info == &chunks[2]);
     assert(send_args[1].is_last_chunk == true);
-    assert(sync->task_group->tasks[0].request_id == 0x55AA);
+    assert(sync->task_group->tasks[0].request_id == 0x3FF);
     assert(g_mock_last_submit_task_count == 2);
     free_sync_owned_resources(sync);
 
@@ -967,7 +962,10 @@ static void test_init_destroy_and_send_recv_api(void)
     free_sync_owned_resources(sync);
 
     host_src.addr = 0x3300;
+    host_src.tseg = (urma_target_seg_t *)0x3301;
     device_dst.dst = (void *)0x4400;
+    device_dst.jetty = (urma_jetty_t *)0x4401;
+    device_dst.jfr = (urma_jfr_t *)0x4402;
     send_handle.recv_queue_available = DEFAULT_RECV_QUEUE_CAPACITY;
     sync = NULL;
 
@@ -978,20 +976,6 @@ static void test_init_destroy_and_send_recv_api(void)
     reset_mocks();
     g_mock_submit_fail = 1;
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
-
-    reset_mocks();
-    sync = (task_sync_t *)0xBAD;
-    assert(os_transport_recv(&send_handle,
-                             &host_src,
-                             &device_dst,
-                             (uint32_t)OS_TRANSPORT_MAX_RECV_LEN + 1,
-                             88,
-                             &sync,
-                             test_notify_cb)
-           == (uint32_t)-1);
-    assert(sync == NULL);
-    assert(g_mock_last_submit_task_count == 0);
-    assert(g_mock_urma_recv_calls == 0);
 
     reset_mocks();
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == 0);
