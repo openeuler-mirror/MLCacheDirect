@@ -321,6 +321,7 @@ public:
         TIMER_START(waitCopy);
         err = WaitAndDestroyH2DStream(h2dStream);
         h2dStream = nullptr;
+        readOnlyBuffers.clear();
         TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
         TIMER_END(thread_id_, Mgeth2d, "MGETH2D");
         if (err != cudaSuccess) {
@@ -418,6 +419,7 @@ public:
             TIMER_END(thread_id_, round, "MGETH2D_SUBMIT");
             TIMER_START(waitCopy);
             err = cudaStreamSynchronize(h2dStream);
+            readOnlyBuffers.clear();
             TIMER_END(thread_id_, waitCopy, "MGETH2D_COPY_WAIT");
             TIMER_END(thread_id_, mgeth2d, "MGETH2D");
             if (err != cudaSuccess) {
