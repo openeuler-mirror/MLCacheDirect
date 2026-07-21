@@ -710,8 +710,8 @@ void PrintUsage(const char *prog)
     std::cout << "  --delete_value=true|false|1|0       : Delete keys after get (default: true)" << std::endl;
     std::cout << "  --gpu_id=N                         : GPU device ID to use (default: 0)" << std::endl;
     std::cout << "  --enable_local_cache=true|false     : Enable local worker/cache path (default: true)" << std::endl;
-    std::cout << "  --enable_client_direct_pipeline_h2d=true|false : Enable client-direct RH2D (default: false)" << std::endl;
-    std::cout << "  --client_direct_pipeline_h2d_thread_num=N      : Client-side pipeline H2D thread num (default: 32)" << std::endl;
+    std::cout << "  --enable_client_direct_rh2d=true|false : Enable client-direct RH2D (default: false)" << std::endl;
+    std::cout << "  --client_direct_thread_num=N      : Client-side pipeline H2D thread num (default: 32)" << std::endl;
     std::cout << "  --fast_transport_mem_size=N         : Client UB transport memory pool size in bytes (default: 1GB)" << std::endl;
     std::cout << "  --help or -h                        : Show this help message (can be placed anywhere)" << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -748,9 +748,9 @@ struct CmdArgs {
     int gpu_id = 0;
     bool help = false;
     bool enable_local_cache = true;
-    bool enable_client_direct_pipeline_h2d = false;
-    int client_direct_pipeline_h2d_thread_num = 32;
-    uint64_t fast_transport_mem_size = 1024ULL * 1024 * 1024;
+    bool enable_client_direct_rh2d = false;
+    int client_direct_thread_num = 32;
+    uint64_t fast_transport_mem_size = 2 * 1024ULL * 1024 * 1024;
 };
 
 CmdArgs ParseArgs(int argc, char *argv[])
@@ -792,10 +792,10 @@ CmdArgs ParseArgs(int argc, char *argv[])
                 args.port = std::stoi(value);
             else if (key == "enable_local_cache")
                 args.enable_local_cache = ParseBool(value);
-            else if (key == "enable_client_direct_pipeline_h2d")
-                args.enable_client_direct_pipeline_h2d = ParseBool(value);
-            else if (key == "client_direct_pipeline_h2d_thread_num")
-                args.client_direct_pipeline_h2d_thread_num = std::stoi(value);
+            else if (key == "enable_client_direct_rh2d")
+                args.enable_client_direct_rh2d = ParseBool(value);
+            else if (key == "client_direct_thread_num")
+                args.client_direct_thread_num = std::stoi(value);
             else if (key == "fast_transport_mem_size")
                 args.fast_transport_mem_size = std::stoull(value);
             continue;
@@ -836,10 +836,10 @@ CmdArgs ParseArgs(int argc, char *argv[])
                     args.port = std::stoi(value);
                 else if (key == "enable_local_cache")
                     args.enable_local_cache = ParseBool(value);
-                else if (key == "enable_client_direct_pipeline_h2d")
-                    args.enable_client_direct_pipeline_h2d = ParseBool(value);
-                else if (key == "client_direct_pipeline_h2d_thread_num")
-                    args.client_direct_pipeline_h2d_thread_num = std::stoi(value);
+                else if (key == "enable_client_direct_rh2d")
+                    args.enable_client_direct_rh2d = ParseBool(value);
+                else if (key == "client_direct_thread_num")
+                    args.client_direct_thread_num = std::stoi(value);
                 else if (key == "fast_transport_mem_size")
                     args.fast_transport_mem_size = std::stoull(value);
             }
@@ -898,8 +898,8 @@ int main(int argc, char *argv[])
               << "port: " << args.port << ", "
               << "command=" << args.cmd << ", "
               << "enable_local_cache=" << std::boolalpha << args.enable_local_cache << ", "
-              << "enable_client_direct_pipeline_h2d=" << args.enable_client_direct_pipeline_h2d << ", "
-              << "client_direct_pipeline_h2d_thread_num=" << args.client_direct_pipeline_h2d_thread_num << ", "
+              << "enable_client_direct_rh2d=" << args.enable_client_direct_rh2d << ", "
+              << "client_direct_thread_num=" << args.client_direct_thread_num << ", "
               << "fast_transport_mem_size=" << args.fast_transport_mem_size << std::noboolalpha << std::endl;
 
     try {
@@ -911,8 +911,8 @@ int main(int argc, char *argv[])
         connectOptions.deviceId = std::to_string(args.gpu_id);
         connectOptions.fastTransportMemSize = args.fast_transport_mem_size;
         connectOptions.enableLocalCache = args.enable_local_cache;
-        connectOptions.enableClientDirectPipelineH2D = args.enable_client_direct_pipeline_h2d;
-        connectOptions.clientDirectPipelineH2DThreadNum = args.client_direct_pipeline_h2d_thread_num;
+        connectOptions.enableClientDirectPipelineH2D = args.enable_client_direct_rh2d;
+        connectOptions.clientDirectPipelineH2DThreadNum = args.client_direct_thread_num;
 
         auto sharedClient = std::make_shared<KVClient>(connectOptions);
         auto ret = sharedClient->Init();
