@@ -325,7 +325,7 @@ static void ost_log_emit(OstLogEmitTarget target, LogLevel level, const char *fo
         break;
     case OST_LOG_BACKEND_CALLBACK:
         if (target.callback) {
-            static mask = 0xff;
+            static int mask = 0xff;
             int logLevel = (level & mask) | ((vlevel & mask) << 8);
             target.callback(logLevel, formatted_line);
         }
