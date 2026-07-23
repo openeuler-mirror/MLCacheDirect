@@ -95,12 +95,12 @@ typedef enum urma_status_t {
 
 ### 2.3 运行时条件编译
 
-**关键设计：条件编译宏 `OS_TRANSPORT_MOCK_MODE`**
+**关键设计：条件编译宏 `USE_URMA_MOCK`**
 
 通过条件编译实现 mock 模式与真实模式的切换：
 
 ```c
-#ifdef OS_TRANSPORT_MOCK_MODE
+#ifdef USE_URMA_MOCK
 #include "urma_abi_compat.h"
 #else
 #include <ub/umdk/urma/urma_api.h>
@@ -165,10 +165,10 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty,
 **CMake 层面的开关控制：**
 
 ```cmake
-option(OS_TRANSPORT_MOCK_MODE "Use mock URMA implementation" OFF)
+option(USE_URMA_MOCK "Use mock URMA implementation" OFF)
 
-if(OS_TRANSPORT_MOCK_MODE)
-    add_definitions(-DOS_TRANSPORT_MOCK_MODE=1)
+if(USE_URMA_MOCK)
+    add_definitions(-DUSE_URMA_MOCK=1)
     file(GLOB MOCK_SRC_FILES mock/*.c)
     list(APPEND SRC_FILES ${MOCK_SRC_FILES})
     message(STATUS "URMA mock mode enabled")
@@ -183,7 +183,7 @@ endif()
 ```bash
 case "${OPT}" in
     mock)
-        OS_TRANSPORT_MOCK_MODE="ON"
+        USE_URMA_MOCK="ON"
         echo "✅ 启用URMA mock模式"
         ;;
 ```
@@ -207,7 +207,7 @@ target_include_directories(os_transport
 target_include_directories(test_thread_pool
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
+        $<$<BOOL:${USE_URMA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
 )
 ```
 

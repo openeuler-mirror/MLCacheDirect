@@ -2,6 +2,7 @@
 #include "os_transport_urma.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifndef URMA_OPC_WRITE_IMM
 #define URMA_OPC_WRITE_IMM 0
