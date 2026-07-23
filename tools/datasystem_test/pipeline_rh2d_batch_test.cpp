@@ -100,6 +100,13 @@ struct SizeConfig {
     int count;  // -1 means remaining in batch
 };
 
+struct ClientOptions {
+    uint64_t fast_transport_mem_size = 2 * 1024ULL * 1024 * 1024;
+    bool enable_local_cache = true;
+    bool enable_client_direct_rh2d = false;
+    int client_direct_thread_num = 32;
+};
+
 #define TLOG(tid, ...) do { \
     std::lock_guard<std::mutex> lock(print_mutex); \
     std::cout << "[T" << tid << "] "; \
@@ -316,8 +323,10 @@ std::string GenerateRandomString(size_t length) {
 
 class RemoteH2DTest {
 public:
-    RemoteH2DTest(const std::string& host, int port, int thread_id, int gpu_id, bool verify_data = true)
-        : thread_id_(thread_id), gpu_id_(gpu_id), host_(host), port_(port), verify_data_(verify_data) {
+    RemoteH2DTest(const std::string& host, int port, int thread_id, int gpu_id, bool verify_data = true,
+                  const ClientOptions& client_options = ClientOptions())
+        : thread_id_(thread_id), gpu_id_(gpu_id), host_(host), port_(port), verify_data_(verify_data),
+          client_options_(client_options) {
         client_ = nullptr;
     }
 
@@ -328,6 +337,10 @@ public:
         connectOptions.accessKey = "";
         connectOptions.secretKey = "";
         connectOptions.deviceId = std::to_string(gpu_id_);
+        connectOptions.fastTransportMemSize = client_options_.fast_transport_mem_size;
+        connectOptions.enableLocalCache = client_options_.enable_local_cache;
+        connectOptions.enableClientDirectPipelineH2D = client_options_.enable_client_direct_rh2d;
+        connectOptions.clientDirectPipelineH2DThreadNum = client_options_.client_direct_thread_num;
 
         client_ = std::make_unique<KVClient>(connectOptions);
         Status rc = client_->Init();
@@ -1049,6 +1062,7 @@ private:
     int port_;
     std::shared_ptr<Barrier> barrier_;
     bool verify_data_ = true;
+    ClientOptions client_options_;
 };
 
 void PrintUsage(const char* prog) {
@@ -1075,6 +1089,10 @@ void PrintUsage(const char* prog) {
     std::cout << "  --gpu_id=N        GPU device ID (default: 0)" << std::endl;
     std::cout << "  --verify=Y/N      Verify data (default: Y)" << std::endl;
     std::cout << "  --use_user_stream=Y/N  Use new MGetH2D interface (default: N)" << std::endl;
+    std::cout << "  --enable_local_cache=Y/N  Enable datasystem local cache (default: Y)" << std::endl;
+    std::cout << "  --enable_client_direct_rh2d=Y/N  Enable client-direct RH2D (default: N)" << std::endl;
+    std::cout << "  --client_direct_thread_num=N  Client-direct RH2D thread count (default: 32)" << std::endl;
+    std::cout << "  --fast_transport_mem_size=N   Fast transport memory size (default: 2147483648)" << std::endl;
     std::cout << "  --help, -h        Show this help" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -1086,6 +1104,11 @@ void PrintUsage(const char* prog) {
     std::cout << std::endl;
     std::cout << "  # New interface with user stream" << std::endl;
     std::cout << "  " << prog << " rh2d --count=100 --batch=10 --use_user_stream=Y --remoteip=192.168.1.100 --localip=192.168.1.101" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # Client-direct RH2D without local worker" << std::endl;
+    std::cout << "  " << prog << " rh2d --count=100 --batch=10 --thread=4 --value_size=3670016 \\" << std::endl;
+    std::cout << "    --remoteip=192.168.1.100 --enable_local_cache=N \\" << std::endl;
+    std::cout << "    --enable_client_direct_rh2d=Y --client_direct_thread_num=64" << std::endl;
     std::cout << std::endl;
     std::cout << "  # KPS mode: 1000 ops/sec, 4 threads, 60 seconds" << std::endl;
     std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --remoteip=192.168.1.100" << std::endl;
@@ -1107,8 +1130,40 @@ struct CmdArgs {
     int gpu_id = 0;
     bool verify_data = true;
     bool use_user_stream = false;
+    ClientOptions client_options;
     bool help = false;
 };
+
+bool ParseBoolValue(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return value == "y" || value == "yes" || value == "1" || value == "true";
+}
+
+void ApplyOption(CmdArgs& args, const std::string& key, const std::string& value)
+{
+    if (key == "count") args.count = std::stoi(value);
+    else if (key == "batch") args.batch = std::stoi(value);
+    else if (key == "thread") args.thread_count = std::stoi(value);
+    else if (key == "process") args.process_count = std::stoi(value);
+    else if (key == "kps") args.kps = std::stod(value);
+    else if (key == "duration") args.duration = std::stoi(value);
+    else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
+    else if (key == "remoteip") args.remoteip = value;
+    else if (key == "localip") args.localip = value;
+    else if (key == "port") args.port = std::stoi(value);
+    else if (key == "gpu_id") args.gpu_id = std::stoi(value);
+    else if (key == "verify") args.verify_data = ParseBoolValue(value);
+    else if (key == "use_user_stream") args.use_user_stream = ParseBoolValue(value);
+    else if (key == "enable_local_cache") args.client_options.enable_local_cache = ParseBoolValue(value);
+    else if (key == "enable_client_direct_rh2d") {
+        args.client_options.enable_client_direct_rh2d = ParseBoolValue(value);
+    } else if (key == "client_direct_thread_num") {
+        args.client_options.client_direct_thread_num = std::stoi(value);
+    } else if (key == "fast_transport_mem_size") {
+        args.client_options.fast_transport_mem_size = std::stoull(value);
+    }
+}
 
 CmdArgs ParseArgs(int argc, char* argv[]) {
     CmdArgs args;
@@ -1123,25 +1178,7 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
         }
 
         if (ParseKeyValue(arg, key, value)) {
-            if (key == "count") args.count = std::stoi(value);
-            else if (key == "batch") args.batch = std::stoi(value);
-            else if (key == "thread") args.thread_count = std::stoi(value);
-            else if (key == "process") args.process_count = std::stoi(value);
-            else if (key == "kps") args.kps = std::stod(value);
-            else if (key == "duration") args.duration = std::stoi(value);
-            else if (key == "valuesize") args.valuesize_config = value;  // Support new format
-            else if (key == "remoteip") args.remoteip = value;
-            else if (key == "localip") args.localip = value;
-            else if (key == "port") args.port = std::stoi(value);
-            else if (key == "gpu_id") args.gpu_id = std::stoi(value);
-            else if (key == "verify") {
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                args.verify_data = (value == "y" || value == "yes" || value == "1" || value == "true");
-            }
-            else if (key == "use_user_stream") {
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                args.use_user_stream = (value == "y" || value == "yes" || value == "1" || value == "true");
-            }
+            ApplyOption(args, key, value);
             continue;
         }
 
@@ -1149,25 +1186,7 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             key = arg.substr(2);
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 value = argv[++i];
-                if (key == "count") args.count = std::stoi(value);
-                else if (key == "batch") args.batch = std::stoi(value);
-                else if (key == "thread") args.thread_count = std::stoi(value);
-                else if (key == "process") args.process_count = std::stoi(value);
-                else if (key == "kps") args.kps = std::stod(value);
-                else if (key == "duration") args.duration = std::stoi(value);
-                else if (key == "valuesize") args.valuesize_config = value;  // Support new format
-                else if (key == "remoteip") args.remoteip = value;
-                else if (key == "localip") args.localip = value;
-                else if (key == "port") args.port = std::stoi(value);
-                else if (key == "gpu_id") args.gpu_id = std::stoi(value);
-                else if (key == "verify") {
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    args.verify_data = (value == "y" || value == "yes" || value == "1" || value == "true");
-                }
-                else if (key == "use_user_stream") {
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    args.use_user_stream = (value == "y" || value == "yes" || value == "1" || value == "true");
-                }
+                ApplyOption(args, key, value);
             }
         } else if (arg[0] != '-') {
             if (args.cmd.empty()) {
@@ -1303,7 +1322,8 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
 
         if (pid == 0) {
             // Child process
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data);
+            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
+                               args.client_options);
             if (!test.Init()) {
                 exit(1);
             }
@@ -1445,7 +1465,7 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 
     for (int tid = 0; tid < args.thread_count; ++tid) {
         threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data);
+            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data, args.client_options);
             if (!test.Init()) {
                 return;
             }
@@ -1545,7 +1565,7 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
     // Start worker threads
     for (int tid = 0; tid < args.thread_count; ++tid) {
         threads.emplace_back([tid, &args, &all_data, keys_per_thread, &kps_stats, rate_limiter, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data);
+            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data, args.client_options);
             if (!test.Init()) {
                 return;
             }
@@ -1694,7 +1714,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
         if (pid == 0) {
             // Child process
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data);
+            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
+                               args.client_options);
             if (!test.Init()) {
                 exit(1);
             }
@@ -2131,6 +2152,12 @@ int main(int argc, char* argv[]) {
               << ", Port: " << args.port << ", GPU: " << args.gpu_id << std::endl;
     std::cout << "[Main] Verify Data: " << (args.verify_data ? "Yes" : "No")
               << ", Use User Stream: " << (args.use_user_stream ? "Yes" : "No") << std::endl;
+    std::cout << "[Main] Enable Local Cache: "
+              << (args.client_options.enable_local_cache ? "Yes" : "No")
+              << ", Client-direct RH2D: "
+              << (args.client_options.enable_client_direct_rh2d ? "Yes" : "No") << std::endl;
+    std::cout << "[Main] Client-direct Threads: " << args.client_options.client_direct_thread_num
+              << ", Fast Transport Memory: " << args.client_options.fast_transport_mem_size << std::endl;
 
     // Parse value size configuration
     std::vector<SizeConfig> size_configs;
