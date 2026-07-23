@@ -6,8 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Check if using mock mode
+option(USE_PIPLN_MOCK "Use mock mode without CUDA" OFF)
+
 # deps
-find_package(CUDAToolkit REQUIRED)
+if(NOT USE_PIPLN_MOCK)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 execute_process(
     COMMAND sh -c "pip show openyuanrong-datasystem | grep '^Location:' | awk '{print $2}'"
     OUTPUT_VARIABLE OPENYUANRONG_SITE_PACKAGES
@@ -33,7 +38,11 @@ set(COMMON_HEADER ${DATASYSTEM_INCLUDE_DIR}/..)
 file(GLOB_RECURSE
     DATASYSTEM_LIB_PATH "${OPENYUANRONG_DATASYSTEM_PATH}/*/libdatasystem.so"
 )
-set(COMMON_LIB ${DATASYSTEM_LIB_PATH} CUDA::cudart)
+if(USE_PIPLN_MOCK)
+    set(COMMON_LIB ${DATASYSTEM_LIB_PATH})
+else()
+    set(COMMON_LIB ${DATASYSTEM_LIB_PATH} CUDA::cudart)
+endif()
 
 #################### feature test util ##################
 
@@ -51,14 +60,17 @@ target_compile_options(pipeline_h2d PRIVATE
 
 #################### batch test util ##################
 
-add_executable(batch_test pipeline_rh2d_batch_test.cpp)
-target_include_directories(batch_test PRIVATE
+add_executable(pipeline_rh2d_batch_test pipeline_rh2d_batch_test.cpp)
+target_include_directories(pipeline_rh2d_batch_test PRIVATE
     ${COMMON_HEADER}/
 )
-target_link_libraries(batch_test PRIVATE 
+target_link_libraries(pipeline_rh2d_batch_test PRIVATE
     ${COMMON_LIB}
 )
-target_compile_options(batch_test PRIVATE
+if(USE_PIPLN_MOCK)
+    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_PIPLN_MOCK)
+endif()
+target_compile_options(pipeline_rh2d_batch_test PRIVATE
     $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
 )
 
