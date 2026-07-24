@@ -1519,9 +1519,9 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
     std::cout << "=================================================" << std::endl;
 }
 
-void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
+void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
+                    const std::shared_ptr<KVClient>& sharedClient) {
     int keys_per_thread = args.count / args.thread_count;
-    auto sharedClient = CreateSharedClient(args);
     if (sharedClient == nullptr) {
         return;
     }
@@ -1618,9 +1618,9 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 }
 
 // KPS mode multi-thread runner
-void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
+void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
+                       const std::shared_ptr<KVClient>& sharedClient) {
     int keys_per_thread = args.count / args.thread_count;
-    auto sharedClient = CreateSharedClient(args);
     if (sharedClient == nullptr) {
         return;
     }
@@ -2231,6 +2231,14 @@ int main(int argc, char* argv[]) {
               << ", client_direct_thread_num: " << args.client_options.client_direct_thread_num
               << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size << std::endl;
 
+    std::shared_ptr<KVClient> sharedClient;
+    if (args.process_count == 0) {
+        sharedClient = CreateSharedClient(args);
+        if (sharedClient == nullptr) {
+            return 1;
+        }
+    }
+
     // Parse value size configuration
     std::vector<SizeConfig> size_configs;
     if (!args.valuesize_config.empty()) {
@@ -2322,7 +2330,7 @@ int main(int argc, char* argv[]) {
         if (args.process_count > 0) {
             RunKpsMultiProcess(args, all_data);
         } else {
-            RunKpsMultiThread(args, all_data);
+            RunKpsMultiThread(args, all_data, sharedClient);
         }
         return 0;
     }
@@ -2370,7 +2378,7 @@ int main(int argc, char* argv[]) {
     if (args.process_count > 0) {
         RunMultiProcess(args, all_data);
     } else {
-        RunMultiThread(args, all_data);
+        RunMultiThread(args, all_data, sharedClient);
     }
 
     // Delete all keys after test completion
