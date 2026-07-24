@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 project(OS_TRANSPORT VERSION 1.0.0 LANGUAGES C)
 option(OS_TRANSPORT_BUILD_TESTS "Build OS_TRANSPORT test binaries" OFF)
 option(OS_TRANSPORT_WITH_INJECT "Enable fault injection for os_transport" OFF)
-option(OS_TRANSPORT_MOCK_MODE "Use mock URMA implementation" OFF)
+option(USE_URMA_MOCK "Use mock URMA implementation" OFF)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -16,8 +16,8 @@ if(OS_TRANSPORT_WITH_INJECT)
 endif()
 
 # Mock模式配置
-if(OS_TRANSPORT_MOCK_MODE)
-    add_definitions(-DOS_TRANSPORT_MOCK_MODE=1)
+if(USE_URMA_MOCK)
+    add_definitions(-DUSE_URMA_MOCK=1)
     message(STATUS "URMA mock mode enabled")
 endif()
 
@@ -25,13 +25,13 @@ endif()
 file(GLOB SRC_FILES src/*.c)
 
 # Mock模式下添加mock源码
-if(OS_TRANSPORT_MOCK_MODE)
+if(USE_URMA_MOCK)
     file(GLOB MOCK_SRC_FILES mock/*.c)
     list(APPEND SRC_FILES ${MOCK_SRC_FILES})
 endif()
 
 # Mock模式下不需要查找URMA库
-if(NOT OS_TRANSPORT_MOCK_MODE)
+if(NOT USE_URMA_MOCK)
     find_library(URMA_LIB urma
         HINTS /usr/lib64 /usr/local/lib /opt/urma/lib /opt/urma/lib64
         DOC "URMA library path"
@@ -111,7 +111,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
         target_include_directories(test_inject_unit
             PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
-                $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
+                $<$<BOOL:${USE_URMA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
         )
         target_link_libraries(test_inject_unit pthread rt)
         message(STATUS "Fault injection unit test will be built: test_inject_unit")
@@ -126,7 +126,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
     target_include_directories(test_thread_pool
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
+            $<$<BOOL:${USE_URMA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_thread_pool pthread)
 
@@ -135,7 +135,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
+            $<$<BOOL:${USE_URMA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_os_transport_log_unit pthread)
 
@@ -144,7 +144,7 @@ if(OS_TRANSPORT_BUILD_TESTS)
     target_include_directories(test_os_transport_unit
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
-            $<$<BOOL:${OS_TRANSPORT_MOCK_MODE}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
+            $<$<BOOL:${USE_URMA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/mock>
     )
     target_link_libraries(test_os_transport_unit pthread)
 endif()

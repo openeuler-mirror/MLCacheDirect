@@ -202,7 +202,7 @@ cmake \
     -DCMAKE_C_FLAGS="${CMAKE_C_FLAGS}" \
     -DOS_TRANSPORT_BUILD_TESTS="$([ ${DO_TEST} -eq 1 ] && echo ON || echo OFF)" \
     -DOS_TRANSPORT_WITH_INJECT="${WITH_INJECT}" \
-    -DOS_TRANSPORT_MOCK_MODE="${USE_MOCK}" \
+    -DUSE_URMA_MOCK="${USE_MOCK}" \
     "${ROOT_DIR}"
 
 print_gcov_summary_from_output() {
