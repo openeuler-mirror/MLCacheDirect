@@ -25,15 +25,15 @@
 #include <sys/types.h> 
 #include <utility>
 
-#ifdef USE_PIPLN_MOCK
-#include "mock.h"
+#ifdef USE_CUDA_MOCK
+#include "cuda_mock.h"
 #else
 #include <cuda_runtime.h>
 #endif
 
 using namespace datasystem;
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
 static cudaError_t CreateH2DStream(cudaStream_t *stream)
 {
     return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
@@ -475,7 +475,7 @@ public:
         stats.latency_stats.batch_count = num_batches;
         stats.latency_stats.key_count = total_keys;
 
-#ifdef USE_PIPLN_MOCK
+#ifdef USE_CUDA_MOCK
         // Mock mode: always use old interface
         if (use_user_stream) {
             TLOG(thread_id_, "[WARN] use_user_stream is not supported in mock mode, falling back to old interface");
@@ -503,7 +503,7 @@ public:
             void* dev_ptr = nullptr;
             if ((err = cudaMalloc(&dev_ptr, max_size)) != cudaSuccess) {
                 TLOG(thread_id_, "cudaMalloc failed for pre-allocated buffer: " << cudaGetErrorString(err));
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
                 if (use_user_stream && h2dStream) {
                     WaitAndDestroyH2DStream(h2dStream);
                 }
@@ -540,7 +540,7 @@ public:
                              << ", error: " << cudaGetErrorString(err));
                         for (auto& chunk : devShmChunks) cudaFree(chunk.pointer);
                         if (!preallocated_buffers.empty()) cudaFree(preallocated_buffers[0].pointer);
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
                         if (use_user_stream && h2dStream) {
                             WaitAndDestroyH2DStream(h2dStream);
                         }
@@ -556,7 +556,7 @@ public:
 
             auto start_time = std::chrono::high_resolution_clock::now();
             Status ret;
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             if (use_user_stream) {
                 // Use new interface with user-provided stream and readOnlyBuffer
                 std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
@@ -607,7 +607,7 @@ public:
             }
         }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
         // Destroy CUDA stream if using new interface
         if (use_user_stream && h2dStream) {
             WaitAndDestroyH2DStream(h2dStream);
@@ -745,7 +745,7 @@ public:
         if (barrier && barrier->Wait())
             return;
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
         cudaError_t err;
         if ((err = cudaSetDevice(gpu_id_)) != cudaSuccess) {
             TLOG(thread_id_, "cudaSetDevice(" << gpu_id_ << ") failed: " << cudaGetErrorString(err));
@@ -778,7 +778,7 @@ public:
 
         std::uniform_int_distribution<int> key_dist(0, total_keys - batch_size);
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
         // Create CUDA stream if using user stream
         cudaStream_t h2dStream = nullptr;
         if (use_user_stream) {
@@ -882,7 +882,7 @@ public:
             std::vector<Blob> devShmChunks;
             std::vector<std::string> outFailedKeys;
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             // Randomly select a pre-allocated batch buffer
             int batch_slot = -1;
             for (int b = 0; b < NUM_PREALLOCATED_BATCHES; ++b) {
@@ -919,7 +919,7 @@ public:
 #endif
 
             auto rh2d_start = std::chrono::high_resolution_clock::now();
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             if (use_user_stream) {
                 // Use new interface with user-provided stream and readOnlyBuffer
                 std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
@@ -956,7 +956,7 @@ public:
                 }
             }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             // Free per-batch CUDA memory only if allocated on-the-fly (batch_slot == -1)
             if (batch_slot == -1) {
                 for (auto& chunk : devShmChunks) {
@@ -993,7 +993,7 @@ public:
             }
         }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
         // Free all pre-allocated CUDA memory
         for (int b = 0; b < NUM_PREALLOCATED_BATCHES; ++b) {
             for (auto ptr : preallocated_batches[b]) {
@@ -1017,7 +1017,7 @@ private:
     std::vector<SizeConfig> value_size_configs_;
 
     void CheckDataBatch(int startIdx, const std::vector<Blob>& devShmChunks) {
-#ifdef USE_PIPLN_MOCK
+#ifdef USE_CUDA_MOCK
         TLOG(thread_id_, "CheckDataBatch skipped in mock mode (no real GPU memory to verify)");
 #else
         bool is_failed = false;
@@ -1048,7 +1048,7 @@ private:
     }
 
     void CheckDataBatchHost(int startIdx, const std::vector<std::string>& values) {
-#ifdef USE_PIPLN_MOCK
+#ifdef USE_CUDA_MOCK
         TLOG(thread_id_, "CheckDataBatch skipped in mock mode (no real GPU memory to verify)");
 #else
         bool is_failed = false;
@@ -1793,7 +1793,7 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                 exit(1);
             }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             cudaError_t err;
             if ((err = cudaSetDevice(args.gpu_id)) != cudaSuccess) {
                 std::cerr << "[P" << pid_idx << "] cudaSetDevice failed: " << cudaGetErrorString(err) << std::endl;
@@ -1894,7 +1894,7 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                 std::vector<Blob> devShmChunks;
                 std::vector<std::string> outFailedKeys;
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
                 for (int i = 0; i < args.batch; ++i) {
                     void* ptr = nullptr;
                     size_t size = all_data[start_idx + start + i].second.size();
@@ -1929,7 +1929,7 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                     }
                 }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
                 // Free per-batch CUDA memory if not pre-allocated
                 if (preallocated_ptrs.empty()) {
                     for (auto& chunk : devShmChunks) {
@@ -1984,7 +1984,7 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                 }
             }
 
-#ifndef USE_PIPLN_MOCK
+#ifndef USE_CUDA_MOCK
             // Free pre-allocated CUDA memory
             for (auto ptr : preallocated_ptrs) {
                 if (ptr) cudaFree(ptr);

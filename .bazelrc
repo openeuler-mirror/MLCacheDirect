@@ -15,5 +15,5 @@ build:release --copt=-O2
 build:release --strip=always
 
 # Mock mode - use mock URMA implementation
-build:mock --copt=-DOS_TRANSPORT_MOCK_MODE=1
+build:mock --copt=-DUSE_URMA_MOCK=1
 build:mock --define=mock_mode=true

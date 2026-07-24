@@ -7,10 +7,10 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Check if using mock mode
-option(USE_PIPLN_MOCK "Use mock mode without CUDA" OFF)
+option(USE_CUDA_MOCK "Use mock mode without CUDA" OFF)
 
 # deps
-if(NOT USE_PIPLN_MOCK)
+if(NOT USE_CUDA_MOCK)
     find_package(CUDAToolkit REQUIRED)
 endif()
 execute_process(
@@ -38,7 +38,7 @@ set(COMMON_HEADER ${DATASYSTEM_INCLUDE_DIR}/..)
 file(GLOB_RECURSE
     DATASYSTEM_LIB_PATH "${OPENYUANRONG_DATASYSTEM_PATH}/*/libdatasystem.so"
 )
-if(USE_PIPLN_MOCK)
+if(USE_CUDA_MOCK)
     set(COMMON_LIB ${DATASYSTEM_LIB_PATH})
 else()
     set(COMMON_LIB ${DATASYSTEM_LIB_PATH} CUDA::cudart)
@@ -63,12 +63,14 @@ target_compile_options(pipeline_h2d PRIVATE
 add_executable(pipeline_rh2d_batch_test pipeline_rh2d_batch_test.cpp)
 target_include_directories(pipeline_rh2d_batch_test PRIVATE
     ${COMMON_HEADER}/
+    $<$<BOOL:${USE_CUDA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/../../mock>
 )
 target_link_libraries(pipeline_rh2d_batch_test PRIVATE
     ${COMMON_LIB}
 )
-if(USE_PIPLN_MOCK)
-    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_PIPLN_MOCK)
+if(USE_CUDA_MOCK)
+    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_CUDA_MOCK)
+    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_URMA_MOCK)
 endif()
 target_compile_options(pipeline_rh2d_batch_test PRIVATE
     $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
