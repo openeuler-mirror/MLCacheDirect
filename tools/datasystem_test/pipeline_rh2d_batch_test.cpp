@@ -741,7 +741,7 @@ public:
     // KPS mode: continuously execute set-get-delete at specified rate
     void RunKpsMode(int batch_size, double target_kps, KpsOperationStats& kps_stats,
                     std::shared_ptr<RateLimiter> rate_limiter, std::shared_ptr<Barrier> barrier,
-                    bool use_user_stream = false) {
+                    bool use_user_stream = false, bool origin_get = false, int thread_count = 1) {
         if (barrier && barrier->Wait())
             return;
 
@@ -774,7 +774,8 @@ public:
         }
 
         TLOG(thread_id_, "KPS mode started. Target: " << target_kps << " kps, batch: " << batch_size
-             << (use_user_stream ? " (with user stream)" : ""));
+             << (use_user_stream ? " (with user stream)" : "")
+             << (origin_get ? " (using Get+H2D)" : " (using MGetH2D)"));
 
         std::uniform_int_distribution<int> key_dist(0, total_keys - batch_size);
 
@@ -790,8 +791,9 @@ public:
         }
 
         // Pre-allocate CUDA memory for multiple batches
-        // Allocate 4 batches worth of memory buffers
-        constexpr int NUM_PREALLOCATED_BATCHES = 4;
+        // Allocate at least thread_count batches to ensure each thread has dedicated memory
+        // Add extra buffers (thread_count * 2) to handle concurrent operations more smoothly
+        const int NUM_PREALLOCATED_BATCHES = std::max(thread_count * 2, 4);
         std::vector<std::vector<void*>> preallocated_batches(NUM_PREALLOCATED_BATCHES);
         std::vector<size_t> batch_sizes(NUM_PREALLOCATED_BATCHES);
 
@@ -833,8 +835,8 @@ public:
 #endif
 
         while (!g_kps_stop.load()) {
-            // Apply rate limiting (3 ops per batch: set + rh2d + del)
-            int64_t wait_us = rate_limiter->Acquire(batch_size * 3);
+            // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+            int64_t wait_us = rate_limiter->Acquire(batch_size);
             if (wait_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
             }
@@ -878,92 +880,149 @@ public:
                 if (rc.IsError()) continue;
             }
 
-            // ========== Phase 2: Batch MGetH2D ==========
-            std::vector<Blob> devShmChunks;
-            std::vector<std::string> outFailedKeys;
+            // ========== Phase 2: Batch Get (MGetH2D or Get+H2D) ==========
+            if (origin_get) {
+                // Use original Get + cudaMemcpy
+                std::vector<std::string> values;
+                auto get_start = std::chrono::high_resolution_clock::now();
+                rc = client_->Get(keys, values);
+                auto get_end = std::chrono::high_resolution_clock::now();
 
+                double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
+
+                if (rc.IsError()) {
+                    kps_stats.failed_ops += batch_size;
+                    kps_stats.get_ops += batch_size;
+                    kps_stats.total_ops += batch_size;
+                    kps_stats.AddGetLatency(get_us);
+                    TLOG(thread_id_, "Get failed: " << rc.GetMsg());
+                } else {
 #ifndef USE_CUDA_MOCK
-            // Randomly select a pre-allocated batch buffer
-            int batch_slot = -1;
-            for (int b = 0; b < NUM_PREALLOCATED_BATCHES; ++b) {
-                if (!preallocated_batches[b].empty()) {
-                    batch_slot = b;
-                    break;
-                }
-            }
+                    // Perform H2D copy using pre-allocated memory
+                    // Use thread_id_ % NUM_PREALLOCATED_BATCHES to ensure each thread uses its own batch
+                    int batch_slot = thread_id_ % NUM_PREALLOCATED_BATCHES;
+                    auto h2d_start = std::chrono::high_resolution_clock::now();
 
-            if (batch_slot == -1) {
-                // No pre-allocated batch available, allocate on-the-fly
-                for (int i = 0; i < batch_size; ++i) {
-                    void* dev_ptr = nullptr;
-                    if ((err = cudaMalloc(&dev_ptr, data_[start_idx + i].second.size())) != cudaSuccess) {
-                        TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
-                        break;
+                    if (preallocated_batches[batch_slot].empty()) {
+                        TLOG(thread_id_, "Warning: No pre-allocated batch available for slot " << batch_slot);
                     }
-                    devShmChunks.push_back(Blob{dev_ptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+
+                    for (size_t i = 0; i < keys.size(); ++i) {
+                        void* dev_ptr = preallocated_batches[batch_slot].empty() ? nullptr : preallocated_batches[batch_slot][i];
+                        if (dev_ptr) {
+                            // Use pre-allocated memory
+                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
+                            }
+                        } else {
+                            // Fallback: allocate on-the-fly if pre-allocation failed
+                            if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMalloc failed for Get+H2D: " << cudaGetErrorString(err));
+                                break;
+                            }
+                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
+                            }
+                            cudaFree(dev_ptr);  // Free immediately after use
+                        }
+                    }
+
+                    auto h2d_end = std::chrono::high_resolution_clock::now();
+                    double h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+
+                    double total_us = get_us + h2d_us;
+                    kps_stats.AddGetLatency(total_us);
+#else
+                    kps_stats.AddGetLatency(get_us);
+#endif
+                    kps_stats.get_ops += batch_size;
+                    kps_stats.total_ops += batch_size;
                 }
             } else {
-                // Use pre-allocated batch
-                for (int i = 0; i < batch_size; ++i) {
-                    devShmChunks.push_back(Blob{
-                        preallocated_batches[batch_slot][i],
-                        static_cast<uint64_t>(data_[start_idx + i].second.size())
-                    });
+                // Use MGetH2D
+                std::vector<Blob> devShmChunks;
+                std::vector<std::string> outFailedKeys;
+
+#ifndef USE_CUDA_MOCK
+                // Use thread_id_ % NUM_PREALLOCATED_BATCHES to ensure each thread uses its own batch
+                int batch_slot = thread_id_ % NUM_PREALLOCATED_BATCHES;
+
+                if (preallocated_batches[batch_slot].empty()) {
+                    // No pre-allocated batch available, allocate on-the-fly
+                    TLOG(thread_id_, "Warning: No pre-allocated batch available for slot " << batch_slot);
+                    for (int i = 0; i < batch_size; ++i) {
+                        void* dev_ptr = nullptr;
+                        if ((err = cudaMalloc(&dev_ptr, data_[start_idx + i].second.size())) != cudaSuccess) {
+                            TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
+                            break;
+                        }
+                        devShmChunks.push_back(Blob{dev_ptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+                    }
+                } else {
+                    // Use pre-allocated batch
+                    for (int i = 0; i < batch_size; ++i) {
+                        devShmChunks.push_back(Blob{
+                            preallocated_batches[batch_slot][i],
+                            static_cast<uint64_t>(data_[start_idx + i].second.size())
+                        });
+                    }
                 }
-            }
 #else
-            // Mock mode: no CUDA operations
-            for (int i = 0; i < batch_size; ++i) {
-                devShmChunks.push_back(Blob{nullptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
-            }
+                // Mock mode: no CUDA operations
+                for (int i = 0; i < batch_size; ++i) {
+                    devShmChunks.push_back(Blob{nullptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+                }
 #endif
 
-            auto rh2d_start = std::chrono::high_resolution_clock::now();
+                auto rh2d_start = std::chrono::high_resolution_clock::now();
 #ifndef USE_CUDA_MOCK
-            if (use_user_stream) {
-                // Use new interface with user-provided stream and readOnlyBuffer
-                std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
-                rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys,
-                                      reinterpret_cast<void*>(h2dStream), &readOnlyBuffers);
-                // Wait for stream to complete
-                err = cudaStreamSynchronize(h2dStream);
-                if (err != cudaSuccess) {
-                    TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
-                    rc = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+                if (use_user_stream) {
+                    // Use new interface with user-provided stream and readOnlyBuffer
+                    std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
+                    rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys,
+                                          reinterpret_cast<void*>(h2dStream), &readOnlyBuffers);
+                    // Wait for stream to complete
+                    err = cudaStreamSynchronize(h2dStream);
+                    if (err != cudaSuccess) {
+                        TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
+                        rc = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+                    }
+                } else {
+                    // Use old interface (default parameters)
+                    rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
                 }
-            } else {
-                // Use old interface (default parameters)
+#else
+                // Mock mode: use old interface
                 rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
-            }
-#else
-            // Mock mode: use old interface
-            rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
 #endif
-            auto rh2d_end = std::chrono::high_resolution_clock::now();
-            double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
-            kps_stats.AddGetLatency(rh2d_us);  // Reuse get latency for rh2d
-            kps_stats.get_ops += batch_size;
-            kps_stats.total_ops += batch_size;
+                auto rh2d_end = std::chrono::high_resolution_clock::now();
+                double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
+                kps_stats.AddGetLatency(rh2d_us);  // Reuse get latency for rh2d
+                kps_stats.get_ops += batch_size;
+                kps_stats.total_ops += batch_size;
 
-            if (rc.IsError() || !outFailedKeys.empty()) {
-                kps_stats.failed_ops += batch_size;
-                TLOG(thread_id_, "MGetH2D failed: " << rc.GetMsg() << ", failed keys count: " << outFailedKeys.size());
-                if (!outFailedKeys.empty()) {
-                    TLOG(thread_id_, "MGetH2D failed keys: ");
-                    for (const auto& key : outFailedKeys) {
-                        TLOG_NONL(thread_id_, "  " << key << std::endl);
+                if (rc.IsError() || !outFailedKeys.empty()) {
+                    kps_stats.failed_ops += batch_size;
+                    TLOG(thread_id_, "MGetH2D failed: " << rc.GetMsg() << ", failed keys count: " << outFailedKeys.size());
+                    if (!outFailedKeys.empty()) {
+                        TLOG(thread_id_, "MGetH2D failed keys: ");
+                        for (const auto& key : outFailedKeys) {
+                            TLOG_NONL(thread_id_, "  " << key << std::endl);
+                        }
                     }
                 }
-            }
 
 #ifndef USE_CUDA_MOCK
-            // Free per-batch CUDA memory only if allocated on-the-fly (batch_slot == -1)
-            if (batch_slot == -1) {
-                for (auto& chunk : devShmChunks) {
-                    if (chunk.pointer) cudaFree(chunk.pointer);
+                // Free per-batch CUDA memory only if allocated on-the-fly (preallocated_batches[batch_slot].empty())
+                if (preallocated_batches[batch_slot].empty()) {
+                    for (auto& chunk : devShmChunks) {
+                        if (chunk.pointer) cudaFree(chunk.pointer);
+                    }
                 }
-            }
 #endif
+            }
 
             // ========== Phase 3: Batch Delete ==========
             auto del_start = std::chrono::high_resolution_clock::now();
@@ -1107,6 +1166,7 @@ void PrintUsage(const char* prog) {
     std::cout << "  --enable_client_direct_rh2d=Y/N  Enable client-direct RH2D (default: N)" << std::endl;
     std::cout << "  --client_direct_thread_num=N  Client-direct RH2D thread num (default: 32)" << std::endl;
     std::cout << "  --fast_transport_mem_size=N  Fast transport memory size (default: 2GB)" << std::endl;
+    std::cout << "  --originget=Y/N   Use original Get+cudaMemcpy instead of MGetH2D in kps mode (default: N)" << std::endl;
     std::cout << "  --help, -h        Show this help" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -1121,6 +1181,9 @@ void PrintUsage(const char* prog) {
     std::cout << std::endl;
     std::cout << "  # KPS mode: 1000 ops/sec, 4 threads, 60 seconds" << std::endl;
     std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --remoteip=192.168.1.100" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # KPS mode with original Get+H2D (instead of MGetH2D)" << std::endl;
+    std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --originget=Y --remoteip=192.168.1.100" << std::endl;
 }
 
 struct CmdArgs {
@@ -1140,6 +1203,7 @@ struct CmdArgs {
     bool verify_data = true;
     bool use_user_stream = false;
     ClientOptions client_options;
+    bool origin_get = false;  // Use original Get + cudaMemcpy instead of MGetH2D
     bool help = false;
 };
 
@@ -1179,6 +1243,10 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             else if (key == "fast_transport_mem_size") {
                 args.client_options.fast_transport_mem_size = std::stoull(value);
             }
+            else if (key == "originget") {
+                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                args.origin_get = (value == "y" || value == "yes" || value == "1" || value == "true");
+            }
             continue;
         }
 
@@ -1208,6 +1276,10 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                 }
                 else if (key == "fast_transport_mem_size") {
                     args.client_options.fast_transport_mem_size = std::stoull(value);
+                }
+                else if (key == "originget") {
+                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                    args.origin_get = (value == "y" || value == "yes" || value == "1" || value == "true");
                 }
             }
         } else if (arg[0] != '-') {
@@ -1628,7 +1700,8 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
     KpsOperationStats kps_stats;  // Shared statistics
-    auto rate_limiter = std::make_shared<RateLimiter>(args.kps * 3, static_cast<int>(args.kps * 3));  // token rate = key rate * 3 ops
+    // Rate limiter: rate = kps (keys per second), burst size = kps
+    auto rate_limiter = std::make_shared<RateLimiter>(args.kps, static_cast<int>(args.kps));
 
     std::cout << "[Main] Starting KPS mode with " << args.thread_count << " threads..." << std::endl;
     std::cout << "[Main] Target KPS: " << args.kps << ", Batch size: " << args.batch << std::endl;
@@ -1645,7 +1718,7 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
             int end_idx = start_idx + keys_per_thread;
             test.SetSharedData(all_data, start_idx, end_idx);
 
-            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier);
+            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier, args.use_user_stream, args.origin_get, args.thread_count);
         });
     }
 
@@ -1821,7 +1894,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
             // Local rate limiter for this process
             double process_kps = args.kps / process_count;
-            RateLimiter rate_limiter(process_kps * 3, static_cast<int>(process_kps * 3));  // token rate = key rate * 3 ops
+            // Rate limiter: rate = process_kps (keys per second), burst size = process_kps
+            RateLimiter rate_limiter(process_kps, static_cast<int>(process_kps));
 
             std::random_device rd;
             std::mt19937 rng(rd());
@@ -1845,8 +1919,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                     break;
                 }
 
-                // Apply rate limiting
-                int64_t wait_us = rate_limiter.Acquire(args.batch * 3);
+                // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+                int64_t wait_us = rate_limiter.Acquire(args.batch);
                 if (wait_us > 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
                 }
@@ -1890,54 +1964,119 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                     }
                 }
 
-                // ========== Batch MGetH2D ==========
-                std::vector<Blob> devShmChunks;
-                std::vector<std::string> outFailedKeys;
+                // ========== Batch Get (MGetH2D or Get+H2D) ==========
+                if (args.origin_get) {
+                    // Use original Get + cudaMemcpy
+                    std::vector<std::string> values;
+                    auto get_start = std::chrono::high_resolution_clock::now();
+                    rc = test.GetClient()->Get(keys, values);
+                    auto get_end = std::chrono::high_resolution_clock::now();
 
-#ifndef USE_CUDA_MOCK
-                for (int i = 0; i < args.batch; ++i) {
-                    void* ptr = nullptr;
-                    size_t size = all_data[start_idx + start + i].second.size();
-                    if (!preallocated_ptrs.empty()) {
-                        // Use pre-allocated independent buffer for each key
-                        ptr = preallocated_ptrs[i];
+                    double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
+
+                    if (rc.IsError()) {
+                        local_stats.failed_ops += args.batch;
+                        local_stats.get_ops += args.batch;
+                        local_stats.total_ops += args.batch;
+                        local_stats.AddGetLatency(get_us);
+                        std::cerr << "[P" << pid_idx << "] Get failed: " << rc.GetMsg() << std::endl;
                     } else {
-                        // Allocate on-the-fly if no pre-allocated buffers
-                        cudaMalloc(&ptr, size);
-                    }
-                    devShmChunks.push_back(Blob{ptr, static_cast<uint64_t>(size)});
-                }
-#endif
+#ifndef USE_CUDA_MOCK
+                        // Perform H2D copy using pre-allocated memory
+                        std::vector<void*> dev_ptrs;
+                        auto h2d_start = std::chrono::high_resolution_clock::now();
 
-                auto rh2d_start = std::chrono::high_resolution_clock::now();
-                rc = test.GetClient()->MGetH2D(keys, devShmChunks, outFailedKeys);
-                auto rh2d_end = std::chrono::high_resolution_clock::now();
-                double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
-                local_stats.AddGetLatency(rh2d_us);
-                local_stats.get_ops += args.batch;
-                local_stats.total_ops += args.batch;
-                if (rc.IsError() || !outFailedKeys.empty()) {
-                    local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] MGetH2D failed: " << rc.GetMsg()
-                              << ", failed keys count: " << outFailedKeys.size() << std::endl;
-                    if (!outFailedKeys.empty()) {
-                        std::cerr << "[P" << pid_idx << "] MGetH2D failed keys: ";
-                        for (const auto& key : outFailedKeys) {
-                            std::cerr << key << " ";
+                        if (!preallocated_ptrs.empty()) {
+                            // Use pre-allocated independent buffer for each key
+                            for (size_t i = 0; i < keys.size(); ++i) {
+                                if ((err = cudaMemcpy(preallocated_ptrs[i], values[i].c_str(),
+                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i
+                                              << ": " << cudaGetErrorString(err) << std::endl;
+                                }
+                            }
+                        } else {
+                            // Allocate on-the-fly if no pre-allocated buffers (fallback)
+                            for (size_t i = 0; i < keys.size(); ++i) {
+                                void* dev_ptr = nullptr;
+                                cudaError_t err;
+                                if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMalloc failed for Get+H2D: " << cudaGetErrorString(err) << std::endl;
+                                    break;
+                                }
+                                if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err) << std::endl;
+                                }
+                                dev_ptrs.push_back(dev_ptr);
+                            }
+                            // Free temporary allocations
+                            for (auto ptr : dev_ptrs) {
+                                if (ptr) cudaFree(ptr);
+                            }
                         }
-                        std::cerr << std::endl;
+
+                        auto h2d_end = std::chrono::high_resolution_clock::now();
+                        double h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+
+                        double total_us = get_us + h2d_us;
+                        local_stats.AddGetLatency(total_us);
+#else
+                        local_stats.AddGetLatency(get_us);
+#endif
+                        local_stats.get_ops += args.batch;
+                        local_stats.total_ops += args.batch;
                     }
-                }
+                } else {
+                    // Use MGetH2D
+                    std::vector<Blob> devShmChunks;
+                    std::vector<std::string> outFailedKeys;
 
 #ifndef USE_CUDA_MOCK
-                // Free per-batch CUDA memory if not pre-allocated
-                if (preallocated_ptrs.empty()) {
-                    for (auto& chunk : devShmChunks) {
-                        if (chunk.pointer) cudaFree(chunk.pointer);
+                    for (int i = 0; i < args.batch; ++i) {
+                        void* ptr = nullptr;
+                        size_t size = all_data[start_idx + start + i].second.size();
+                        if (!preallocated_ptrs.empty()) {
+                            // Use pre-allocated independent buffer for each key
+                            ptr = preallocated_ptrs[i];
+                        } else {
+                            // Allocate on-the-fly if no pre-allocated buffers
+                            cudaMalloc(&ptr, size);
+                        }
+                        devShmChunks.push_back(Blob{ptr, static_cast<uint64_t>(size)});
                     }
-                }
-                // Note: pre-allocated buffers are freed at process exit
 #endif
+
+                    auto rh2d_start = std::chrono::high_resolution_clock::now();
+                    rc = test.GetClient()->MGetH2D(keys, devShmChunks, outFailedKeys);
+                    auto rh2d_end = std::chrono::high_resolution_clock::now();
+                    double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
+                    local_stats.AddGetLatency(rh2d_us);
+                    local_stats.get_ops += args.batch;
+                    local_stats.total_ops += args.batch;
+                    if (rc.IsError() || !outFailedKeys.empty()) {
+                        local_stats.failed_ops += args.batch;
+                        std::cerr << "[P" << pid_idx << "] MGetH2D failed: " << rc.GetMsg()
+                                  << ", failed keys count: " << outFailedKeys.size() << std::endl;
+                        if (!outFailedKeys.empty()) {
+                            std::cerr << "[P" << pid_idx << "] MGetH2D failed keys: ";
+                            for (const auto& key : outFailedKeys) {
+                                std::cerr << key << " ";
+                            }
+                            std::cerr << std::endl;
+                        }
+                    }
+
+#ifndef USE_CUDA_MOCK
+                    // Free per-batch CUDA memory if not pre-allocated
+                    if (preallocated_ptrs.empty()) {
+                        for (auto& chunk : devShmChunks) {
+                            if (chunk.pointer) cudaFree(chunk.pointer);
+                        }
+                    }
+                    // Note: pre-allocated buffers are freed at process exit
+#endif
+                }
 
                 // ========== Batch Delete ==========
                 auto del_start = std::chrono::high_resolution_clock::now();
@@ -2230,6 +2369,7 @@ int main(int argc, char* argv[]) {
               << (args.client_options.enable_client_direct_rh2d ? "Yes" : "No")
               << ", client_direct_thread_num: " << args.client_options.client_direct_thread_num
               << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size << std::endl;
+              << ", Origin Get: " << (args.origin_get ? "Yes" : "No") << std::endl;
 
     std::shared_ptr<KVClient> sharedClient;
     if (args.process_count == 0) {
