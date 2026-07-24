@@ -2368,7 +2368,7 @@ int main(int argc, char* argv[]) {
               << ", enable_client_direct_rh2d: "
               << (args.client_options.enable_client_direct_rh2d ? "Yes" : "No")
               << ", client_direct_thread_num: " << args.client_options.client_direct_thread_num
-              << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size << std::endl;
+              << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size
               << ", Origin Get: " << (args.origin_get ? "Yes" : "No") << std::endl;
 
     std::shared_ptr<KVClient> sharedClient;
