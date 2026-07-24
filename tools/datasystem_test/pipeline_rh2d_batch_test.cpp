@@ -741,7 +741,7 @@ public:
     // KPS mode: continuously execute set-get-delete at specified rate
     void RunKpsMode(int batch_size, double target_kps, KpsOperationStats& kps_stats,
                     std::shared_ptr<RateLimiter> rate_limiter, std::shared_ptr<Barrier> barrier,
-                    bool use_user_stream = false) {
+                    bool use_user_stream = false, int thread_count = 1) {
         if (barrier && barrier->Wait())
             return;
 
@@ -790,8 +790,9 @@ public:
         }
 
         // Pre-allocate CUDA memory for multiple batches
-        // Allocate 4 batches worth of memory buffers
-        constexpr int NUM_PREALLOCATED_BATCHES = 4;
+        // Allocate at least thread_count batches to ensure each thread has dedicated memory
+        // Add extra buffers (thread_count * 2) to handle concurrent operations more smoothly
+        const int NUM_PREALLOCATED_BATCHES = std::max(thread_count * 2, 4);
         std::vector<std::vector<void*>> preallocated_batches(NUM_PREALLOCATED_BATCHES);
         std::vector<size_t> batch_sizes(NUM_PREALLOCATED_BATCHES);
 
@@ -833,8 +834,8 @@ public:
 #endif
 
         while (!g_kps_stop.load()) {
-            // Apply rate limiting (3 ops per batch: set + rh2d + del)
-            int64_t wait_us = rate_limiter->Acquire(batch_size * 3);
+            // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+            int64_t wait_us = rate_limiter->Acquire(batch_size);
             if (wait_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
             }
@@ -1628,7 +1629,8 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
     KpsOperationStats kps_stats;  // Shared statistics
-    auto rate_limiter = std::make_shared<RateLimiter>(args.kps * 3, static_cast<int>(args.kps * 3));  // token rate = key rate * 3 ops
+    // Rate limiter: rate = kps (keys per second), burst size = kps
+    auto rate_limiter = std::make_shared<RateLimiter>(args.kps, static_cast<int>(args.kps));
 
     std::cout << "[Main] Starting KPS mode with " << args.thread_count << " threads..." << std::endl;
     std::cout << "[Main] Target KPS: " << args.kps << ", Batch size: " << args.batch << std::endl;
@@ -1645,7 +1647,7 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
             int end_idx = start_idx + keys_per_thread;
             test.SetSharedData(all_data, start_idx, end_idx);
 
-            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier);
+            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier, args.use_user_stream, args.thread_count);
         });
     }
 
@@ -1821,7 +1823,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
             // Local rate limiter for this process
             double process_kps = args.kps / process_count;
-            RateLimiter rate_limiter(process_kps * 3, static_cast<int>(process_kps * 3));  // token rate = key rate * 3 ops
+            // Rate limiter: rate = process_kps (keys per second), burst size = process_kps
+            RateLimiter rate_limiter(process_kps, static_cast<int>(process_kps));
 
             std::random_device rd;
             std::mt19937 rng(rd());
@@ -1845,8 +1848,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                     break;
                 }
 
-                // Apply rate limiting
-                int64_t wait_us = rate_limiter.Acquire(args.batch * 3);
+                // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+                int64_t wait_us = rate_limiter.Acquire(args.batch);
                 if (wait_us > 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
                 }
