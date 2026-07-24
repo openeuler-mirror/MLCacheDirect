@@ -23,6 +23,7 @@
 #include <deque>
 #include <sys/stat.h> 
 #include <sys/types.h> 
+#include <utility>
 
 #ifdef USE_PIPLN_MOCK
 #include "mock.h"
@@ -335,6 +336,14 @@ public:
         client_ = nullptr;
     }
 
+    RemoteH2DTest(std::shared_ptr<KVClient> client, int thread_id, int gpu_id, bool verify_data = true)
+        : client_(std::move(client)), thread_id_(thread_id), gpu_id_(gpu_id), verify_data_(verify_data) {
+        if (client_ == nullptr) {
+            throw std::runtime_error("shared KVClient is nullptr");
+        }
+        TLOG(thread_id_, "Using shared KVClient instance: " << client_.get() << " (GPU: " << gpu_id_ << ")");
+    }
+
     bool Init() {
         ConnectOptions connectOptions;
         connectOptions.host = host_;
@@ -347,7 +356,7 @@ public:
         connectOptions.enableClientDirectPipelineH2D = client_options_.enable_client_direct_rh2d;
         connectOptions.clientDirectPipelineH2DThreadNum = client_options_.client_direct_thread_num;
 
-        client_ = std::make_unique<KVClient>(connectOptions);
+        client_ = std::make_shared<KVClient>(connectOptions);
         Status rc = client_->Init();
         if (rc.IsError()) {
             TLOG(thread_id_, "Failed to connect to " << host_ << ":" << port_ << " - " << rc.GetMsg());
@@ -1058,13 +1067,13 @@ private:
 #endif
     }
 
-    std::unique_ptr<KVClient> client_;
+    std::shared_ptr<KVClient> client_;
     std::vector<std::pair<std::string, std::string>> data_;
     size_t value_size_ = 8388608;
     int thread_id_ = 0;
     int gpu_id_ = 0;
     std::string host_;
-    int port_;
+    int port_ = 0;
     std::shared_ptr<Barrier> barrier_;
     bool verify_data_ = true;
     ClientOptions client_options_;
@@ -1211,6 +1220,48 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
     return args;
 }
 
+#ifndef USE_PIPLN_MOCK
+bool SetCudaDeviceBeforeClientInit(int gpu_id, const std::string& prefix) {
+    cudaError_t err = cudaSetDevice(gpu_id);
+    if (err != cudaSuccess) {
+        std::cerr << prefix << " cudaSetDevice(" << gpu_id << ") failed before KVClient Init: "
+                  << cudaGetErrorString(err) << std::endl;
+        return false;
+    }
+    return true;
+}
+#else
+bool SetCudaDeviceBeforeClientInit(int, const std::string&) {
+    return true;
+}
+#endif
+
+std::shared_ptr<KVClient> CreateSharedClient(const CmdArgs& args) {
+    if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[Main]")) {
+        return nullptr;
+    }
+    ConnectOptions connectOptions;
+    connectOptions.host = args.localip;
+    connectOptions.port = args.port;
+    connectOptions.accessKey = "";
+    connectOptions.secretKey = "";
+    connectOptions.deviceId = std::to_string(args.gpu_id);
+    connectOptions.fastTransportMemSize = args.client_options.fast_transport_mem_size;
+    connectOptions.enableLocalCache = args.client_options.enable_local_cache;
+    connectOptions.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
+    connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
+
+    auto sharedClient = std::make_shared<KVClient>(connectOptions);
+    Status rc = sharedClient->Init();
+    if (rc.IsError()) {
+        std::cerr << "[Main] Failed to init shared KVClient: " << rc.GetMsg() << std::endl;
+        return nullptr;
+    }
+    std::cout << "[Main] Shared KVClient initialized once: " << sharedClient.get() << ", host=" << args.localip
+              << ", port=" << args.port << ", gpu=" << args.gpu_id << std::endl;
+    return sharedClient;
+}
+
 void PrintLatencyStats(const LatencyStats& stats, const std::string& prefix = "") {
     std::cout << std::fixed << std::setprecision(2);
     std::cout << prefix << "Latency Statistics:" << std::endl;
@@ -1335,6 +1386,9 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
 
         if (pid == 0) {
             // Child process
+            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
+                exit(1);
+            }
             RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
                                args.client_options);
             if (!test.Init()) {
@@ -1467,6 +1521,10 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
 
 void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
     int keys_per_thread = args.count / args.thread_count;
+    auto sharedClient = CreateSharedClient(args);
+    if (sharedClient == nullptr) {
+        return;
+    }
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
@@ -1477,12 +1535,8 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
     auto main_start = std::chrono::high_resolution_clock::now();
 
     for (int tid = 0; tid < args.thread_count; ++tid) {
-        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data,
-                               args.client_options);
-            if (!test.Init()) {
-                return;
-            }
+        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier, sharedClient]() {
+            RemoteH2DTest test(sharedClient, tid, args.gpu_id, args.verify_data);
             test.SetBarrier(barrier);
 
             int start_idx = tid * keys_per_thread;
@@ -1566,6 +1620,10 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 // KPS mode multi-thread runner
 void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
     int keys_per_thread = args.count / args.thread_count;
+    auto sharedClient = CreateSharedClient(args);
+    if (sharedClient == nullptr) {
+        return;
+    }
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
@@ -1578,12 +1636,9 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
 
     // Start worker threads
     for (int tid = 0; tid < args.thread_count; ++tid) {
-        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &kps_stats, rate_limiter, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data,
-                               args.client_options);
-            if (!test.Init()) {
-                return;
-            }
+        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &kps_stats, rate_limiter, barrier,
+                              sharedClient]() {
+            RemoteH2DTest test(sharedClient, tid, args.gpu_id, args.verify_data);
             test.SetBarrier(barrier);
 
             int start_idx = tid * keys_per_thread;
@@ -1729,6 +1784,9 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
         if (pid == 0) {
             // Child process
+            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
+                exit(1);
+            }
             RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
                                args.client_options);
             if (!test.Init()) {
