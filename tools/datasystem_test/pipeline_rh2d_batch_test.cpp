@@ -23,6 +23,7 @@
 #include <deque>
 #include <sys/stat.h> 
 #include <sys/types.h> 
+#include <utility>
 
 #ifdef USE_CUDA_MOCK
 #include "cuda_mock.h"
@@ -100,6 +101,53 @@ struct SizeConfig {
     int count;  // -1 means remaining in batch
 };
 
+std::string MakeProcessStatFilePath(pid_t parent_pid, int index) {
+    return "/tmp/rh2d_stats_" + std::to_string(parent_pid) + "_" + std::to_string(index) + ".tmp";
+}
+
+bool ValidateValueSizeConfigs(const std::vector<SizeConfig>& configs, int batch, std::string& error) {
+    if (configs.empty()) {
+        error = "valuesize config is empty";
+        return false;
+    }
+
+    bool has_remaining = false;
+    int explicit_count = 0;
+    for (const auto& config : configs) {
+        if (config.size == 0) {
+            error = "valuesize must be positive";
+            return false;
+        }
+        if (config.count == -1) {
+            has_remaining = true;
+            continue;
+        }
+        if (config.count <= 0) {
+            error = "valuesize item count must be positive or omitted for remaining";
+            return false;
+        }
+        explicit_count += config.count;
+    }
+
+    if (!has_remaining && explicit_count < batch) {
+        error = "explicit valuesize item count is smaller than batch and no remaining size is configured";
+        return false;
+    }
+    return true;
+}
+
+#ifndef USE_CUDA_MOCK
+void FreeCudaPtrs(std::vector<void*>& ptrs) {
+    for (auto& ptr : ptrs) {
+        if (ptr != nullptr) {
+            cudaFree(ptr);
+            ptr = nullptr;
+        }
+    }
+    ptrs.clear();
+}
+#endif
+
 #define TLOG(tid, ...) do { \
     std::lock_guard<std::mutex> lock(print_mutex); \
     std::cout << "[T" << tid << "] "; \
@@ -136,6 +184,18 @@ bool ParseKeyValue(const std::string& arg, std::string& key, std::string& value)
     }
     return false;
 }
+
+bool ParseBool(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return value == "y" || value == "yes" || value == "1" || value == "true";
+}
+
+struct ClientOptions {
+    uint64_t fast_transport_mem_size = 2ULL * 1024 * 1024 * 1024;
+    bool enable_local_cache = true;
+    bool enable_client_direct_rh2d = false;
+    int client_direct_thread_num = 32;
+};
 
 class Barrier {
 public:
@@ -316,9 +376,19 @@ std::string GenerateRandomString(size_t length) {
 
 class RemoteH2DTest {
 public:
-    RemoteH2DTest(const std::string& host, int port, int thread_id, int gpu_id, bool verify_data = true)
-        : thread_id_(thread_id), gpu_id_(gpu_id), host_(host), port_(port), verify_data_(verify_data) {
+    RemoteH2DTest(const std::string& host, int port, int thread_id, int gpu_id, bool verify_data = true,
+                  const ClientOptions& client_options = ClientOptions())
+        : thread_id_(thread_id), gpu_id_(gpu_id), host_(host), port_(port), verify_data_(verify_data),
+          client_options_(client_options) {
         client_ = nullptr;
+    }
+
+    RemoteH2DTest(std::shared_ptr<KVClient> client, int thread_id, int gpu_id, bool verify_data = true)
+        : client_(std::move(client)), thread_id_(thread_id), gpu_id_(gpu_id), verify_data_(verify_data) {
+        if (client_ == nullptr) {
+            throw std::runtime_error("shared KVClient is nullptr");
+        }
+        TLOG(thread_id_, "Using shared KVClient instance: " << client_.get() << " (GPU: " << gpu_id_ << ")");
     }
 
     bool Init() {
@@ -328,8 +398,12 @@ public:
         connectOptions.accessKey = "";
         connectOptions.secretKey = "";
         connectOptions.deviceId = std::to_string(gpu_id_);
+        connectOptions.fastTransportMemSize = client_options_.fast_transport_mem_size;
+        connectOptions.enableLocalCache = client_options_.enable_local_cache;
+        connectOptions.enableClientDirectPipelineH2D = client_options_.enable_client_direct_rh2d;
+        connectOptions.clientDirectPipelineH2DThreadNum = client_options_.client_direct_thread_num;
 
-        client_ = std::make_unique<KVClient>(connectOptions);
+        client_ = std::make_shared<KVClient>(connectOptions);
         Status rc = client_->Init();
         if (rc.IsError()) {
             TLOG(thread_id_, "Failed to connect to " << host_ << ":" << port_ << " - " << rc.GetMsg());
@@ -466,25 +540,33 @@ public:
         }
 #endif
 
-        // Pre-allocate CUDA memory if verification is disabled
+        // Pre-allocate one CUDA buffer per batch slot if verification is disabled.
         std::vector<Blob> preallocated_buffers;
         if (!verify_data_) {
             size_t max_size = 0;
             for (const auto& kv : data_) {
                 max_size = std::max(max_size, kv.second.size());
             }
-            void* dev_ptr = nullptr;
-            if ((err = cudaMalloc(&dev_ptr, max_size)) != cudaSuccess) {
-                TLOG(thread_id_, "cudaMalloc failed for pre-allocated buffer: " << cudaGetErrorString(err));
+            preallocated_buffers.reserve(batch);
+            for (int i = 0; i < batch; ++i) {
+                void* dev_ptr = nullptr;
+                if ((err = cudaMalloc(&dev_ptr, max_size)) != cudaSuccess) {
+                    TLOG(thread_id_, "cudaMalloc failed for pre-allocated buffer slot " << i
+                         << ": " << cudaGetErrorString(err));
+                    for (auto& buf : preallocated_buffers) {
+                        cudaFree(buf.pointer);
+                    }
 #ifndef USE_CUDA_MOCK
-                if (use_user_stream && h2dStream) {
-                    WaitAndDestroyH2DStream(h2dStream);
-                }
+                    if (use_user_stream && h2dStream) {
+                        WaitAndDestroyH2DStream(h2dStream);
+                    }
 #endif
-                return;
+                    return;
+                }
+                preallocated_buffers.push_back(Blob{dev_ptr, static_cast<uint64_t>(max_size)});
             }
-            preallocated_buffers.push_back(Blob{dev_ptr, static_cast<uint64_t>(max_size)});
-            TLOG(thread_id_, "Pre-allocated CUDA buffer of size " << max_size << " bytes");
+            TLOG(thread_id_, "Pre-allocated " << preallocated_buffers.size()
+                 << " CUDA buffers of size " << max_size << " bytes");
         }
 
         for (int round = 0; round < num_batches; ++round) {
@@ -500,8 +582,8 @@ public:
                 void* dev_ptr = nullptr;
 
                 if (!verify_data_ && !preallocated_buffers.empty()) {
-                    // Reuse pre-allocated memory
-                    dev_ptr = preallocated_buffers[0].pointer;
+                    int slot = i - start;
+                    dev_ptr = preallocated_buffers[slot].pointer;
                     devShmChunks.push_back(Blob{dev_ptr, static_cast<uint64_t>(data_[i].second.size())});
                 } else {
                     // Allocate per-batch (needed for verification)
@@ -512,7 +594,9 @@ public:
                              << ", round=" << round << ", i=" << i
                              << ", error: " << cudaGetErrorString(err));
                         for (auto& chunk : devShmChunks) cudaFree(chunk.pointer);
-                        if (!preallocated_buffers.empty()) cudaFree(preallocated_buffers[0].pointer);
+                        for (auto& buf : preallocated_buffers) {
+                            cudaFree(buf.pointer);
+                        }
 #ifndef USE_CUDA_MOCK
                         if (use_user_stream && h2dStream) {
                             WaitAndDestroyH2DStream(h2dStream);
@@ -714,9 +798,16 @@ public:
     // KPS mode: continuously execute set-get-delete at specified rate
     void RunKpsMode(int batch_size, double target_kps, KpsOperationStats& kps_stats,
                     std::shared_ptr<RateLimiter> rate_limiter, std::shared_ptr<Barrier> barrier,
-                    bool use_user_stream = false) {
+                    bool use_user_stream = false, bool origin_get = false, int thread_count = 1,
+                    const std::shared_ptr<KVClient>& write_client = nullptr) {
         if (barrier && barrier->Wait())
             return;
+
+        auto writeClient = (write_client != nullptr) ? write_client : client_;
+        if (client_ == nullptr || writeClient == nullptr) {
+            TLOG(thread_id_, "KPS client is null");
+            return;
+        }
 
 #ifndef USE_CUDA_MOCK
         cudaError_t err;
@@ -747,7 +838,8 @@ public:
         }
 
         TLOG(thread_id_, "KPS mode started. Target: " << target_kps << " kps, batch: " << batch_size
-             << (use_user_stream ? " (with user stream)" : ""));
+             << (use_user_stream ? " (with user stream)" : "")
+             << (origin_get ? " (using Get+H2D)" : " (using MGetH2D)"));
 
         std::uniform_int_distribution<int> key_dist(0, total_keys - batch_size);
 
@@ -763,8 +855,9 @@ public:
         }
 
         // Pre-allocate CUDA memory for multiple batches
-        // Allocate 4 batches worth of memory buffers
-        constexpr int NUM_PREALLOCATED_BATCHES = 4;
+        // Allocate at least thread_count batches to ensure each thread has dedicated memory
+        // Add extra buffers (thread_count * 2) to handle concurrent operations more smoothly
+        const int NUM_PREALLOCATED_BATCHES = std::max(thread_count * 2, 4);
         std::vector<std::vector<void*>> preallocated_batches(NUM_PREALLOCATED_BATCHES);
         std::vector<size_t> batch_sizes(NUM_PREALLOCATED_BATCHES);
 
@@ -773,14 +866,15 @@ public:
         for (const auto& kv : data_) {
             max_value_size = std::max(max_value_size, kv.second.size());
         }
+        size_t max_copy_size = max_value_size + 1;
 
         // Pre-allocate memory for each batch
         for (int b = 0; b < NUM_PREALLOCATED_BATCHES; ++b) {
             preallocated_batches[b].resize(batch_size);
-            batch_sizes[b] = max_value_size;
+            batch_sizes[b] = max_copy_size;
             bool alloc_success = true;
             for (int i = 0; i < batch_size; ++i) {
-                if ((err = cudaMalloc(&preallocated_batches[b][i], max_value_size)) != cudaSuccess) {
+                if ((err = cudaMalloc(&preallocated_batches[b][i], max_copy_size)) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMalloc failed for batch " << b << " slot " << i
                          << ": " << cudaGetErrorString(err));
                     alloc_success = false;
@@ -800,14 +894,14 @@ public:
         }
 
         TLOG(thread_id_, "Pre-allocated " << NUM_PREALLOCATED_BATCHES << " batches of CUDA memory, "
-             << batch_size << " buffers per batch, " << max_value_size << " bytes each");
+             << batch_size << " buffers per batch, " << max_copy_size << " bytes each");
 
         std::uniform_int_distribution<int> batch_dist(0, NUM_PREALLOCATED_BATCHES - 1);
 #endif
 
         while (!g_kps_stop.load()) {
-            // Apply rate limiting (3 ops per batch: set + rh2d + del)
-            int64_t wait_us = rate_limiter->Acquire(batch_size * 3);
+            // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+            int64_t wait_us = rate_limiter->Acquire(batch_size);
             if (wait_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
             }
@@ -825,12 +919,12 @@ public:
 
             auto set_start = std::chrono::high_resolution_clock::now();
             std::vector<std::string> setFailedKeys;
-            Status rc;
+            Status setRc;
             for (size_t i = 0; i < keys.size(); ++i) {
-                Status s = client_->Set(keys[i], values[i]);
+                Status s = writeClient->Set(keys[i], values[i]);
                 if (s.IsError()) {
                     setFailedKeys.push_back(keys[i]);
-                    rc = s;  // Keep last error
+                    setRc = s;  // Keep last error
                 }
             }
             auto set_end = std::chrono::high_resolution_clock::now();
@@ -839,113 +933,186 @@ public:
             kps_stats.set_ops += batch_size;
             kps_stats.total_ops += batch_size;
 
-            if (rc.IsError() || !setFailedKeys.empty()) {
+            if (setRc.IsError() || !setFailedKeys.empty()) {
                 kps_stats.failed_ops += batch_size;
-                TLOG(thread_id_, "Set failed: " << rc.GetMsg() << ", failed keys count: " << setFailedKeys.size());
+                TLOG(thread_id_, "Set failed: " << setRc.GetMsg()
+                     << ", failed keys count: " << setFailedKeys.size());
                 if (!setFailedKeys.empty()) {
                     TLOG(thread_id_, "Set failed keys: ");
                     for (const auto& key : setFailedKeys) {
                         TLOG_NONL(thread_id_, "  " << key << std::endl);
                     }
                 }
-                if (rc.IsError()) continue;
+                if (setRc.IsError()) continue;
             }
 
-            // ========== Phase 2: Batch MGetH2D ==========
-            std::vector<Blob> devShmChunks;
-            std::vector<std::string> outFailedKeys;
+            // ========== Phase 2: Batch Get (MGetH2D or Get+H2D) ==========
+            if (origin_get) {
+                // Use original Get + cudaMemcpy
+                std::vector<std::string> values;
+                auto get_start = std::chrono::high_resolution_clock::now();
+                Status getRc = client_->Get(keys, values);
+                auto get_end = std::chrono::high_resolution_clock::now();
 
+                double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
+
+                if (getRc.IsError()) {
+                    kps_stats.failed_ops += batch_size;
+                    kps_stats.get_ops += batch_size;
+                    kps_stats.total_ops += batch_size;
+                    kps_stats.AddGetLatency(get_us);
+                    TLOG(thread_id_, "Get failed: " << getRc.GetMsg());
+                } else {
 #ifndef USE_CUDA_MOCK
-            // Randomly select a pre-allocated batch buffer
-            int batch_slot = -1;
-            for (int b = 0; b < NUM_PREALLOCATED_BATCHES; ++b) {
-                if (!preallocated_batches[b].empty()) {
-                    batch_slot = b;
-                    break;
-                }
-            }
+                    // Perform H2D copy using pre-allocated memory
+                    // Use thread_id_ % NUM_PREALLOCATED_BATCHES to ensure each thread uses its own batch
+                    int batch_slot = thread_id_ % NUM_PREALLOCATED_BATCHES;
+                    auto h2d_start = std::chrono::high_resolution_clock::now();
 
-            if (batch_slot == -1) {
-                // No pre-allocated batch available, allocate on-the-fly
-                for (int i = 0; i < batch_size; ++i) {
-                    void* dev_ptr = nullptr;
-                    if ((err = cudaMalloc(&dev_ptr, data_[start_idx + i].second.size())) != cudaSuccess) {
-                        TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
-                        break;
+                    if (preallocated_batches[batch_slot].empty()) {
+                        TLOG(thread_id_, "Warning: No pre-allocated batch available for slot " << batch_slot);
                     }
-                    devShmChunks.push_back(Blob{dev_ptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+
+                    for (size_t i = 0; i < keys.size(); ++i) {
+                        void* dev_ptr = preallocated_batches[batch_slot].empty() ? nullptr : preallocated_batches[batch_slot][i];
+                        if (dev_ptr) {
+                            // Use pre-allocated memory
+                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
+                            }
+                        } else {
+                            // Fallback: allocate on-the-fly if pre-allocation failed
+                            if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMalloc failed for Get+H2D: " << cudaGetErrorString(err));
+                                break;
+                            }
+                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
+                            }
+                            cudaFree(dev_ptr);  // Free immediately after use
+                        }
+                    }
+
+                    auto h2d_end = std::chrono::high_resolution_clock::now();
+                    double h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+
+                    double total_us = get_us + h2d_us;
+                    kps_stats.AddGetLatency(total_us);
+#else
+                    kps_stats.AddGetLatency(get_us);
+#endif
+                    kps_stats.get_ops += batch_size;
+                    kps_stats.total_ops += batch_size;
                 }
             } else {
-                // Use pre-allocated batch
-                for (int i = 0; i < batch_size; ++i) {
-                    devShmChunks.push_back(Blob{
-                        preallocated_batches[batch_slot][i],
-                        static_cast<uint64_t>(data_[start_idx + i].second.size())
-                    });
-                }
-            }
-#else
-            // Mock mode: no CUDA operations
-            for (int i = 0; i < batch_size; ++i) {
-                devShmChunks.push_back(Blob{nullptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
-            }
-#endif
+                // Use MGetH2D
+                std::vector<Blob> devShmChunks;
+                std::vector<std::string> outFailedKeys;
+                Status getRc;
 
-            auto rh2d_start = std::chrono::high_resolution_clock::now();
 #ifndef USE_CUDA_MOCK
-            if (use_user_stream) {
-                // Use new interface with user-provided stream and readOnlyBuffer
-                std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
-                rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys,
-                                      reinterpret_cast<void*>(h2dStream), &readOnlyBuffers);
-                // Wait for stream to complete
-                err = cudaStreamSynchronize(h2dStream);
-                if (err != cudaSuccess) {
-                    TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
-                    rc = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
-                }
-            } else {
-                // Use old interface (default parameters)
-                rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
-            }
-#else
-            // Mock mode: use old interface
-            rc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
-#endif
-            auto rh2d_end = std::chrono::high_resolution_clock::now();
-            double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
-            kps_stats.AddGetLatency(rh2d_us);  // Reuse get latency for rh2d
-            kps_stats.get_ops += batch_size;
-            kps_stats.total_ops += batch_size;
+                // Use thread_id_ % NUM_PREALLOCATED_BATCHES to ensure each thread uses its own batch
+                int batch_slot = thread_id_ % NUM_PREALLOCATED_BATCHES;
+                bool use_preallocated = !preallocated_batches[batch_slot].empty();
+                bool buffers_ready = true;
 
-            if (rc.IsError() || !outFailedKeys.empty()) {
-                kps_stats.failed_ops += batch_size;
-                TLOG(thread_id_, "MGetH2D failed: " << rc.GetMsg() << ", failed keys count: " << outFailedKeys.size());
-                if (!outFailedKeys.empty()) {
-                    TLOG(thread_id_, "MGetH2D failed keys: ");
-                    for (const auto& key : outFailedKeys) {
-                        TLOG_NONL(thread_id_, "  " << key << std::endl);
+                if (!use_preallocated) {
+                    // No pre-allocated batch available, allocate on-the-fly
+                    TLOG(thread_id_, "Warning: No pre-allocated batch available for slot " << batch_slot);
+                    for (int i = 0; i < batch_size; ++i) {
+                        void* dev_ptr = nullptr;
+                        if ((err = cudaMalloc(&dev_ptr, data_[start_idx + i].second.size())) != cudaSuccess) {
+                            TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
+                            buffers_ready = false;
+                            break;
+                        }
+                        devShmChunks.push_back(Blob{dev_ptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+                    }
+                } else {
+                    // Use pre-allocated batch
+                    for (int i = 0; i < batch_size; ++i) {
+                        devShmChunks.push_back(Blob{
+                            preallocated_batches[batch_slot][i],
+                            static_cast<uint64_t>(data_[start_idx + i].second.size())
+                        });
                     }
                 }
-            }
+                if (!buffers_ready) {
+                    for (auto& chunk : devShmChunks) {
+                        if (!use_preallocated && chunk.pointer) {
+                            cudaFree(chunk.pointer);
+                        }
+                    }
+                    kps_stats.failed_ops += batch_size;
+                    continue;
+                }
+#else
+                // Mock mode: no CUDA operations
+                for (int i = 0; i < batch_size; ++i) {
+                    devShmChunks.push_back(Blob{nullptr, static_cast<uint64_t>(data_[start_idx + i].second.size())});
+                }
+#endif
+
+                auto rh2d_start = std::chrono::high_resolution_clock::now();
+#ifndef USE_CUDA_MOCK
+                if (use_user_stream) {
+                    // Use new interface with user-provided stream and readOnlyBuffer
+                    std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
+                    getRc = client_->MGetH2D(keys, devShmChunks, outFailedKeys,
+                                             reinterpret_cast<void*>(h2dStream), &readOnlyBuffers);
+                    // Wait for stream to complete
+                    err = cudaStreamSynchronize(h2dStream);
+                    if (err != cudaSuccess) {
+                        TLOG(thread_id_, "cudaStreamSynchronize failed: " << cudaGetErrorString(err));
+                        getRc = Status(StatusCode::K_RUNTIME_ERROR, cudaGetErrorString(err));
+                    }
+                } else {
+                    // Use old interface (default parameters)
+                    getRc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
+                }
+#else
+                // Mock mode: use old interface
+                getRc = client_->MGetH2D(keys, devShmChunks, outFailedKeys);
+#endif
+                auto rh2d_end = std::chrono::high_resolution_clock::now();
+                double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
+                kps_stats.AddGetLatency(rh2d_us);  // Reuse get latency for rh2d
+                kps_stats.get_ops += batch_size;
+                kps_stats.total_ops += batch_size;
+
+                if (getRc.IsError() || !outFailedKeys.empty()) {
+                    kps_stats.failed_ops += batch_size;
+                    TLOG(thread_id_, "MGetH2D failed: " << getRc.GetMsg()
+                         << ", failed keys count: " << outFailedKeys.size());
+                    if (!outFailedKeys.empty()) {
+                        TLOG(thread_id_, "MGetH2D failed keys: ");
+                        for (const auto& key : outFailedKeys) {
+                            TLOG_NONL(thread_id_, "  " << key << std::endl);
+                        }
+                    }
+                }
 
 #ifndef USE_CUDA_MOCK
-            // Free per-batch CUDA memory only if allocated on-the-fly (batch_slot == -1)
-            if (batch_slot == -1) {
-                for (auto& chunk : devShmChunks) {
-                    if (chunk.pointer) cudaFree(chunk.pointer);
+                // Free per-batch CUDA memory only if allocated on-the-fly (preallocated_batches[batch_slot].empty())
+                if (!use_preallocated) {
+                    for (auto& chunk : devShmChunks) {
+                        if (chunk.pointer) cudaFree(chunk.pointer);
+                    }
                 }
-            }
 #endif
+            }
 
             // ========== Phase 3: Batch Delete ==========
             auto del_start = std::chrono::high_resolution_clock::now();
             std::vector<std::string> delFailedKeys;
+            Status delRc;
             for (const auto& key : keys) {
-                Status s = client_->Del(key);
+                Status s = writeClient->Del(key);
                 if (s.IsError()) {
                     delFailedKeys.push_back(key);
-                    rc = s;  // Keep last error
+                    delRc = s;  // Keep last error
                 }
             }
             auto del_end = std::chrono::high_resolution_clock::now();
@@ -954,9 +1121,10 @@ public:
             kps_stats.del_ops += batch_size;
             kps_stats.total_ops += batch_size;
 
-            if (rc.IsError() || !delFailedKeys.empty()) {
+            if (delRc.IsError() || !delFailedKeys.empty()) {
                 kps_stats.failed_ops += batch_size;
-                TLOG(thread_id_, "Del failed: " << rc.GetMsg() << ", failed keys count: " << delFailedKeys.size());
+                TLOG(thread_id_, "Del failed: " << delRc.GetMsg()
+                     << ", failed keys count: " << delFailedKeys.size());
                 if (!delFailedKeys.empty()) {
                     TLOG(thread_id_, "Del failed keys: ");
                     for (const auto& key : delFailedKeys) {
@@ -1040,15 +1208,16 @@ private:
 #endif
     }
 
-    std::unique_ptr<KVClient> client_;
+    std::shared_ptr<KVClient> client_;
     std::vector<std::pair<std::string, std::string>> data_;
     size_t value_size_ = 8388608;
     int thread_id_ = 0;
     int gpu_id_ = 0;
     std::string host_;
-    int port_;
+    int port_ = 0;
     std::shared_ptr<Barrier> barrier_;
     bool verify_data_ = true;
+    ClientOptions client_options_;
 };
 
 void PrintUsage(const char* prog) {
@@ -1069,12 +1238,17 @@ void PrintUsage(const char* prog) {
     std::cout << "  --valuesize=CFG   Value size config (default: 8388608)" << std::endl;
     std::cout << "                    Format: size1:num1,size2:num2,size3" << std::endl;
     std::cout << "                    Last size without :num = remaining" << std::endl;
-    std::cout << "  --remoteip=IP     Remote server IP (required)" << std::endl;
-    std::cout << "  --localip=IP      Local IP (default: same as remoteip)" << std::endl;
+    std::cout << "  --remoteip=IP     Worker IP used for Set/Del KVCache (required)" << std::endl;
+    std::cout << "  --localip=IP      Worker IP used for Get/MGetH2D client init (default: same as remoteip)" << std::endl;
     std::cout << "  --port=N          Server port (default: 18481)" << std::endl;
     std::cout << "  --gpu_id=N        GPU device ID (default: 0)" << std::endl;
     std::cout << "  --verify=Y/N      Verify data (default: Y)" << std::endl;
     std::cout << "  --use_user_stream=Y/N  Use new MGetH2D interface (default: N)" << std::endl;
+    std::cout << "  --enable_local_cache=Y/N  Enable local cache (default: Y)" << std::endl;
+    std::cout << "  --enable_client_direct_rh2d=Y/N  Enable client-direct RH2D (default: N)" << std::endl;
+    std::cout << "  --client_direct_thread_num=N  Client-direct RH2D thread num (default: 32)" << std::endl;
+    std::cout << "  --fast_transport_mem_size=N  Fast transport memory size (default: 2GB)" << std::endl;
+    std::cout << "  --originget=Y/N   Use original Get+cudaMemcpy instead of MGetH2D in kps mode (default: N)" << std::endl;
     std::cout << "  --help, -h        Show this help" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -1088,7 +1262,10 @@ void PrintUsage(const char* prog) {
     std::cout << "  " << prog << " rh2d --count=100 --batch=10 --use_user_stream=Y --remoteip=192.168.1.100 --localip=192.168.1.101" << std::endl;
     std::cout << std::endl;
     std::cout << "  # KPS mode: 1000 ops/sec, 4 threads, 60 seconds" << std::endl;
-    std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --remoteip=192.168.1.100" << std::endl;
+    std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --remoteip=192.168.1.100 --localip=192.168.1.101" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # KPS mode with original Get+H2D (instead of MGetH2D)" << std::endl;
+    std::cout << "  " << prog << " kps --count=100 --batch=10 --kps=1000 --thread=4 --duration=60 --originget=Y --remoteip=192.168.1.100 --localip=192.168.1.101" << std::endl;
 }
 
 struct CmdArgs {
@@ -1107,6 +1284,8 @@ struct CmdArgs {
     int gpu_id = 0;
     bool verify_data = true;
     bool use_user_stream = false;
+    ClientOptions client_options;
+    bool origin_get = false;  // Use original Get + cudaMemcpy instead of MGetH2D
     bool help = false;
 };
 
@@ -1129,18 +1308,26 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             else if (key == "process") args.process_count = std::stoi(value);
             else if (key == "kps") args.kps = std::stod(value);
             else if (key == "duration") args.duration = std::stoi(value);
-            else if (key == "valuesize") args.valuesize_config = value;  // Support new format
+            else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
             else if (key == "remoteip") args.remoteip = value;
             else if (key == "localip") args.localip = value;
             else if (key == "port") args.port = std::stoi(value);
             else if (key == "gpu_id") args.gpu_id = std::stoi(value);
-            else if (key == "verify") {
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                args.verify_data = (value == "y" || value == "yes" || value == "1" || value == "true");
+            else if (key == "verify") args.verify_data = ParseBool(value);
+            else if (key == "use_user_stream") args.use_user_stream = ParseBool(value);
+            else if (key == "enable_local_cache") args.client_options.enable_local_cache = ParseBool(value);
+            else if (key == "enable_client_direct_rh2d") {
+                args.client_options.enable_client_direct_rh2d = ParseBool(value);
             }
-            else if (key == "use_user_stream") {
+            else if (key == "client_direct_thread_num") {
+                args.client_options.client_direct_thread_num = std::stoi(value);
+            }
+            else if (key == "fast_transport_mem_size") {
+                args.client_options.fast_transport_mem_size = std::stoull(value);
+            }
+            else if (key == "originget") {
                 std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                args.use_user_stream = (value == "y" || value == "yes" || value == "1" || value == "true");
+                args.origin_get = (value == "y" || value == "yes" || value == "1" || value == "true");
             }
             continue;
         }
@@ -1155,18 +1342,26 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                 else if (key == "process") args.process_count = std::stoi(value);
                 else if (key == "kps") args.kps = std::stod(value);
                 else if (key == "duration") args.duration = std::stoi(value);
-                else if (key == "valuesize") args.valuesize_config = value;  // Support new format
+                else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
                 else if (key == "remoteip") args.remoteip = value;
                 else if (key == "localip") args.localip = value;
                 else if (key == "port") args.port = std::stoi(value);
                 else if (key == "gpu_id") args.gpu_id = std::stoi(value);
-                else if (key == "verify") {
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    args.verify_data = (value == "y" || value == "yes" || value == "1" || value == "true");
+                else if (key == "verify") args.verify_data = ParseBool(value);
+                else if (key == "use_user_stream") args.use_user_stream = ParseBool(value);
+                else if (key == "enable_local_cache") args.client_options.enable_local_cache = ParseBool(value);
+                else if (key == "enable_client_direct_rh2d") {
+                    args.client_options.enable_client_direct_rh2d = ParseBool(value);
                 }
-                else if (key == "use_user_stream") {
+                else if (key == "client_direct_thread_num") {
+                    args.client_options.client_direct_thread_num = std::stoi(value);
+                }
+                else if (key == "fast_transport_mem_size") {
+                    args.client_options.fast_transport_mem_size = std::stoull(value);
+                }
+                else if (key == "originget") {
                     std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    args.use_user_stream = (value == "y" || value == "yes" || value == "1" || value == "true");
+                    args.origin_get = (value == "y" || value == "yes" || value == "1" || value == "true");
                 }
             }
         } else if (arg[0] != '-') {
@@ -1177,6 +1372,103 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
     }
 
     return args;
+}
+
+#ifndef USE_PIPLN_MOCK
+bool SetCudaDeviceBeforeClientInit(int gpu_id, const std::string& prefix) {
+    cudaError_t err = cudaSetDevice(gpu_id);
+    if (err != cudaSuccess) {
+        std::cerr << prefix << " cudaSetDevice(" << gpu_id << ") failed before KVClient Init: "
+                  << cudaGetErrorString(err) << std::endl;
+        return false;
+    }
+    return true;
+}
+#else
+bool SetCudaDeviceBeforeClientInit(int, const std::string&) {
+    return true;
+}
+#endif
+
+std::shared_ptr<KVClient> CreateClientForHost(const CmdArgs& args, const std::string& host,
+                                              const std::string& name, const std::string& prefix) {
+    if (!SetCudaDeviceBeforeClientInit(args.gpu_id, prefix)) {
+        return nullptr;
+    }
+    ConnectOptions connectOptions;
+    connectOptions.host = host;
+    connectOptions.port = args.port;
+    connectOptions.accessKey = "";
+    connectOptions.secretKey = "";
+    connectOptions.deviceId = std::to_string(args.gpu_id);
+    connectOptions.fastTransportMemSize = args.client_options.fast_transport_mem_size;
+    connectOptions.enableLocalCache = args.client_options.enable_local_cache;
+    connectOptions.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
+    connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
+
+    auto sharedClient = std::make_shared<KVClient>(connectOptions);
+    Status rc = sharedClient->Init();
+    if (rc.IsError()) {
+        std::cerr << prefix << " Failed to init " << name << ": " << rc.GetMsg() << std::endl;
+        return nullptr;
+    }
+    std::cout << prefix << " " << name << " initialized once: " << sharedClient.get() << ", host=" << host
+              << ", port=" << args.port << ", gpu=" << args.gpu_id << std::endl;
+    return sharedClient;
+}
+
+std::shared_ptr<KVClient> CreateSharedClient(const CmdArgs& args) {
+    return CreateClientForHost(args, args.localip, "Shared KVClient", "[Main]");
+}
+
+bool SetAllData(KVClient& client, const std::vector<std::pair<std::string, std::string>>& data,
+                const std::string& prefix) {
+    int set_count = 0;
+    int set_failed = 0;
+    int progress_interval = std::max(1, static_cast<int>(data.size()) / 20);
+    for (const auto& kv : data) {
+        Status rc = client.Set(kv.first, kv.second);
+        if (rc.IsError()) {
+            set_failed++;
+            if (set_failed <= 5) {
+                std::cerr << prefix << " Set failed for key " << kv.first << ": " << rc.GetMsg() << std::endl;
+            }
+        } else {
+            set_count++;
+        }
+        if (set_count % progress_interval == 0 || set_count == static_cast<int>(data.size())) {
+            int progress = data.empty() ? 100 : set_count * 100 / static_cast<int>(data.size());
+            std::cout << prefix << " Set progress: " << std::setw(3) << progress << "% ("
+                      << set_count << "/" << data.size() << ")" << std::endl;
+        }
+    }
+    std::cout << prefix << " Set completed. Success: " << set_count << ", Failed: " << set_failed << std::endl;
+    return set_failed == 0;
+}
+
+bool DeleteAllData(KVClient& client, const std::vector<std::pair<std::string, std::string>>& data,
+                   const std::string& prefix) {
+    int del_count = 0;
+    int del_failed = 0;
+    int progress_interval = std::max(1, static_cast<int>(data.size()) / 20);
+    for (const auto& kv : data) {
+        Status rc = client.Del(kv.first);
+        if (rc.IsError()) {
+            del_failed++;
+            if (del_failed <= 5) {
+                std::cerr << prefix << " Del failed for key " << kv.first << ": " << rc.GetMsg() << std::endl;
+            }
+        } else {
+            del_count++;
+        }
+        if (del_count % progress_interval == 0 || del_count == static_cast<int>(data.size())) {
+            int progress = data.empty() ? 100 : del_count * 100 / static_cast<int>(data.size());
+            std::cout << prefix << " Del progress: " << std::setw(3) << progress << "% ("
+                      << del_count << "/" << data.size() << ")" << std::endl;
+        }
+    }
+    std::cout << prefix << " Del completed. Success: " << del_count << ", Failed: " << del_failed << std::endl;
+    return del_failed == 0;
 }
 
 void PrintLatencyStats(const LatencyStats& stats, const std::string& prefix = "") {
@@ -1289,6 +1581,7 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
     std::cout << "[Main] use_user_stream: " << (args.use_user_stream ? "Yes" : "No") << std::endl;
 
     auto main_start = std::chrono::high_resolution_clock::now();
+    pid_t parent_pid = getpid();
 
     std::vector<pid_t> pids(process_count);
     std::vector<std::string> stat_files(process_count);
@@ -1303,13 +1596,39 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
 
         if (pid == 0) {
             // Child process
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data);
+            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
+                exit(1);
+            }
+            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
+                               args.client_options);
             if (!test.Init()) {
                 exit(1);
             }
 
             int start_idx = pid_idx * keys_per_process;
             int end_idx = start_idx + keys_per_process;
+            std::vector<std::pair<std::string, std::string>> process_data(
+                all_data.begin() + start_idx, all_data.begin() + end_idx);
+
+            std::string prefix = "[P" + std::to_string(pid_idx) + "]";
+            std::shared_ptr<KVClient> remoteClient;
+            KVClient* writeClient = test.GetClient();
+            if (args.remoteip != args.localip) {
+                remoteClient = CreateClientForHost(args, args.remoteip, "Process remote KVClient", prefix);
+                if (remoteClient == nullptr) {
+                    exit(1);
+                }
+                writeClient = remoteClient.get();
+            } else {
+                std::cout << prefix << " Reusing local KVClient for Set/Del because remoteip == localip"
+                          << std::endl;
+            }
+
+            std::cout << prefix << " Setting data through remote KVClient connected to "
+                      << args.remoteip << ":" << args.port << "..." << std::endl;
+            if (!SetAllData(*writeClient, process_data, prefix)) {
+                exit(1);
+            }
             test.SetSharedData(all_data, start_idx, end_idx);
 
             Stats stats;
@@ -1319,8 +1638,14 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
                 test.RunGetBatch(args.batch, stats);
             }
 
+            std::cout << prefix << " Deleting data through remote KVClient connected to "
+                      << args.remoteip << ":" << args.port << "..." << std::endl;
+            if (!DeleteAllData(*writeClient, process_data, prefix)) {
+                exit(1);
+            }
+
             // Write statistics to temp file
-            std::string stat_file = "/tmp/rh2d_stats_" + std::to_string(pid_idx) + ".tmp";
+            std::string stat_file = MakeProcessStatFilePath(parent_pid, pid_idx);
             std::ofstream ofs(stat_file, std::ios::binary);
             if (ofs) {
                 ofs.write(reinterpret_cast<const char*>(&stats.total_time_us), sizeof(double));
@@ -1340,7 +1665,7 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
         } else {
             // Parent process
             pids[pid_idx] = pid;
-            stat_files[pid_idx] = "/tmp/rh2d_stats_" + std::to_string(pid_idx) + ".tmp";
+            stat_files[pid_idx] = MakeProcessStatFilePath(parent_pid, pid_idx);
         }
     }
 
@@ -1355,7 +1680,7 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
 
     // Collect statistics from all processes
     std::vector<Stats> process_stats(process_count);
-	    for (int i = 0; i < process_count; ++i) {
+    for (int i = 0; i < process_count; ++i) {
         std::ifstream ifs(stat_files[i], std::ios::binary);
         if (ifs) {
             ifs.read(reinterpret_cast<char*>(&process_stats[i].total_time_us), sizeof(double));
@@ -1432,8 +1757,12 @@ void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::strin
     std::cout << "=================================================" << std::endl;
 }
 
-void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
+void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
+                    const std::shared_ptr<KVClient>& sharedClient) {
     int keys_per_thread = args.count / args.thread_count;
+    if (sharedClient == nullptr) {
+        return;
+    }
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
@@ -1444,11 +1773,8 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
     auto main_start = std::chrono::high_resolution_clock::now();
 
     for (int tid = 0; tid < args.thread_count; ++tid) {
-        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data);
-            if (!test.Init()) {
-                return;
-            }
+        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier, sharedClient]() {
+            RemoteH2DTest test(sharedClient, tid, args.gpu_id, args.verify_data);
             test.SetBarrier(barrier);
 
             int start_idx = tid * keys_per_thread;
@@ -1530,13 +1856,27 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 }
 
 // KPS mode multi-thread runner
-void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
+void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
+                       const std::shared_ptr<KVClient>& sharedClient) {
     int keys_per_thread = args.count / args.thread_count;
+    if (sharedClient == nullptr) {
+        return;
+    }
+    std::shared_ptr<KVClient> remoteClient = sharedClient;
+    if (args.remoteip != args.localip) {
+        remoteClient = CreateClientForHost(args, args.remoteip, "KPS remote KVClient", "[Main]");
+        if (remoteClient == nullptr) {
+            return;
+        }
+    } else {
+        std::cout << "[Main] Reusing shared KVClient for KPS Set/Del because remoteip == localip" << std::endl;
+    }
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
     std::vector<std::thread> threads;
     KpsOperationStats kps_stats;  // Shared statistics
-    auto rate_limiter = std::make_shared<RateLimiter>(args.kps * 3, static_cast<int>(args.kps * 3));  // token rate = key rate * 3 ops
+    // Rate limiter: rate = kps (keys per second), burst size = kps
+    auto rate_limiter = std::make_shared<RateLimiter>(args.kps, static_cast<int>(args.kps));
 
     std::cout << "[Main] Starting KPS mode with " << args.thread_count << " threads..." << std::endl;
     std::cout << "[Main] Target KPS: " << args.kps << ", Batch size: " << args.batch << std::endl;
@@ -1544,18 +1884,17 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
 
     // Start worker threads
     for (int tid = 0; tid < args.thread_count; ++tid) {
-        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &kps_stats, rate_limiter, barrier]() {
-            RemoteH2DTest test(args.localip, args.port, tid, args.gpu_id, args.verify_data);
-            if (!test.Init()) {
-                return;
-            }
+        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &kps_stats, rate_limiter, barrier,
+                              sharedClient, remoteClient]() {
+            RemoteH2DTest test(sharedClient, tid, args.gpu_id, args.verify_data);
             test.SetBarrier(barrier);
 
             int start_idx = tid * keys_per_thread;
             int end_idx = start_idx + keys_per_thread;
             test.SetSharedData(all_data, start_idx, end_idx);
 
-            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier);
+            test.RunKpsMode(args.batch, args.kps, kps_stats, rate_limiter, barrier, args.use_user_stream,
+                            args.origin_get, args.thread_count, remoteClient);
         });
     }
 
@@ -1569,9 +1908,6 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
     // Statistics printing thread
     std::thread stats_thread([&kps_stats, &args, &main_start]() {
         int64_t last_ops = 0;
-        int64_t last_set_ops = 0;
-        int64_t last_get_ops = 0;
-        int64_t last_del_ops = 0;
         auto last_print_time = main_start;
 
         while (!g_kps_stop.load()) {
@@ -1624,9 +1960,6 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
             std::cout << "===========================================================" << std::endl;
 
             last_ops = current_ops;
-            last_set_ops = current_set_ops;
-            last_get_ops = current_get_ops;
-            last_del_ops = current_del_ops;
             last_print_time = now;
         }
     });
@@ -1694,9 +2027,26 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
         if (pid == 0) {
             // Child process
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data);
+            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
+                exit(1);
+            }
+            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
+                               args.client_options);
             if (!test.Init()) {
                 exit(1);
+            }
+            std::string prefix = "[P" + std::to_string(pid_idx) + "]";
+            std::shared_ptr<KVClient> remoteClient;
+            KVClient* writeClient = test.GetClient();
+            if (args.remoteip != args.localip) {
+                remoteClient = CreateClientForHost(args, args.remoteip, "KPS remote KVClient", prefix);
+                if (remoteClient == nullptr) {
+                    exit(1);
+                }
+                writeClient = remoteClient.get();
+            } else {
+                std::cout << prefix << " Reusing local KVClient for KPS Set/Del because remoteip == localip"
+                          << std::endl;
             }
 
 #ifndef USE_CUDA_MOCK
@@ -1713,12 +2063,25 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
             for (int i = 0; i < keys_per_process; ++i) {
                 max_size = std::max(max_size, all_data[pid_idx * keys_per_process + i].second.size());
             }
+            max_size += 1;
             // Allocate batch_size independent buffers
+            bool prealloc_success = true;
             for (int i = 0; i < args.batch; ++i) {
                 void* dev_ptr = nullptr;
-                if (cudaMalloc(&dev_ptr, max_size) == cudaSuccess) {
+                err = cudaMalloc(&dev_ptr, max_size);
+                if (err == cudaSuccess) {
                     preallocated_ptrs.push_back(dev_ptr);
+                } else {
+                    std::cerr << "[P" << pid_idx << "] cudaMalloc failed for pre-allocated slot " << i
+                              << ": " << cudaGetErrorString(err) << std::endl;
+                    prealloc_success = false;
+                    break;
                 }
+            }
+            if (!prealloc_success || preallocated_ptrs.size() < static_cast<size_t>(args.batch)) {
+                FreeCudaPtrs(preallocated_ptrs);
+                std::cerr << "[P" << pid_idx
+                          << "] CUDA pre-allocation incomplete, fallback to per-batch allocation" << std::endl;
             }
 #endif
 
@@ -1727,7 +2090,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
             // Local rate limiter for this process
             double process_kps = args.kps / process_count;
-            RateLimiter rate_limiter(process_kps * 3, static_cast<int>(process_kps * 3));  // token rate = key rate * 3 ops
+            // Rate limiter: rate = process_kps (keys per second), burst size = process_kps
+            RateLimiter rate_limiter(process_kps, static_cast<int>(process_kps));
 
             std::random_device rd;
             std::mt19937 rng(rd());
@@ -1751,8 +2115,8 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                     break;
                 }
 
-                // Apply rate limiting
-                int64_t wait_us = rate_limiter.Acquire(args.batch * 3);
+                // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
+                int64_t wait_us = rate_limiter.Acquire(args.batch);
                 if (wait_us > 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
                 }
@@ -1770,12 +2134,12 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
 
                 auto set_start = std::chrono::high_resolution_clock::now();
                 std::vector<std::string> setFailedKeys;
-                Status rc;
+                Status setRc;
                 for (size_t i = 0; i < keys.size(); ++i) {
-                    Status s = test.GetClient()->Set(keys[i], values[i]);
+                    Status s = writeClient->Set(keys[i], values[i]);
                     if (s.IsError()) {
                         setFailedKeys.push_back(keys[i]);
-                        rc = s;  // Keep last error
+                        setRc = s;  // Keep last error
                     }
                 }
                 auto set_end = std::chrono::high_resolution_clock::now();
@@ -1783,9 +2147,9 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                 local_stats.AddSetLatency(set_us);
                 local_stats.set_ops += args.batch;
                 local_stats.total_ops += args.batch;
-                if (rc.IsError() || !setFailedKeys.empty()) {
+                if (setRc.IsError() || !setFailedKeys.empty()) {
                     local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] Set failed: " << rc.GetMsg()
+                    std::cerr << "[P" << pid_idx << "] Set failed: " << setRc.GetMsg()
                               << ", failed keys count: " << setFailedKeys.size() << std::endl;
                     if (!setFailedKeys.empty()) {
                         std::cerr << "[P" << pid_idx << "] Set failed keys: ";
@@ -1794,65 +2158,153 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                         }
                         std::cerr << std::endl;
                     }
+                    if (setRc.IsError()) {
+                        continue;
+                    }
                 }
 
-                // ========== Batch MGetH2D ==========
-                std::vector<Blob> devShmChunks;
-                std::vector<std::string> outFailedKeys;
+                // ========== Batch Get (MGetH2D or Get+H2D) ==========
+                if (args.origin_get) {
+                    // Use original Get + cudaMemcpy
+                    std::vector<std::string> values;
+                    auto get_start = std::chrono::high_resolution_clock::now();
+                    Status getRc = test.GetClient()->Get(keys, values);
+                    auto get_end = std::chrono::high_resolution_clock::now();
 
-#ifndef USE_CUDA_MOCK
-                for (int i = 0; i < args.batch; ++i) {
-                    void* ptr = nullptr;
-                    size_t size = all_data[start_idx + start + i].second.size();
-                    if (!preallocated_ptrs.empty()) {
-                        // Use pre-allocated independent buffer for each key
-                        ptr = preallocated_ptrs[i];
+                    double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
+
+                    if (getRc.IsError()) {
+                        local_stats.failed_ops += args.batch;
+                        local_stats.get_ops += args.batch;
+                        local_stats.total_ops += args.batch;
+                        local_stats.AddGetLatency(get_us);
+                        std::cerr << "[P" << pid_idx << "] Get failed: " << getRc.GetMsg() << std::endl;
                     } else {
-                        // Allocate on-the-fly if no pre-allocated buffers
-                        cudaMalloc(&ptr, size);
-                    }
-                    devShmChunks.push_back(Blob{ptr, static_cast<uint64_t>(size)});
-                }
-#endif
+#ifndef USE_CUDA_MOCK
+                        // Perform H2D copy using pre-allocated memory
+                        std::vector<void*> dev_ptrs;
+                        auto h2d_start = std::chrono::high_resolution_clock::now();
 
-                auto rh2d_start = std::chrono::high_resolution_clock::now();
-                rc = test.GetClient()->MGetH2D(keys, devShmChunks, outFailedKeys);
-                auto rh2d_end = std::chrono::high_resolution_clock::now();
-                double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
-                local_stats.AddGetLatency(rh2d_us);
-                local_stats.get_ops += args.batch;
-                local_stats.total_ops += args.batch;
-                if (rc.IsError() || !outFailedKeys.empty()) {
-                    local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] MGetH2D failed: " << rc.GetMsg()
-                              << ", failed keys count: " << outFailedKeys.size() << std::endl;
-                    if (!outFailedKeys.empty()) {
-                        std::cerr << "[P" << pid_idx << "] MGetH2D failed keys: ";
-                        for (const auto& key : outFailedKeys) {
-                            std::cerr << key << " ";
+                        if (preallocated_ptrs.size() >= keys.size()) {
+                            // Use pre-allocated independent buffer for each key
+                            for (size_t i = 0; i < keys.size(); ++i) {
+                                if ((err = cudaMemcpy(preallocated_ptrs[i], values[i].c_str(),
+                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i
+                                              << ": " << cudaGetErrorString(err) << std::endl;
+                                }
+                            }
+                        } else {
+                            // Allocate on-the-fly if no pre-allocated buffers (fallback)
+                            for (size_t i = 0; i < keys.size(); ++i) {
+                                void* dev_ptr = nullptr;
+                                cudaError_t err;
+                                if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMalloc failed for Get+H2D: "
+                                              << cudaGetErrorString(err) << std::endl;
+                                    break;
+                                }
+                                if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
+                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i
+                                              << ": " << cudaGetErrorString(err) << std::endl;
+                                }
+                                dev_ptrs.push_back(dev_ptr);
+                            }
+                            // Free temporary allocations
+                            for (auto ptr : dev_ptrs) {
+                                if (ptr) cudaFree(ptr);
+                            }
                         }
-                        std::cerr << std::endl;
+
+                        auto h2d_end = std::chrono::high_resolution_clock::now();
+                        double h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
+
+                        double total_us = get_us + h2d_us;
+                        local_stats.AddGetLatency(total_us);
+#else
+                        local_stats.AddGetLatency(get_us);
+#endif
+                        local_stats.get_ops += args.batch;
+                        local_stats.total_ops += args.batch;
                     }
-                }
+                } else {
+                    // Use MGetH2D
+                    std::vector<Blob> devShmChunks;
+                    std::vector<std::string> outFailedKeys;
+                    Status getRc;
 
 #ifndef USE_CUDA_MOCK
-                // Free per-batch CUDA memory if not pre-allocated
-                if (preallocated_ptrs.empty()) {
-                    for (auto& chunk : devShmChunks) {
-                        if (chunk.pointer) cudaFree(chunk.pointer);
+                    bool use_preallocated = preallocated_ptrs.size() >= static_cast<size_t>(args.batch);
+                    bool buffers_ready = true;
+                    for (int i = 0; i < args.batch; ++i) {
+                        void* ptr = nullptr;
+                        size_t size = all_data[start_idx + start + i].second.size();
+                        if (use_preallocated) {
+                            // Use pre-allocated independent buffer for each key
+                            ptr = preallocated_ptrs[i];
+                        } else {
+                            // Allocate on-the-fly if no pre-allocated buffers
+                            if ((err = cudaMalloc(&ptr, size)) != cudaSuccess) {
+                                std::cerr << "[P" << pid_idx << "] cudaMalloc failed for MGetH2D slot " << i
+                                          << ": " << cudaGetErrorString(err) << std::endl;
+                                buffers_ready = false;
+                                break;
+                            }
+                        }
+                        devShmChunks.push_back(Blob{ptr, static_cast<uint64_t>(size)});
                     }
-                }
-                // Note: pre-allocated buffers are freed at process exit
+                    if (!buffers_ready) {
+                        for (auto& chunk : devShmChunks) {
+                            if (!use_preallocated && chunk.pointer) {
+                                cudaFree(chunk.pointer);
+                            }
+                        }
+                        local_stats.failed_ops += args.batch;
+                        continue;
+                    }
 #endif
+
+                    auto rh2d_start = std::chrono::high_resolution_clock::now();
+                    getRc = test.GetClient()->MGetH2D(keys, devShmChunks, outFailedKeys);
+                    auto rh2d_end = std::chrono::high_resolution_clock::now();
+                    double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
+                    local_stats.AddGetLatency(rh2d_us);
+                    local_stats.get_ops += args.batch;
+                    local_stats.total_ops += args.batch;
+                    if (getRc.IsError() || !outFailedKeys.empty()) {
+                        local_stats.failed_ops += args.batch;
+                        std::cerr << "[P" << pid_idx << "] MGetH2D failed: " << getRc.GetMsg()
+                                  << ", failed keys count: " << outFailedKeys.size() << std::endl;
+                        if (!outFailedKeys.empty()) {
+                            std::cerr << "[P" << pid_idx << "] MGetH2D failed keys: ";
+                            for (const auto& key : outFailedKeys) {
+                                std::cerr << key << " ";
+                            }
+                            std::cerr << std::endl;
+                        }
+                    }
+
+#ifndef USE_CUDA_MOCK
+                    // Free per-batch CUDA memory if not pre-allocated
+                    if (!use_preallocated) {
+                        for (auto& chunk : devShmChunks) {
+                            if (chunk.pointer) cudaFree(chunk.pointer);
+                        }
+                    }
+                    // Note: pre-allocated buffers are freed at process exit
+#endif
+                }
 
                 // ========== Batch Delete ==========
                 auto del_start = std::chrono::high_resolution_clock::now();
                 std::vector<std::string> delFailedKeys;
+                Status delRc;
                 for (const auto& key : keys) {
-                    Status s = test.GetClient()->Del(key);
+                    Status s = writeClient->Del(key);
                     if (s.IsError()) {
                         delFailedKeys.push_back(key);
-                        rc = s;  // Keep last error
+                        delRc = s;  // Keep last error
                     }
                 }
                 auto del_end = std::chrono::high_resolution_clock::now();
@@ -1860,9 +2312,9 @@ void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::st
                 local_stats.AddDelLatency(del_us);
                 local_stats.del_ops += args.batch;
                 local_stats.total_ops += args.batch;
-                if (rc.IsError() || !delFailedKeys.empty()) {
+                if (delRc.IsError() || !delFailedKeys.empty()) {
                     local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] Del failed: " << rc.GetMsg()
+                    std::cerr << "[P" << pid_idx << "] Del failed: " << delRc.GetMsg()
                               << ", failed keys count: " << delFailedKeys.size() << std::endl;
                     if (!delFailedKeys.empty()) {
                         std::cerr << "[P" << pid_idx << "] Del failed keys: ";
@@ -2083,6 +2535,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (args.thread_count <= 0 || args.process_count < 0) {
+        std::cerr << "Error: thread must be positive and process must be non-negative" << std::endl;
+        return 1;
+    }
+
+    // Determine execution mode
+    int parallel_count = args.process_count > 0 ? args.process_count : args.thread_count;
+    if (parallel_count <= 0) {
+        std::cerr << "Error: parallel count must be positive" << std::endl;
+        return 1;
+    }
+
     // KPS mode specific validation
     if (args.cmd == "kps") {
         if (args.kps <= 0) {
@@ -2097,10 +2561,17 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: count must be >= batch for kps mode" << std::endl;
             return 1;
         }
+        if (args.count < args.batch * parallel_count) {
+            std::cerr << "Error: count must be >= batch * "
+                      << (args.process_count > 0 ? "process" : "thread") << " for kps mode" << std::endl;
+            return 1;
+        }
+        if (args.count % parallel_count != 0) {
+            std::cerr << "Error: count must be divisible by "
+                      << (args.process_count > 0 ? "process" : "thread") << " for kps mode" << std::endl;
+            return 1;
+        }
     }
-
-    // Determine execution mode
-    int parallel_count = args.process_count > 0 ? args.process_count : args.thread_count;
 
     if (args.cmd != "kps") {
         // Original validation for non-kps modes
@@ -2131,6 +2602,20 @@ int main(int argc, char* argv[]) {
               << ", Port: " << args.port << ", GPU: " << args.gpu_id << std::endl;
     std::cout << "[Main] Verify Data: " << (args.verify_data ? "Yes" : "No")
               << ", Use User Stream: " << (args.use_user_stream ? "Yes" : "No") << std::endl;
+    std::cout << "[Main] enable_local_cache: " << (args.client_options.enable_local_cache ? "Yes" : "No")
+              << ", enable_client_direct_rh2d: "
+              << (args.client_options.enable_client_direct_rh2d ? "Yes" : "No")
+              << ", client_direct_thread_num: " << args.client_options.client_direct_thread_num
+              << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size
+              << ", Origin Get: " << (args.origin_get ? "Yes" : "No") << std::endl;
+
+    std::shared_ptr<KVClient> sharedClient;
+    if (args.process_count == 0) {
+        sharedClient = CreateSharedClient(args);
+        if (sharedClient == nullptr) {
+            return 1;
+        }
+    }
 
     // Parse value size configuration
     std::vector<SizeConfig> size_configs;
@@ -2153,6 +2638,12 @@ int main(int argc, char* argv[]) {
     } else {
         // Legacy: single size
         size_configs.push_back({args.value_size, -1});
+    }
+
+    std::string value_size_error;
+    if (!ValidateValueSizeConfigs(size_configs, args.batch, value_size_error)) {
+        std::cerr << "Error: " << value_size_error << std::endl;
+        return 1;
     }
 
     // Print size configuration
@@ -2223,95 +2714,38 @@ int main(int argc, char* argv[]) {
         if (args.process_count > 0) {
             RunKpsMultiProcess(args, all_data);
         } else {
-            RunKpsMultiThread(args, all_data);
+            RunKpsMultiThread(args, all_data, sharedClient);
         }
         return 0;
     }
 
-    // For rh2d/get mode, pre-set data to remote server
-    std::cout << "[Main] Setting data to remote server " << args.remoteip << ":" << args.port << "..." << std::endl;
-    {
-        ConnectOptions connectOptions;
-        connectOptions.host = args.remoteip;
-        connectOptions.port = args.port;
-        connectOptions.accessKey = "";
-        connectOptions.secretKey = "";
-        connectOptions.deviceId = std::to_string(args.gpu_id);
-
-        KVClient remoteClient(connectOptions);
-        Status rc = remoteClient.Init();
-        if (rc.IsError()) {
-            std::cerr << "[Main] Failed to connect to remote server: " << rc.GetMsg() << std::endl;
-            return 1;
-        }
-
-        int set_count = 0;
-        int set_failed = 0;
-        int set_progress_interval = std::max(1, args.count / 20); // Print progress every 5%
-        for (const auto& kv : all_data) {
-            rc = remoteClient.Set(kv.first, kv.second);
-            if (rc.IsError()) {
-                set_failed++;
-                if (set_failed <= 5) {
-                    std::cerr << "[Main] Set failed for key " << kv.first << ": " << rc.GetMsg() << std::endl;
-                }
-            } else {
-                set_count++;
-            }
-            if (set_count % set_progress_interval == 0 || set_count == args.count) {
-                int progress = set_count * 100 / args.count;
-                std::cout << "[Main] Set progress: " << std::setw(3) << progress << "% ("
-                          << set_count << "/" << args.count << ")" << std::endl;
-            }
-        }
-        std::cout << "[Main] Set completed. Success: " << set_count << ", Failed: " << set_failed << std::endl;
-    }
-
-    // Run in either multi-process or multi-thread mode
     if (args.process_count > 0) {
         RunMultiProcess(args, all_data);
-    } else {
-        RunMultiThread(args, all_data);
+        return 0;
     }
 
-    // Delete all keys after test completion
-    std::cout << "[Main] Deleting all keys from remote server..." << std::endl;
-    {
-        ConnectOptions connectOptions;
-        connectOptions.host = args.remoteip;
-        connectOptions.port = args.port;
-        connectOptions.accessKey = "";
-        connectOptions.secretKey = "";
-        connectOptions.deviceId = std::to_string(args.gpu_id);
-
-        KVClient remoteClient(connectOptions);
-        Status rc = remoteClient.Init();
-        if (rc.IsError()) {
-            std::cerr << "[Main] Failed to connect to remote server for deletion: " << rc.GetMsg() << std::endl;
+    std::shared_ptr<KVClient> remoteClient = sharedClient;
+    if (args.remoteip != args.localip) {
+        remoteClient = CreateClientForHost(args, args.remoteip, "Remote KVClient", "[Main]");
+        if (remoteClient == nullptr) {
             return 1;
         }
-
-        int del_count = 0;
-        int del_failed = 0;
-        int del_progress_interval = std::max(1, args.count / 20); // Print progress every 5%
-        for (const auto& kv : all_data) {
-            rc = remoteClient.Del(kv.first);
-            if (rc.IsError()) {
-                del_failed++;
-                if (del_failed <= 5) {
-                    std::cerr << "[Main] Del failed for key " << kv.first << ": " << rc.GetMsg() << std::endl;
-                }
-            } else {
-                del_count++;
-            }
-            if (del_count % del_progress_interval == 0 || del_count == args.count) {
-                int progress = del_count * 100 / args.count;
-                std::cout << "[Main] Del progress: " << std::setw(3) << progress << "% ("
-                          << del_count << "/" << args.count << ")" << std::endl;
-            }
-        }
-        std::cout << "[Main] Del completed. Success: " << del_count << ", Failed: " << del_failed << std::endl;
+    } else {
+        std::cout << "[Main] Reusing shared KVClient for Set/Del because remoteip == localip" << std::endl;
     }
 
+    std::cout << "[Main] Setting data through remote KVClient connected to "
+              << args.remoteip << ":" << args.port << "..." << std::endl;
+    if (!SetAllData(*remoteClient, all_data, "[Main]")) {
+        return 1;
+    }
+
+    RunMultiThread(args, all_data, sharedClient);
+
+    std::cout << "[Main] Deleting data through remote KVClient connected to "
+              << args.remoteip << ":" << args.port << "..." << std::endl;
+    if (!DeleteAllData(*remoteClient, all_data, "[Main]")) {
+        return 1;
+    }
     return 0;
 }
