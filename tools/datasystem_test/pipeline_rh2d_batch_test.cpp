@@ -17,12 +17,8 @@
 #include <atomic>
 #include <random>
 #include <cmath>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <queue>
 #include <deque>
-#include <sys/stat.h> 
-#include <sys/types.h> 
 #include <utility>
 
 #ifdef USE_CUDA_MOCK
@@ -59,35 +55,44 @@ public:
         : rate_(rate), tokens_(burst_size), max_tokens_(burst_size),
           last_time_(std::chrono::steady_clock::now()) {}
 
-    // Try to acquire n tokens, return wait time in microseconds if need to wait
-    int64_t Acquire(int n = 1) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time_).count();
-        last_time_ = now;
-
-        // Add tokens based on elapsed time
-        double new_tokens = (elapsed_us / 1000000.0) * rate_;
-        tokens_ = std::min(max_tokens_, tokens_ + new_tokens);
-
-        if (tokens_ >= n) {
-            tokens_ -= n;
-            return 0;  // No wait needed
-        } else {
-            // Calculate wait time
+    void Acquire(int n = 1) {
+        if (n <= 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        max_tokens_ = std::max(max_tokens_, static_cast<double>(n));
+        while (true) {
+            if (rate_ <= 0) {
+                return;
+            }
+            RefillTokens();
+            if (tokens_ >= n) {
+                tokens_ -= n;
+                return;
+            }
             double deficit = n - tokens_;
-            int64_t wait_us = static_cast<int64_t>(deficit / rate_ * 1000000.0);
-            tokens_ = 0;
-            return wait_us;
+            auto wait_us = static_cast<int64_t>(std::ceil(deficit / rate_ * 1000000.0));
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(std::max<int64_t>(1, wait_us)));
+            lock.lock();
         }
     }
 
     void SetRate(double rate) {
         std::lock_guard<std::mutex> lock(mutex_);
+        RefillTokens();
         rate_ = rate;
     }
 
 private:
+    void RefillTokens() {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time_).count();
+        last_time_ = now;
+        double new_tokens = (elapsed_us / 1000000.0) * rate_;
+        tokens_ = std::min(max_tokens_, tokens_ + new_tokens);
+    }
+
     double rate_;  // tokens per second
     double tokens_;
     double max_tokens_;
@@ -100,10 +105,6 @@ struct SizeConfig {
     size_t size;
     int count;  // -1 means remaining in batch
 };
-
-std::string MakeProcessStatFilePath(pid_t parent_pid, int index) {
-    return "/tmp/rh2d_stats_" + std::to_string(parent_pid) + "_" + std::to_string(index) + ".tmp";
-}
 
 bool ValidateValueSizeConfigs(const std::vector<SizeConfig>& configs, int batch, std::string& error) {
     if (configs.empty()) {
@@ -901,10 +902,7 @@ public:
 
         while (!g_kps_stop.load()) {
             // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
-            int64_t wait_us = rate_limiter->Acquire(batch_size);
-            if (wait_us > 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
-            }
+            rate_limiter->Acquire(batch_size);
 
             // Randomly select starting index for batch
             int start_idx = key_dist(rng);
@@ -1151,7 +1149,7 @@ public:
         TLOG(thread_id_, "KPS mode stopped. Total ops: " << kps_stats.total_ops.load());
     }
 
-    // Get the underlying client pointer (for multi-process KPS mode)
+    // Get the underlying client pointer
     KVClient* GetClient() { return client_.get(); }
 
 private:
@@ -1232,7 +1230,6 @@ void PrintUsage(const char* prog) {
     std::cout << "  --count=N         Total keys (default: 100)" << std::endl;
     std::cout << "  --batch=N         Keys per batch (default: 10)" << std::endl;
     std::cout << "  --thread=N        Threads (default: 1)" << std::endl;
-    std::cout << "  --process=N       Processes (default: 0, 0=multi-thread)" << std::endl;
     std::cout << "  --kps=N           Target KPS (keys per second) for kps mode (default: 0)" << std::endl;
     std::cout << "  --duration=N      Duration in seconds for kps mode (default: 60)" << std::endl;
     std::cout << "  --valuesize=CFG   Value size config (default: 8388608)" << std::endl;
@@ -1273,7 +1270,6 @@ struct CmdArgs {
     int count = 100;
     int batch = 10;
     int thread_count = 1;
-    int process_count = 0;
     double kps = 0;  // Target keys per second for kps mode
     int duration = 60;  // Duration in seconds for kps mode
     std::string valuesize_config;  // Format: "size1:num1,size2:num2,size3"
@@ -1305,7 +1301,6 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             if (key == "count") args.count = std::stoi(value);
             else if (key == "batch") args.batch = std::stoi(value);
             else if (key == "thread") args.thread_count = std::stoi(value);
-            else if (key == "process") args.process_count = std::stoi(value);
             else if (key == "kps") args.kps = std::stod(value);
             else if (key == "duration") args.duration = std::stoi(value);
             else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
@@ -1339,7 +1334,6 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                 if (key == "count") args.count = std::stoi(value);
                 else if (key == "batch") args.batch = std::stoi(value);
                 else if (key == "thread") args.thread_count = std::stoi(value);
-                else if (key == "process") args.process_count = std::stoi(value);
                 else if (key == "kps") args.kps = std::stod(value);
                 else if (key == "duration") args.duration = std::stoi(value);
                 else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
@@ -1557,204 +1551,6 @@ void PrintKpsStats(const KpsOperationStats& stats, double interval_s, const std:
         std::cout << "N/A";
     }
     std::cout << std::endl;
-}
-
-// Shared memory structure for multi-process statistics
-struct SharedStats {
-    double total_time_us;
-    double get_time_us;
-    double h2d_time_us;
-    int batch_count;
-    int key_count;
-    int process_id;
-    // For percentile calculation, we'll use a file-based approach
-    static constexpr size_t MAX_LATENCIES = 100000;
-    size_t latency_count;
-    double latencies[MAX_LATENCIES];
-};
-
-void RunMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
-    int process_count = args.process_count;
-    int keys_per_process = args.count / process_count;
-
-    std::cout << "[Main] Starting " << process_count << " processes..." << std::endl;
-    std::cout << "[Main] use_user_stream: " << (args.use_user_stream ? "Yes" : "No") << std::endl;
-
-    auto main_start = std::chrono::high_resolution_clock::now();
-    pid_t parent_pid = getpid();
-
-    std::vector<pid_t> pids(process_count);
-    std::vector<std::string> stat_files(process_count);
-
-    for (int pid_idx = 0; pid_idx < process_count; ++pid_idx) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            std::cerr << "Fork failed for process " << pid_idx << std::endl;
-            continue;
-        }
-
-        if (pid == 0) {
-            // Child process
-            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
-                exit(1);
-            }
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
-                               args.client_options);
-            if (!test.Init()) {
-                exit(1);
-            }
-
-            int start_idx = pid_idx * keys_per_process;
-            int end_idx = start_idx + keys_per_process;
-            std::vector<std::pair<std::string, std::string>> process_data(
-                all_data.begin() + start_idx, all_data.begin() + end_idx);
-
-            std::string prefix = "[P" + std::to_string(pid_idx) + "]";
-            std::shared_ptr<KVClient> remoteClient;
-            KVClient* writeClient = test.GetClient();
-            if (args.remoteip != args.localip) {
-                remoteClient = CreateClientForHost(args, args.remoteip, "Process remote KVClient", prefix);
-                if (remoteClient == nullptr) {
-                    exit(1);
-                }
-                writeClient = remoteClient.get();
-            } else {
-                std::cout << prefix << " Reusing local KVClient for Set/Del because remoteip == localip"
-                          << std::endl;
-            }
-
-            std::cout << prefix << " Setting data through remote KVClient connected to "
-                      << args.remoteip << ":" << args.port << "..." << std::endl;
-            if (!SetAllData(*writeClient, process_data, prefix)) {
-                exit(1);
-            }
-            test.SetSharedData(all_data, start_idx, end_idx);
-
-            Stats stats;
-            if (args.cmd == "rh2d") {
-                test.RunRh2DBatch(args.batch, stats, args.use_user_stream);
-            } else if (args.cmd == "get") {
-                test.RunGetBatch(args.batch, stats);
-            }
-
-            std::cout << prefix << " Deleting data through remote KVClient connected to "
-                      << args.remoteip << ":" << args.port << "..." << std::endl;
-            if (!DeleteAllData(*writeClient, process_data, prefix)) {
-                exit(1);
-            }
-
-            // Write statistics to temp file
-            std::string stat_file = MakeProcessStatFilePath(parent_pid, pid_idx);
-            std::ofstream ofs(stat_file, std::ios::binary);
-            if (ofs) {
-                ofs.write(reinterpret_cast<const char*>(&stats.total_time_us), sizeof(double));
-                ofs.write(reinterpret_cast<const char*>(&stats.get_time_us), sizeof(double));
-                ofs.write(reinterpret_cast<const char*>(&stats.h2d_time_us), sizeof(double));
-                ofs.write(reinterpret_cast<const char*>(&stats.batch_count), sizeof(int));
-                ofs.write(reinterpret_cast<const char*>(&stats.key_count), sizeof(int));
-                size_t latency_count = stats.latency_stats.latencies_us.size();
-                ofs.write(reinterpret_cast<const char*>(&latency_count), sizeof(size_t));
-                for (const auto& lat : stats.latency_stats.latencies_us) {
-                    ofs.write(reinterpret_cast<const char*>(&lat), sizeof(double));
-                }
-                ofs.close();
-            }
-
-            exit(0);
-        } else {
-            // Parent process
-            pids[pid_idx] = pid;
-            stat_files[pid_idx] = MakeProcessStatFilePath(parent_pid, pid_idx);
-        }
-    }
-
-    // Wait for all processes
-    for (int i = 0; i < process_count; ++i) {
-        int status;
-        waitpid(pids[i], &status, 0);
-    }
-
-    auto main_end = std::chrono::high_resolution_clock::now();
-    double total_time_s = std::chrono::duration_cast<std::chrono::microseconds>(main_end - main_start).count() / 1000000.0;
-
-    // Collect statistics from all processes
-    std::vector<Stats> process_stats(process_count);
-    for (int i = 0; i < process_count; ++i) {
-        std::ifstream ifs(stat_files[i], std::ios::binary);
-        if (ifs) {
-            ifs.read(reinterpret_cast<char*>(&process_stats[i].total_time_us), sizeof(double));
-            ifs.read(reinterpret_cast<char*>(&process_stats[i].get_time_us), sizeof(double));
-            ifs.read(reinterpret_cast<char*>(&process_stats[i].h2d_time_us), sizeof(double));
-            ifs.read(reinterpret_cast<char*>(&process_stats[i].batch_count), sizeof(int));
-            ifs.read(reinterpret_cast<char*>(&process_stats[i].key_count), sizeof(int));
-            size_t latency_count;
-            ifs.read(reinterpret_cast<char*>(&latency_count), sizeof(size_t));
-            process_stats[i].latency_stats.latencies_us.resize(latency_count);
-            for (size_t j = 0; j < latency_count; ++j) {
-                ifs.read(reinterpret_cast<char*>(&process_stats[i].latency_stats.latencies_us[j]), sizeof(double));
-            }
-            ifs.close();
-            unlink(stat_files[i].c_str());
-        }
-    }
-
-    // Print summary
-    std::cout << std::endl;
-    std::cout << "==================== Summary ====================" << std::endl;
-    std::cout << "Total keys: " << args.count << std::endl;
-    std::cout << "Batch size: " << args.batch << std::endl;
-    std::cout << "Processes: " << process_count << std::endl;
-    std::cout << "Verify data: " << (args.verify_data ? "Yes" : "No") << std::endl;
-    std::cout << "Total time: " << total_time_s << " s" << std::endl;
-    std::cout << std::endl;
-
-    // Aggregate all latencies for overall statistics
-    LatencyStats overall_stats;
-    double sum_get_time_us = 0;
-    double sum_h2d_time_us = 0;
-
-    for (int pid = 0; pid < process_count; ++pid) {
-        const auto& s = process_stats[pid];
-        for (const auto& lat : s.latency_stats.latencies_us) {
-            overall_stats.latencies_us.push_back(lat);
-        }
-        overall_stats.total_time_us += s.total_time_us;
-        overall_stats.batch_count += s.batch_count;
-        overall_stats.key_count += s.key_count;
-
-        if (args.cmd == "get") {
-            sum_get_time_us += s.get_time_us;
-            sum_h2d_time_us += s.h2d_time_us;
-        }
-
-        std::cout << "[P" << pid << "] Keys: " << s.key_count
-                  << ", Batches: " << s.batch_count << std::endl;
-        PrintLatencyStats(s.latency_stats, "[P" + std::to_string(pid) + "] ");
-        if (args.cmd == "get") {
-            double avg_get_us = s.batch_count > 0 ? s.get_time_us / s.batch_count : 0;
-            double avg_h2d_us = s.batch_count > 0 ? s.h2d_time_us / s.batch_count : 0;
-            std::cout << "[P" << pid << "] Avg Get Time: " << std::fixed << std::setprecision(2)
-                      << (avg_get_us/1000.0) << " ms" << std::endl;
-            std::cout << "[P" << pid << "] Avg H2D Time: " << std::fixed << std::setprecision(2)
-                      << (avg_h2d_us/1000.0) << " ms" << std::endl;
-        }
-        std::cout << std::endl;
-    }
-
-    std::cout << "==================== Overall ====================" << std::endl;
-    PrintLatencyStats(overall_stats, "");
-
-    double overall_qps = overall_stats.total_time_us > 0 ? (overall_stats.key_count * 1000000.0 / overall_stats.total_time_us) : 0;
-    std::cout << "Overall QPS: " << std::fixed << std::setprecision(1) << overall_qps << " keys/s" << std::endl;
-
-    if (args.cmd == "get") {
-        std::cout << "Overall Avg Get Time: " << std::fixed << std::setprecision(2)
-                  << (sum_get_time_us / process_count / 1000.0) << " ms" << std::endl;
-        std::cout << "Overall Avg H2D Time: " << std::fixed << std::setprecision(2)
-                  << (sum_h2d_time_us / process_count / 1000.0) << " ms" << std::endl;
-    }
-    std::cout << "=================================================" << std::endl;
 }
 
 void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
@@ -1993,513 +1789,6 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
     std::cout << "=======================================================" << std::endl;
 }
 
-// KPS mode multi-process runner
-void RunKpsMultiProcess(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data) {
-    int process_count = args.process_count;
-    int keys_per_process = args.count / process_count;
-
-    std::cout << "[Main] Starting KPS mode with " << process_count << " processes..." << std::endl;
-    std::cout << "[Main] Target KPS: " << args.kps << ", Batch size: " << args.batch << std::endl;
-    std::cout << "[Main] Duration: " << args.duration << " seconds" << std::endl;
-
-    // Create a shared memory region for inter-process communication
-    // Using file-based approach for simplicity
-    std::string stop_file = "/tmp/rh2d_kps_stop_" + std::to_string(getpid()) + ".tmp";
-    std::string running_file = "/tmp/rh2d_kps_running_" + std::to_string(getpid()) + ".tmp";
-    std::string stats_dir = "/tmp/rh2d_kps_stats_" + std::to_string(getpid());
-    mkdir(stats_dir.c_str(), 0755);
-
-    // Reset stop signal
-    std::ofstream(stop_file).close();
-    std::ofstream(running_file) << "1" << std::endl;
-
-    std::vector<pid_t> pids(process_count);
-
-    auto main_start = std::chrono::steady_clock::now();
-
-    for (int pid_idx = 0; pid_idx < process_count; ++pid_idx) {
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            std::cerr << "Fork failed for process " << pid_idx << std::endl;
-            continue;
-        }
-
-        if (pid == 0) {
-            // Child process
-            if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[P" + std::to_string(pid_idx) + "]")) {
-                exit(1);
-            }
-            RemoteH2DTest test(args.localip, args.port, pid_idx, args.gpu_id, args.verify_data,
-                               args.client_options);
-            if (!test.Init()) {
-                exit(1);
-            }
-            std::string prefix = "[P" + std::to_string(pid_idx) + "]";
-            std::shared_ptr<KVClient> remoteClient;
-            KVClient* writeClient = test.GetClient();
-            if (args.remoteip != args.localip) {
-                remoteClient = CreateClientForHost(args, args.remoteip, "KPS remote KVClient", prefix);
-                if (remoteClient == nullptr) {
-                    exit(1);
-                }
-                writeClient = remoteClient.get();
-            } else {
-                std::cout << prefix << " Reusing local KVClient for KPS Set/Del because remoteip == localip"
-                          << std::endl;
-            }
-
-#ifndef USE_CUDA_MOCK
-            cudaError_t err;
-            if ((err = cudaSetDevice(args.gpu_id)) != cudaSuccess) {
-                std::cerr << "[P" << pid_idx << "] cudaSetDevice failed: " << cudaGetErrorString(err) << std::endl;
-                exit(1);
-            }
-
-            // Pre-allocate CUDA memory for H2D operations
-            // Each batch element needs independent memory to avoid data corruption
-            std::vector<void*> preallocated_ptrs;
-            size_t max_size = 0;
-            for (int i = 0; i < keys_per_process; ++i) {
-                max_size = std::max(max_size, all_data[pid_idx * keys_per_process + i].second.size());
-            }
-            max_size += 1;
-            // Allocate batch_size independent buffers
-            bool prealloc_success = true;
-            for (int i = 0; i < args.batch; ++i) {
-                void* dev_ptr = nullptr;
-                err = cudaMalloc(&dev_ptr, max_size);
-                if (err == cudaSuccess) {
-                    preallocated_ptrs.push_back(dev_ptr);
-                } else {
-                    std::cerr << "[P" << pid_idx << "] cudaMalloc failed for pre-allocated slot " << i
-                              << ": " << cudaGetErrorString(err) << std::endl;
-                    prealloc_success = false;
-                    break;
-                }
-            }
-            if (!prealloc_success || preallocated_ptrs.size() < static_cast<size_t>(args.batch)) {
-                FreeCudaPtrs(preallocated_ptrs);
-                std::cerr << "[P" << pid_idx
-                          << "] CUDA pre-allocation incomplete, fallback to per-batch allocation" << std::endl;
-            }
-#endif
-
-            int start_idx = pid_idx * keys_per_process;
-            int end_idx = start_idx + keys_per_process;
-
-            // Local rate limiter for this process
-            double process_kps = args.kps / process_count;
-            // Rate limiter: rate = process_kps (keys per second), burst size = process_kps
-            RateLimiter rate_limiter(process_kps, static_cast<int>(process_kps));
-
-            std::random_device rd;
-            std::mt19937 rng(rd());
-            int total_keys = end_idx - start_idx;
-            std::uniform_int_distribution<int> key_dist(0, total_keys - args.batch);
-
-            // Wait for running signal
-            while (!std::ifstream(running_file).good()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-
-            KpsOperationStats local_stats;
-            auto last_report = std::chrono::steady_clock::now();
-
-            while (true) {
-                // Check stop signal
-                std::ifstream stop_ifs(stop_file);
-                std::string stop_content;
-                std::getline(stop_ifs, stop_content);
-                if (stop_content == "stop") {
-                    break;
-                }
-
-                // Apply rate limiting (rate is in keys/sec, so acquire batch_size tokens)
-                int64_t wait_us = rate_limiter.Acquire(args.batch);
-                if (wait_us > 0) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
-                }
-
-                // Randomly select starting index for batch
-                int start = key_dist(rng);
-
-                // ========== Batch Set ==========
-                std::vector<std::string> keys;
-                std::vector<std::string> values;
-                for (int i = 0; i < args.batch; ++i) {
-                    keys.push_back(all_data[start_idx + start + i].first);
-                    values.push_back(all_data[start_idx + start + i].second);
-                }
-
-                auto set_start = std::chrono::high_resolution_clock::now();
-                std::vector<std::string> setFailedKeys;
-                Status setRc;
-                for (size_t i = 0; i < keys.size(); ++i) {
-                    Status s = writeClient->Set(keys[i], values[i]);
-                    if (s.IsError()) {
-                        setFailedKeys.push_back(keys[i]);
-                        setRc = s;  // Keep last error
-                    }
-                }
-                auto set_end = std::chrono::high_resolution_clock::now();
-                double set_us = std::chrono::duration_cast<std::chrono::microseconds>(set_end - set_start).count();
-                local_stats.AddSetLatency(set_us);
-                local_stats.set_ops += args.batch;
-                local_stats.total_ops += args.batch;
-                if (setRc.IsError() || !setFailedKeys.empty()) {
-                    local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] Set failed: " << setRc.GetMsg()
-                              << ", failed keys count: " << setFailedKeys.size() << std::endl;
-                    if (!setFailedKeys.empty()) {
-                        std::cerr << "[P" << pid_idx << "] Set failed keys: ";
-                        for (const auto& key : setFailedKeys) {
-                            std::cerr << key << " ";
-                        }
-                        std::cerr << std::endl;
-                    }
-                    if (setRc.IsError()) {
-                        continue;
-                    }
-                }
-
-                // ========== Batch Get (MGetH2D or Get+H2D) ==========
-                if (args.origin_get) {
-                    // Use original Get + cudaMemcpy
-                    std::vector<std::string> values;
-                    auto get_start = std::chrono::high_resolution_clock::now();
-                    Status getRc = test.GetClient()->Get(keys, values);
-                    auto get_end = std::chrono::high_resolution_clock::now();
-
-                    double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
-
-                    if (getRc.IsError()) {
-                        local_stats.failed_ops += args.batch;
-                        local_stats.get_ops += args.batch;
-                        local_stats.total_ops += args.batch;
-                        local_stats.AddGetLatency(get_us);
-                        std::cerr << "[P" << pid_idx << "] Get failed: " << getRc.GetMsg() << std::endl;
-                    } else {
-#ifndef USE_CUDA_MOCK
-                        // Perform H2D copy using pre-allocated memory
-                        std::vector<void*> dev_ptrs;
-                        auto h2d_start = std::chrono::high_resolution_clock::now();
-
-                        if (preallocated_ptrs.size() >= keys.size()) {
-                            // Use pre-allocated independent buffer for each key
-                            for (size_t i = 0; i < keys.size(); ++i) {
-                                if ((err = cudaMemcpy(preallocated_ptrs[i], values[i].c_str(),
-                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
-                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i
-                                              << ": " << cudaGetErrorString(err) << std::endl;
-                                }
-                            }
-                        } else {
-                            // Allocate on-the-fly if no pre-allocated buffers (fallback)
-                            for (size_t i = 0; i < keys.size(); ++i) {
-                                void* dev_ptr = nullptr;
-                                cudaError_t err;
-                                if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
-                                    std::cerr << "[P" << pid_idx << "] cudaMalloc failed for Get+H2D: "
-                                              << cudaGetErrorString(err) << std::endl;
-                                    break;
-                                }
-                                if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
-                                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
-                                    std::cerr << "[P" << pid_idx << "] cudaMemcpy failed for key " << i
-                                              << ": " << cudaGetErrorString(err) << std::endl;
-                                }
-                                dev_ptrs.push_back(dev_ptr);
-                            }
-                            // Free temporary allocations
-                            for (auto ptr : dev_ptrs) {
-                                if (ptr) cudaFree(ptr);
-                            }
-                        }
-
-                        auto h2d_end = std::chrono::high_resolution_clock::now();
-                        double h2d_us = std::chrono::duration_cast<std::chrono::microseconds>(h2d_end - h2d_start).count();
-
-                        double total_us = get_us + h2d_us;
-                        local_stats.AddGetLatency(total_us);
-#else
-                        local_stats.AddGetLatency(get_us);
-#endif
-                        local_stats.get_ops += args.batch;
-                        local_stats.total_ops += args.batch;
-                    }
-                } else {
-                    // Use MGetH2D
-                    std::vector<Blob> devShmChunks;
-                    std::vector<std::string> outFailedKeys;
-                    Status getRc;
-
-#ifndef USE_CUDA_MOCK
-                    bool use_preallocated = preallocated_ptrs.size() >= static_cast<size_t>(args.batch);
-                    bool buffers_ready = true;
-                    for (int i = 0; i < args.batch; ++i) {
-                        void* ptr = nullptr;
-                        size_t size = all_data[start_idx + start + i].second.size();
-                        if (use_preallocated) {
-                            // Use pre-allocated independent buffer for each key
-                            ptr = preallocated_ptrs[i];
-                        } else {
-                            // Allocate on-the-fly if no pre-allocated buffers
-                            if ((err = cudaMalloc(&ptr, size)) != cudaSuccess) {
-                                std::cerr << "[P" << pid_idx << "] cudaMalloc failed for MGetH2D slot " << i
-                                          << ": " << cudaGetErrorString(err) << std::endl;
-                                buffers_ready = false;
-                                break;
-                            }
-                        }
-                        devShmChunks.push_back(Blob{ptr, static_cast<uint64_t>(size)});
-                    }
-                    if (!buffers_ready) {
-                        for (auto& chunk : devShmChunks) {
-                            if (!use_preallocated && chunk.pointer) {
-                                cudaFree(chunk.pointer);
-                            }
-                        }
-                        local_stats.failed_ops += args.batch;
-                        continue;
-                    }
-#endif
-
-                    auto rh2d_start = std::chrono::high_resolution_clock::now();
-                    getRc = test.GetClient()->MGetH2D(keys, devShmChunks, outFailedKeys);
-                    auto rh2d_end = std::chrono::high_resolution_clock::now();
-                    double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
-                    local_stats.AddGetLatency(rh2d_us);
-                    local_stats.get_ops += args.batch;
-                    local_stats.total_ops += args.batch;
-                    if (getRc.IsError() || !outFailedKeys.empty()) {
-                        local_stats.failed_ops += args.batch;
-                        std::cerr << "[P" << pid_idx << "] MGetH2D failed: " << getRc.GetMsg()
-                                  << ", failed keys count: " << outFailedKeys.size() << std::endl;
-                        if (!outFailedKeys.empty()) {
-                            std::cerr << "[P" << pid_idx << "] MGetH2D failed keys: ";
-                            for (const auto& key : outFailedKeys) {
-                                std::cerr << key << " ";
-                            }
-                            std::cerr << std::endl;
-                        }
-                    }
-
-#ifndef USE_CUDA_MOCK
-                    // Free per-batch CUDA memory if not pre-allocated
-                    if (!use_preallocated) {
-                        for (auto& chunk : devShmChunks) {
-                            if (chunk.pointer) cudaFree(chunk.pointer);
-                        }
-                    }
-                    // Note: pre-allocated buffers are freed at process exit
-#endif
-                }
-
-                // ========== Batch Delete ==========
-                auto del_start = std::chrono::high_resolution_clock::now();
-                std::vector<std::string> delFailedKeys;
-                Status delRc;
-                for (const auto& key : keys) {
-                    Status s = writeClient->Del(key);
-                    if (s.IsError()) {
-                        delFailedKeys.push_back(key);
-                        delRc = s;  // Keep last error
-                    }
-                }
-                auto del_end = std::chrono::high_resolution_clock::now();
-                double del_us = std::chrono::duration_cast<std::chrono::microseconds>(del_end - del_start).count();
-                local_stats.AddDelLatency(del_us);
-                local_stats.del_ops += args.batch;
-                local_stats.total_ops += args.batch;
-                if (delRc.IsError() || !delFailedKeys.empty()) {
-                    local_stats.failed_ops += args.batch;
-                    std::cerr << "[P" << pid_idx << "] Del failed: " << delRc.GetMsg()
-                              << ", failed keys count: " << delFailedKeys.size() << std::endl;
-                    if (!delFailedKeys.empty()) {
-                        std::cerr << "[P" << pid_idx << "] Del failed keys: ";
-                        for (const auto& key : delFailedKeys) {
-                            std::cerr << key << " ";
-                        }
-                        std::cerr << std::endl;
-                    }
-                }
-
-                // Report stats periodically
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 5) {
-                    std::string stats_file = stats_dir + "/stats_" + std::to_string(pid_idx) + ".tmp";
-                    std::ofstream ofs(stats_file, std::ios::trunc);
-                    if (ofs) {
-                        ofs << local_stats.total_ops.load() << "\n";
-                        ofs << local_stats.set_ops.load() << "\n";
-                        ofs << local_stats.get_ops.load() << "\n";
-                        ofs << local_stats.del_ops.load() << "\n";
-                        ofs << local_stats.failed_ops.load() << "\n";
-                        ofs.close();
-                    }
-                    last_report = now;
-                }
-            }
-
-#ifndef USE_CUDA_MOCK
-            // Free pre-allocated CUDA memory
-            for (auto ptr : preallocated_ptrs) {
-                if (ptr) cudaFree(ptr);
-            }
-#endif
-
-            // Write final stats
-            std::string final_file = stats_dir + "/final_" + std::to_string(pid_idx) + ".tmp";
-            std::ofstream ofs(final_file);
-            if (ofs) {
-                ofs << local_stats.total_ops.load() << "\n";
-                ofs << local_stats.set_ops.load() << "\n";
-                ofs << local_stats.get_ops.load() << "\n";
-                ofs << local_stats.del_ops.load() << "\n";
-                ofs << local_stats.failed_ops.load() << "\n";
-                // Write latencies
-                std::vector<double> set_lats = local_stats.GetSetLatencies();
-                std::vector<double> get_lats = local_stats.GetGetLatencies();
-                std::vector<double> del_lats = local_stats.GetDelLatencies();
-                ofs << set_lats.size() << "\n";
-                for (const auto& lat : set_lats) ofs << lat << "\n";
-                ofs << get_lats.size() << "\n";
-                for (const auto& lat : get_lats) ofs << lat << "\n";
-                ofs << del_lats.size() << "\n";
-                for (const auto& lat : del_lats) ofs << lat << "\n";
-                ofs.close();
-            }
-
-            exit(0);
-        } else {
-            pids[pid_idx] = pid;
-        }
-    }
-
-    // Wait for all processes to be ready
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // Statistics printing loop in parent
-    int64_t last_ops = 0;
-    auto last_print_time = main_start;
-
-    for (int sec = 0; sec < args.duration; sec += 5) {
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-
-        auto now = std::chrono::steady_clock::now();
-        double interval_s = std::chrono::duration_cast<std::chrono::microseconds>(now - last_print_time).count() / 1000000.0;
-        double total_s = std::chrono::duration_cast<std::chrono::microseconds>(now - main_start).count() / 1000000.0;
-
-        // Collect stats from all processes
-        int64_t current_ops = 0;
-        int64_t current_set_ops = 0;
-        int64_t current_get_ops = 0;
-        int64_t current_del_ops = 0;
-
-        for (int pid_idx = 0; pid_idx < process_count; ++pid_idx) {
-            std::string stats_file = stats_dir + "/stats_" + std::to_string(pid_idx) + ".tmp";
-            std::ifstream ifs(stats_file);
-            if (ifs) {
-                int64_t ops, set_ops, get_ops, del_ops, failed_ops;
-                ifs >> ops >> set_ops >> get_ops >> del_ops >> failed_ops;
-                current_ops += ops;
-                current_set_ops += set_ops;
-                current_get_ops += get_ops;
-                current_del_ops += del_ops;
-                ifs.close();
-            }
-        }
-
-        int64_t interval_ops = current_ops - last_ops;
-        double interval_kps = interval_ops / interval_s;
-
-        std::cout << std::endl;
-        std::cout << "=================== [" << std::fixed << std::setprecision(1) << total_s << "s] ===================" << std::endl;
-        std::cout << "[Stats] Interval KPS: " << std::fixed << std::setprecision(1) << interval_kps << " ops/s" << std::endl;
-        std::cout << "[Stats] Total ops: " << current_ops << " (set: " << current_set_ops
-                  << ", get: " << current_get_ops << ", del: " << current_del_ops << ")" << std::endl;
-        std::cout << "===========================================================" << std::endl;
-
-        last_ops = current_ops;
-        last_print_time = now;
-    }
-
-    // Stop all processes
-    std::ofstream stop_ofs(stop_file);
-    stop_ofs << "stop" << std::endl;
-    stop_ofs.close();
-
-    // Wait for all processes
-    for (int i = 0; i < process_count; ++i) {
-        int status;
-        waitpid(pids[i], &status, 0);
-    }
-
-    auto main_end = std::chrono::steady_clock::now();
-    double total_time_s = std::chrono::duration_cast<std::chrono::microseconds>(main_end - main_start).count() / 1000000.0;
-
-    // Collect final stats
-    KpsOperationStats final_stats;
-    for (int pid_idx = 0; pid_idx < process_count; ++pid_idx) {
-        std::string final_file = stats_dir + "/final_" + std::to_string(pid_idx) + ".tmp";
-        std::ifstream ifs(final_file);
-        if (ifs) {
-            int64_t ops, set_ops, get_ops, del_ops, failed_ops;
-            ifs >> ops >> set_ops >> get_ops >> del_ops >> failed_ops;
-            final_stats.total_ops += ops;
-            final_stats.set_ops += set_ops;
-            final_stats.get_ops += get_ops;
-            final_stats.del_ops += del_ops;
-            final_stats.failed_ops += failed_ops;
-
-            // Read latencies
-            size_t count;
-            double lat;
-
-            ifs >> count;
-            for (size_t i = 0; i < count; ++i) {
-                ifs >> lat;
-                final_stats.AddSetLatency(lat);
-            }
-            ifs >> count;
-            for (size_t i = 0; i < count; ++i) {
-                ifs >> lat;
-                final_stats.AddGetLatency(lat);
-            }
-            ifs >> count;
-            for (size_t i = 0; i < count; ++i) {
-                ifs >> lat;
-                final_stats.AddDelLatency(lat);
-            }
-            ifs.close();
-        }
-    }
-
-    // Print final summary
-    std::cout << std::endl;
-    std::cout << "==================== Final Summary ====================" << std::endl;
-    std::cout << "Target KPS: " << args.kps << std::endl;
-    std::cout << "Duration: " << total_time_s << " s" << std::endl;
-    std::cout << "Processes: " << process_count << std::endl;
-    std::cout << "Batch size: " << args.batch << std::endl;
-    std::cout << std::endl;
-
-    PrintKpsStats(final_stats, total_time_s, "");
-    std::cout << "=======================================================" << std::endl;
-
-    // Cleanup
-    unlink(stop_file.c_str());
-    unlink(running_file.c_str());
-    for (int pid_idx = 0; pid_idx < process_count; ++pid_idx) {
-        std::string stats_file = stats_dir + "/stats_" + std::to_string(pid_idx) + ".tmp";
-        std::string final_file = stats_dir + "/final_" + std::to_string(pid_idx) + ".tmp";
-        unlink(stats_file.c_str());
-        unlink(final_file.c_str());
-    }
-    rmdir(stats_dir.c_str());
-}
-
 int main(int argc, char* argv[]) {
     CmdArgs args = ParseArgs(argc, argv);
 
@@ -2535,13 +1824,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (args.thread_count <= 0 || args.process_count < 0) {
-        std::cerr << "Error: thread must be positive and process must be non-negative" << std::endl;
+    if (args.thread_count <= 0) {
+        std::cerr << "Error: thread must be positive" << std::endl;
         return 1;
     }
 
-    // Determine execution mode
-    int parallel_count = args.process_count > 0 ? args.process_count : args.thread_count;
+    int parallel_count = args.thread_count;
     if (parallel_count <= 0) {
         std::cerr << "Error: parallel count must be positive" << std::endl;
         return 1;
@@ -2562,13 +1850,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         if (args.count < args.batch * parallel_count) {
-            std::cerr << "Error: count must be >= batch * "
-                      << (args.process_count > 0 ? "process" : "thread") << " for kps mode" << std::endl;
+            std::cerr << "Error: count must be >= batch * thread for kps mode" << std::endl;
             return 1;
         }
         if (args.count % parallel_count != 0) {
-            std::cerr << "Error: count must be divisible by "
-                      << (args.process_count > 0 ? "process" : "thread") << " for kps mode" << std::endl;
+            std::cerr << "Error: count must be divisible by thread for kps mode" << std::endl;
             return 1;
         }
     }
@@ -2581,20 +1867,20 @@ int main(int argc, char* argv[]) {
         }
 
         if (args.count % parallel_count != 0) {
-            std::cerr << "Error: count must be divisible by " << (args.process_count > 0 ? "process" : "thread") << std::endl;
+            std::cerr << "Error: count must be divisible by thread" << std::endl;
             return 1;
         }
 
         if (args.count % (args.batch * parallel_count) != 0) {
-            std::cerr << "Error: count must be divisible by (batch * " << (args.process_count > 0 ? "process" : "thread") << ")" << std::endl;
+            std::cerr << "Error: count must be divisible by (batch * thread)" << std::endl;
             return 1;
         }
     }
 
     std::cout << "[Main] Command: " << args.cmd << std::endl;
-    std::cout << "[Main] Mode: " << (args.process_count > 0 ? "Multi-process" : "Multi-thread") << std::endl;
+    std::cout << "[Main] Mode: Multi-thread" << std::endl;
     std::cout << "[Main] Count: " << args.count << ", Batch: " << args.batch
-              << ", " << (args.process_count > 0 ? "Processes" : "Threads") << ": " << parallel_count << std::endl;
+              << ", Threads: " << parallel_count << std::endl;
     if (args.cmd == "kps") {
         std::cout << "[Main] Target KPS: " << args.kps << ", Duration: " << args.duration << "s" << std::endl;
     }
@@ -2609,12 +1895,9 @@ int main(int argc, char* argv[]) {
               << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size
               << ", Origin Get: " << (args.origin_get ? "Yes" : "No") << std::endl;
 
-    std::shared_ptr<KVClient> sharedClient;
-    if (args.process_count == 0) {
-        sharedClient = CreateSharedClient(args);
-        if (sharedClient == nullptr) {
-            return 1;
-        }
+    std::shared_ptr<KVClient> sharedClient = CreateSharedClient(args);
+    if (sharedClient == nullptr) {
+        return 1;
     }
 
     // Parse value size configuration
@@ -2711,16 +1994,7 @@ int main(int argc, char* argv[]) {
 
     // For kps mode, run the KPS test directly without pre-setting data
     if (args.cmd == "kps") {
-        if (args.process_count > 0) {
-            RunKpsMultiProcess(args, all_data);
-        } else {
-            RunKpsMultiThread(args, all_data, sharedClient);
-        }
-        return 0;
-    }
-
-    if (args.process_count > 0) {
-        RunMultiProcess(args, all_data);
+        RunKpsMultiThread(args, all_data, sharedClient);
         return 0;
     }
 
