@@ -30,6 +30,9 @@ static uint32_t g_mock_wake_last_request_id = 0;
 static os_transport_user_data_t g_mock_wake_last_user_data;
 
 /* URMA mock controls and observations. */
+#define TEST_URMA_STATUS_FIRST  ((urma_status_t)7)
+#define TEST_URMA_STATUS_SECOND ((urma_status_t)9)
+
 static urma_status_t g_mock_urma_write_status = URMA_SUCCESS;
 static urma_status_t g_mock_urma_recv_status = URMA_SUCCESS;
 static uint32_t g_mock_urma_write_calls = 0;
@@ -346,6 +349,13 @@ static void test_wait_for_task_complete_and_mark(void)
     assert(sync->request_completed == 1);
     assert(sync->completed_tasks == 0);
 
+    update_urma_status(sync, TEST_URMA_STATUS_FIRST);
+    update_urma_status(sync, TEST_URMA_STATUS_SECOND);
+    assert(sync->urma_status == TEST_URMA_STATUS_FIRST);
+    update_urma_status(sync, URMA_SUCCESS);
+    assert(sync->urma_status == TEST_URMA_STATUS_FIRST);
+    update_urma_status(NULL, URMA_FAIL);
+
     mark_task_group_completed(NULL, true);
     free_sync_owned_resources(sync);
 }
@@ -646,6 +656,7 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(send_task_worker_func(&send_arg) == -9);
     assert(sync_send->completed_tasks == 0);
     assert(sync_send->request_completed == 1);
+    assert(sync_send->urma_status == (urma_status_t)-9);
 
     assert(init_task_sync(&sync_recv) == 0);
     sync_recv->total_tasks = 1;
@@ -661,6 +672,7 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(g_mock_last_notify_user_data.user_ctx == notify_data.user_ctx);
     assert(sync_recv->completed_tasks == 1);
     assert(sync_recv->request_completed == 1);
+    assert(sync_recv->urma_status == URMA_SUCCESS);
 
     g_mock_notify_ret = 0;
     assert(init_task_sync(&sync_recv_fail) == 0);
@@ -670,6 +682,7 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(recv_task_worker_func(&recv_fail_arg) == -1);
     assert(sync_recv_fail->request_canceled == 1);
     assert(sync_recv_fail->request_completed == 1);
+    assert(sync_recv_fail->urma_status == URMA_SUCCESS);
     free_sync_owned_resources(sync_recv_fail);
     sync_recv_fail = NULL;
 
@@ -681,6 +694,7 @@ static void test_do_chunk_and_worker_funcs(void)
     assert(recv_task_worker_func(&recv_fail_arg) == -3);
     assert(sync_recv_fail->completed_tasks == 0);
     assert(sync_recv_fail->request_completed == 1);
+    assert(sync_recv_fail->urma_status == URMA_SUCCESS);
 
     free_sync_owned_resources(sync_send);
     free_sync_owned_resources(sync_recv);
@@ -840,8 +854,8 @@ static void test_send_single_chunk_and_reg_jfc(void)
     assert(g_mock_last_write_chunk.dst == 0x2222);
     assert(g_mock_last_write_chunk.len == 64);
 
-    g_mock_urma_write_status = -1;
-    assert(send_single_chunk(&jetty_info, &local_src, &remote_dst, 64, 7, 8) == -1);
+    g_mock_urma_write_status = TEST_URMA_STATUS_FIRST;
+    assert(send_single_chunk(&jetty_info, &local_src, &remote_dst, 64, 7, 8) == TEST_URMA_STATUS_FIRST);
 
     g_inited = 0;
     assert(os_transport_reg_jfc((urma_jfce_t *)0x1, (urma_jfc_t *)0x2, &handle) == (uint32_t)-1);
@@ -876,6 +890,7 @@ static void test_init_destroy_and_send_recv_api(void)
     ost_buffer_info_t host_src = {0};
     ost_device_info_t device_dst = {0};
     task_sync_t *sync = (task_sync_t *)0xDEADBEEF;
+    urma_status_t urma_status = TEST_URMA_STATUS_FIRST;
 
     reset_mocks();
     g_inited = 0;
@@ -919,43 +934,68 @@ static void test_init_destroy_and_send_recv_api(void)
     build_valid_send_args(&send_handle, &jetty_info, &local_src, &remote_dst);
     g_inited = 0;
     sync = (task_sync_t *)0xBAD;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync)
+    assert(os_transport_send(
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync,
+               &urma_status)
            == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
 
     g_inited = 1;
     g_mock_urma_write_status = URMA_SUCCESS;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync) == 0);
+    assert(os_transport_send(
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync,
+               &urma_status)
+           == 0);
+    assert(urma_status == URMA_SUCCESS);
 
-    g_mock_urma_write_status = -1;
-    assert(os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync)
+    g_mock_urma_write_status = TEST_URMA_STATUS_FIRST;
+    assert(os_transport_send(
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync,
+               &urma_status)
            == (uint32_t)-1);
+    assert(urma_status == TEST_URMA_STATUS_FIRST);
 
     reset_mocks();
     g_inited = 1;
     g_mock_submit_fail = 1;
     sync = NULL;
+    urma_status = TEST_URMA_STATUS_FIRST;
     assert(
-        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync)
+        os_transport_send(
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync,
+            &urma_status)
         == (uint32_t)-1);
     assert(sync == NULL);
+    assert(urma_status == URMA_SUCCESS);
 
     reset_mocks();
     g_inited = 1;
-    g_mock_urma_write_status = -1;
+    g_mock_urma_write_status = TEST_URMA_STATUS_SECOND;
+    g_mock_cancel_ret = 1;
     sync = (task_sync_t *)0xAAAA;
     assert(
-        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync)
+        os_transport_send(
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync,
+            &urma_status)
         == (uint32_t)-1);
+    assert(urma_status == TEST_URMA_STATUS_SECOND);
     assert(sync != NULL);
-    assert(wait_and_free_sync(&send_handle, sync) == (uint32_t)-1);
+    urma_status = TEST_URMA_STATUS_FIRST;
+    assert(wait_and_free_sync(&send_handle, sync, &urma_status) == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
+    assert(g_mock_cancel_calls == 1);
+    assert(g_mock_cancel_last_request_id == 100);
     sync = NULL;
 
     reset_mocks();
     g_inited = 1;
     sync = NULL;
     assert(
-        os_transport_send(&send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync)
+        os_transport_send(
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync,
+            &urma_status)
         == 0);
+    assert(urma_status == URMA_SUCCESS);
     assert(sync != NULL);
     /* API behavior test only: avoid asserting chunk ownership contract here. */
     sync->chunks = NULL;
@@ -1000,14 +1040,19 @@ static void test_wait_and_free_sync(void)
 {
     task_sync_t *sync = NULL;
     os_transport_handle_t handle = {0};
+    urma_status_t urma_status = TEST_URMA_STATUS_FIRST;
 
     handle.thread_pool = (ThreadPoolHandle)0x1234;
 
-    assert(wait_and_free_sync(NULL, NULL) == (uint32_t)-1);
-    assert(wait_and_free_sync(&handle, NULL) == (uint32_t)-1);
+    assert(wait_and_free_sync(NULL, NULL, &urma_status) == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
+    urma_status = TEST_URMA_STATUS_FIRST;
+    assert(wait_and_free_sync(&handle, NULL, &urma_status) == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
 
     assert(init_task_sync(&sync) == 0);
-    assert(wait_and_free_sync(&handle, sync) == (uint32_t)-1);
+    assert(wait_and_free_sync(&handle, sync, &urma_status) == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
     free_sync_owned_resources(sync);
 
     sync = create_sync_with_tasks(1, 1);
@@ -1015,21 +1060,32 @@ static void test_wait_and_free_sync(void)
     sync->task_group->tasks[0].is_completed = true;
     sync->task_group->tasks[0].request_id = 101;
     reset_mocks();
-    assert(wait_and_free_sync(&handle, sync) == 0);
+    assert(wait_and_free_sync(&handle, sync, &urma_status) == 0);
+    assert(urma_status == URMA_SUCCESS);
     assert(g_mock_cancel_calls == 0);
 
     sync = create_sync_with_tasks(1, 1);
     sync->task_group->tasks[0].is_completed = false;
     sync->task_group->tasks[0].request_id = 202;
     reset_mocks();
-    assert(wait_and_free_sync(&handle, sync) == (uint32_t)-1);
+    assert(wait_and_free_sync(&handle, sync, &urma_status) == (uint32_t)-1);
+    assert(urma_status == URMA_SUCCESS);
     assert(g_mock_cancel_calls == 1);
     assert(g_mock_cancel_last_request_id == 202);
+
+    sync = create_sync_with_tasks(1, 1);
+    sync->completed_tasks = 1;
+    sync->task_group->tasks[0].request_id = 250;
+    sync->urma_status = TEST_URMA_STATUS_FIRST;
+    reset_mocks();
+    assert(wait_and_free_sync(&handle, sync, &urma_status) == (uint32_t)-1);
+    assert(urma_status == TEST_URMA_STATUS_FIRST);
 
     sync = create_sync_with_tasks(1, 0);
     sync->task_group->tasks[0].request_id = 303;
     reset_mocks();
-    assert(wait_and_free_sync_timeout(&handle, sync, 0) == OS_TRANSPORT_WAIT_TIMEOUT);
+    assert(wait_and_free_sync_timeout(&handle, sync, 0, &urma_status) == OS_TRANSPORT_WAIT_TIMEOUT);
+    assert(urma_status == URMA_SUCCESS);
     assert(g_mock_cancel_calls == 1);
     assert(g_mock_cancel_last_request_id == 303);
     assert(sync->request_timedout == 1);

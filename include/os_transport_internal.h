@@ -38,6 +38,7 @@ struct task_sync {
     uint64_t total_tasks;     // 任务组总任务数
     uint64_t completed_tasks; // 任务组已完成任务数
     uint64_t canceled_tasks;  // 任务组已取消任务数
+    urma_status_t urma_status; // send task调用URMA接口返回的第一个非成功状态
     task_group_t *task_group; // 任务组，由主线程统一释放
     chunk_info_t *chunks;     // 本次请求关联的chunk数组，由主线程统一释放
 };
