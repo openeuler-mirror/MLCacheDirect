@@ -17,19 +17,12 @@ static int g_inited = 0;
 #define OS_TRANSPORT_WAIT_TIMEOUT 1U
 #define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
 
-static uint32_t encode_transport_chunk_size(uint32_t len)
-{
-    (void)len;
-    return 0; // Fixed 2MB chunk unit. The last chunk real size is computed by upper layer.
-}
-
-static uint64_t make_transport_user_data_raw64(uint32_t request_id, uint32_t chunk_id, uint32_t chunk_type, uint32_t len)
+static uint64_t make_transport_user_data_raw64(uint64_t request_id, uint32_t chunk_id, uint32_t chunk_type)
 {
     os_transport_user_data_t user_data = {0};
     user_data.bs.request_id = request_id;
     user_data.bs.chunk_type = chunk_type;
     user_data.bs.chunk_id = chunk_id;
-    user_data.bs.chunk_size = encode_transport_chunk_size(len);
     return user_data.user_ctx;
 }
 
@@ -414,10 +407,11 @@ static void mark_task_group_completed(task_sync_t *sync, bool task_success)
     } else {
         sync->completed_tasks++;
         if (sync_all_tasks_accounted_locked(sync)) {
-            OST_LOG_DEBUG(1, "Task group completed successfully (completed=%lu, canceled=%lu, total_tasks=%lu).",
-                         sync->completed_tasks,
-                         sync->canceled_tasks,
-                         sync->total_tasks);
+            OST_LOG_DEBUG(1,
+                          "Task group completed successfully (completed=%lu, canceled=%lu, total_tasks=%lu).",
+                          sync->completed_tasks,
+                          sync->canceled_tasks,
+                          sync->total_tasks);
             sync->request_completed = 1;
             pthread_cond_signal(&sync->cond);
         }
@@ -501,18 +495,46 @@ static int validate_recv_input(void *handle,
     return 0;
 }
 
+#define URMA_REQ_ID_FIELD_WIDTH      20
+#define URMA_REQ_ID_FIELD_MASK       ((1ULL << URMA_REQ_ID_FIELD_WIDTH) - 1)
+#define URMA_REQ_ID_HIGH_FIELD_SHIFT (REQUEST_ID_BITS - URMA_REQ_ID_FIELD_WIDTH)
+#define OS_TRANSPORT_MAX_REQUEST_ID  ((1ULL << REQUEST_ID_EFFECTIVE_BITS) - 1)
+
+static bool is_request_id_valid(uint64_t request_id)
+{
+    return request_id <= OS_TRANSPORT_MAX_REQUEST_ID;
+}
+
+static uint64_t encode_request_id(uint64_t raw_request_id)
+{
+    const uint64_t low_field = raw_request_id & URMA_REQ_ID_FIELD_MASK;
+    const uint64_t high_field = (raw_request_id >> URMA_REQ_ID_FIELD_WIDTH) & URMA_REQ_ID_FIELD_MASK;
+    uint64_t encoded_request_id = (high_field << URMA_REQ_ID_HIGH_FIELD_SHIFT) | low_field;
+    return encoded_request_id;
+}
+
+static uint64_t decode_request_id(uint64_t encoded_request_id)
+{
+    const uint64_t low_field = encoded_request_id & URMA_REQ_ID_FIELD_MASK;
+    const uint64_t high_field = (encoded_request_id >> URMA_REQ_ID_HIGH_FIELD_SHIFT) & URMA_REQ_ID_FIELD_MASK;
+    uint64_t raw_request_id = (high_field << URMA_REQ_ID_FIELD_WIDTH) | low_field;
+    return raw_request_id;
+}
+
 // 发送单个chunk时，构建对应的write_info。
 static urma_write_info_t build_write_info(urma_jetty_info_t *jetty_info,
                                           ost_buffer_info_t *local_src,
                                           ost_buffer_info_t *remote_dst,
                                           uint32_t len,
-                                          uint32_t server_key,
-                                          uint32_t client_key)
+                                          uint64_t server_key,
+                                          uint64_t client_key)
 {
+    (void)len;
     os_transport_user_data_t server_user_data = {
-        .bs.request_id = server_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = encode_transport_chunk_size(len)};
+        .bs.request_id = server_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0};
+    uint64_t encoded_client_key = encode_request_id(client_key);
     os_transport_user_data_t client_user_data = {
-        .bs.request_id = client_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0, .bs.chunk_size = encode_transport_chunk_size(len)};
+        .bs.request_id = encoded_client_key, .bs.chunk_type = MIDDLE_CHUNK, .bs.chunk_id = 0};
     urma_write_info_t write_info = {.jfs = jetty_info->jfs,
                                     .jetty = jetty_info->jetty,
                                     .target_jfr = jetty_info->tjetty,
@@ -535,11 +557,12 @@ static uint32_t common_split_chunks(
     split_chunk_size = DEFAULT_CHUNK_SIZE;
     chunks_num = (remain_len + split_chunk_size - 1) / split_chunk_size;
     if (chunks_num > OS_TRANSPORT_MAX_CHUNK_NUM) {
-        OST_LOG_ERROR("Failed: chunk count exceeds transport tag limit (len=%u, fixed_chunk_size=%u, chunk_count=%u, max=%u).",
-                      len,
-                      split_chunk_size,
-                      chunks_num,
-                      OS_TRANSPORT_MAX_CHUNK_NUM);
+        OST_LOG_ERROR(
+            "Failed: chunk count exceeds transport tag limit (len=%u, fixed_chunk_size=%u, chunk_count=%u, max=%u).",
+            len,
+            split_chunk_size,
+            chunks_num,
+            OS_TRANSPORT_MAX_CHUNK_NUM);
         return -1;
     }
     chunks = (chunk_info_t *)malloc(sizeof(chunk_info_t) * chunks_num);
@@ -626,7 +649,6 @@ static void construct_send_task_arg(send_task_arg_t *arg,
     user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
     user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
     user_data_server.bs.chunk_id   = chunk_id;
-    user_data_server.bs.chunk_size = chunk_info ? encode_transport_chunk_size(chunk_info->len) : 0;
 
     user_data_client.bs = user_data_server.bs;
     user_data_client.bs.request_id = write_info.user_ctx_client.bs.request_id; // 将client_key作为request_id传入
@@ -660,7 +682,7 @@ static void construct_recv_task_arg(recv_task_arg_t *arg,
 
 // 构建供worker取用的task信息
 static ThreadPoolTask construct_worker_task(
-    uint64_t task_id, uint32_t request_id, int (*task_func)(void *), void *task_arg, TaskPrepareCb prepare_cb)
+    uint64_t task_id, uint64_t request_id, int (*task_func)(void *), void *task_arg, TaskPrepareCb prepare_cb)
 {
     ThreadPoolTask task;
     memset(&task, 0, sizeof(task));
@@ -679,8 +701,8 @@ static ThreadPoolTask construct_worker_task(
 static urma_status_t do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
 {
     urma_status_t ret = urma_write_notify(write_info, chunk_info);
-    if (ret != 0) {
-        OST_LOG_ERROR("Failed: urma_write_notify returned %d for request_id=%u, chunk_id=%lu.",
+    if (ret != URMA_SUCCESS) {
+        OST_LOG_ERROR("Failed: urma_write_notify returned %d for request_id=%lu, chunk_id=%lu.",
                       ret,
                       write_info.user_ctx_client.bs.request_id,
                       write_info.user_ctx_client.bs.chunk_id);
@@ -710,15 +732,14 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
     }
 
     if (recv_task_arg->expected_imm64 != 0 && recv_task_arg->expected_imm64 != notify_user_data->user_ctx) {
-        OST_LOG_ERROR("Recv task completion mismatch (request_id=%u, expected_imm64=0x%016llx, "
-                      "notify_imm64=0x%016llx, expected_chunk=%u, notify_chunk=%u, notify_type=%u, notify_size=%u).",
+        OST_LOG_ERROR("Recv task completion mismatch (request_id=%lu, expected_imm64=0x%016llx, "
+                      "notify_imm64=0x%016llx, expected_chunk=%u, notify_chunk=%u, notify_type=%u).",
                       recv_task_arg->recv_info.request_id,
                       (unsigned long long)recv_task_arg->expected_imm64,
                       (unsigned long long)notify_user_data->user_ctx,
-                      (uint32_t)((os_transport_user_data_t){ .user_ctx = recv_task_arg->expected_imm64 }).bs.chunk_id,
+                      (uint32_t)((os_transport_user_data_t){.user_ctx = recv_task_arg->expected_imm64}).bs.chunk_id,
                       (uint32_t)notify_user_data->bs.chunk_id,
-                      (uint32_t)notify_user_data->bs.chunk_type,
-                      (uint32_t)notify_user_data->bs.chunk_size);
+                      (uint32_t)notify_user_data->bs.chunk_type);
     }
     recv_task_arg->notify_user_data = *notify_user_data;
 }
@@ -727,7 +748,7 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
 static int send_task_worker_func(void *arg)
 {
     urma_status_t ret = URMA_SUCCESS;
-    uint32_t request_id;
+    uint64_t request_id;
     uint32_t chunk_id;
     uint32_t chunk_len;
     task_sync_t *sync;
@@ -745,7 +766,7 @@ static int send_task_worker_func(void *arg)
 
     ret = do_send_chunk_for_worker(send_task_arg->write_info, send_task_arg->chunk_info);
     if (ret != URMA_SUCCESS) {
-        OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).", request_id, chunk_id, chunk_len);
+        OST_LOG_WARN("Send worker task failed (request_id=%lu, chunk_id=%u, len=%u).", request_id, chunk_id, chunk_len);
     }
     update_urma_status(sync, ret);
     mark_task_group_completed(sync, ret == URMA_SUCCESS ? true : false);
@@ -756,7 +777,7 @@ static int send_task_worker_func(void *arg)
 static int recv_task_worker_func(void *arg)
 {
     int ret = 0;
-    uint32_t request_id;
+    uint64_t request_id;
     uint64_t chunk_id;
     uint64_t chunk_type;
     bool is_last_chunk;
@@ -776,7 +797,7 @@ static int recv_task_worker_func(void *arg)
 
     if (!recv_task_arg->notify_callback) {
         OST_LOG_ERROR("Failed: notify_callback is NULL in recv_task_worker_func "
-                      "(request_id=%u).",
+                      "(request_id=%lu).",
                       request_id);
         ret = -1;
     } else {
@@ -793,7 +814,7 @@ static int recv_task_worker_func(void *arg)
     }
     if (ret != 0) {
         OST_LOG_WARN("Recv notify callback failed "
-                     "(request_id=%u, chunk_id=%lu, chunk_type=%lu, ret=%d).",
+                     "(request_id=%lu, chunk_id=%lu, chunk_type=%lu, ret=%d).",
                      request_id,
                      chunk_id,
                      chunk_type,
@@ -806,7 +827,7 @@ static int recv_task_worker_func(void *arg)
         // int event_ret = cudaEventRecord(event, stream);
         // if (event_ret != 0) {
         //     OST_LOG_ERROR(
-        //         "Failed: cudaEventRecord returned %d (request_id=%u).", event_ret,
+        //         "Failed: cudaEventRecord returned %d for request.", event_ret,
         //         recv_task_arg->recv_info.request_id);
         // }
     }
@@ -848,7 +869,7 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
     // 从第1个chunk开始注册task，第0个chunk由调用线程发送，确保task_id与chunk_id保持一致，便于追踪和调试
     for (i = 0, chunk_idx = 1; i < task_num; i++, chunk_idx++) {
         bool is_last_chunk = (chunk_idx >= chunk_num - 1);
-        uint32_t request_id = (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id);
+        uint64_t request_id = urma_info.write_info.user_ctx_server.bs.request_id;
 
         construct_send_task_arg(
             &task_args[i], urma_info.write_info, 
@@ -865,8 +886,8 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
         thread_pool_submit_batch_tasks(ost_handle->thread_pool, task_group->tasks, task_num, NULL, NULL, NULL, NULL);
     if (!task_ids) {
         OST_LOG_ERROR("Failed: thread_pool_submit_batch_tasks returned NULL "
-                      "(request_id=%u, task_num=%u).",
-                      (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
+                      "(request_id=%lu, task_num=%u).",
+                      urma_info.write_info.user_ctx_server.bs.request_id,
                       task_num);
         free(task_group->task_args);
         free(task_group->tasks);
@@ -876,10 +897,11 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_DEBUG(1, "Registered async send tasks (request_id=%u, task_num=%u, chunk_num=%u).",
-                 (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id),
-                 task_num,
-                 chunk_num);
+    OST_LOG_DEBUG(1,
+                  "Registered async send tasks (request_id=%lu, task_num=%u, chunk_num=%u).",
+                  urma_info.write_info.user_ctx_server.bs.request_id,
+                  task_num,
+                  chunk_num);
     return 0;
 }
 
@@ -907,9 +929,9 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
     sync->total_tasks = chunk_num;
     for (uint32_t i = 0; i < chunk_num; i++) {
         bool is_last_chunk = (i == chunk_num - 1);
-        uint32_t request_id = (uint32_t)(urma_info.recv_info.request_id);
+        uint64_t request_id = urma_info.recv_info.request_id;
         uint32_t chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
-        uint64_t expected_imm64 = make_transport_user_data_raw64(request_id, i, chunk_type, chunks[i].len);
+        uint64_t expected_imm64 = make_transport_user_data_raw64(request_id, i, chunk_type);
         construct_recv_task_arg(
             &task_args[i], urma_info.recv_info, &chunks[i], is_last_chunk, sync, notify_callback, expected_imm64);
         task_group->tasks[i] =
@@ -922,8 +944,8 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
         thread_pool_submit_batch_tasks(ost_handle->thread_pool, task_group->tasks, chunk_num, NULL, NULL, NULL, NULL);
     if (!task_ids) {
         OST_LOG_ERROR("Failed: thread_pool_submit_batch_tasks returned NULL "
-                      "(request_id=%u, task_num=%u).",
-                      (uint32_t)(urma_info.recv_info.request_id),
+                      "(request_id=%lu, task_num=%u).",
+                      urma_info.recv_info.request_id,
                       chunk_num);
         free(task_group->task_args);
         free(task_group->tasks);
@@ -933,9 +955,8 @@ static int register_recv_tasks(os_transport_handle_t *ost_handle,
 
     free(task_ids);
     sync->task_group = task_group;
-    OST_LOG_DEBUG(1, "Registered async recv tasks (request_id=%u, task_num=%u).",
-                 (uint32_t)(urma_info.recv_info.request_id),
-                 chunk_num);
+    OST_LOG_DEBUG(
+        1, "Registered async recv tasks (request_id=%lu, task_num=%u).", urma_info.recv_info.request_id, chunk_num);
     return 0;
 }
 
@@ -1155,8 +1176,8 @@ uint32_t os_transport_send(void *handle,
                            ost_buffer_info_t *local_src,
                            ost_buffer_info_t *remote_dst,
                            uint32_t len,
-                           uint32_t server_key,
-                           uint32_t client_key,
+                           uint64_t server_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            urma_status_t *urma_status)
 {
@@ -1175,9 +1196,17 @@ uint32_t os_transport_send(void *handle,
         *urma_status = URMA_SUCCESS;
     }
 
-    OST_LOG_DEBUG(1, "Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
+    OST_LOG_DEBUG(1, "Submitting send request (len=%u, server_key=%lu, client_key=%lu).", len, server_key, client_key);
 
     if (validate_send_input(handle, jetty_info, local_src, remote_dst, len, ret_sync_handle) != 0) {
+        return ret;
+    }
+    if (!is_request_id_valid(server_key) || !is_request_id_valid(client_key)) {
+        OST_LOG_ERROR("Failed: request_id exceeds the supported %u-bit range "
+                      "(server_key=%lu, client_key=%lu).",
+                      REQUEST_ID_EFFECTIVE_BITS,
+                      server_key,
+                      client_key);
         return ret;
     }
 
@@ -1197,7 +1226,7 @@ uint32_t os_transport_send(void *handle,
             ost_handle, chunks, chunks_num, SEND_TASK, send_task_worker_func, urma_info, &sync_handle, NULL)
         != 0) {
         OST_LOG_ERROR("Failed: unable to register async send tasks "
-                      "(server_key=%u, client_key=%u, chunk_count=%u).",
+                      "(server_key=%lu, client_key=%lu, chunk_count=%u).",
                       server_key,
                       client_key,
                       chunks_num);
@@ -1205,11 +1234,12 @@ uint32_t os_transport_send(void *handle,
         return ret;
     }
     *ret_sync_handle = sync_handle;
-    OST_LOG_DEBUG(1, "Async send request registered successfully "
-                 "(server_key=%u, client_key=%u, chunk_count=%u).",
-                 server_key,
-                 client_key,
-                 chunks_num);
+    OST_LOG_DEBUG(1,
+                  "Async send request registered successfully "
+                  "(server_key=%lu, client_key=%lu, chunk_count=%u).",
+                  server_key,
+                  client_key,
+                  chunks_num);
     urma_status_t first_chunk_ret = URMA_SUCCESS;
 #if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
     int first_chunk_inject_ret = 0;
@@ -1223,7 +1253,7 @@ uint32_t os_transport_send(void *handle,
 #endif
     if (first_chunk_ret != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: first chunk submission returned URMA error "
-                      "(total_len=%u, chunk_count=%u, server_key=%u, client_key=%u).",
+                      "(total_len=%u, chunk_count=%u, server_key=%lu, client_key=%lu).",
                       len,
                       chunks_num,
                       server_key,
@@ -1247,7 +1277,7 @@ uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
                            ost_device_info_t *device_dst,
                            uint32_t len,
-                           uint32_t client_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            notify_callback_t notify_callback)
 {
@@ -1263,9 +1293,15 @@ uint32_t os_transport_recv(void *handle,
         *ret_sync_handle = NULL;
     }
 
-    OST_LOG_DEBUG(1, "Submitting recv request (len=%u, client_key=%u).", len, client_key);
+    OST_LOG_DEBUG(1, "Submitting recv request (len=%u, client_key=%lu).", len, client_key);
 
     if (validate_recv_input(handle, host_src, device_dst, len, ret_sync_handle, notify_callback) != 0) {
+        return -1;
+    }
+    if (!is_request_id_valid(client_key)) {
+        OST_LOG_ERROR("Failed: request_id exceeds the supported %u-bit range (client_key=%lu).",
+                      REQUEST_ID_EFFECTIVE_BITS,
+                      client_key);
         return -1;
     }
 #if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
@@ -1276,33 +1312,33 @@ uint32_t os_transport_recv(void *handle,
         return -1;
     }
 
-    urma_info.recv_info = (urma_recv_info_t){
-        .jfr = device_dst->jfr,
-        .jetty = device_dst->jetty,
-        .local_tseg = host_src->tseg,
-        .device_info = *device_dst,
-        .request_id = client_key};
+    urma_info.recv_info = (urma_recv_info_t){.jfr = device_dst->jfr,
+                                             .jetty = device_dst->jetty,
+                                             .local_tseg = host_src->tseg,
+                                             .device_info = *device_dst,
+                                             .request_id = client_key};
 
     if (acquire_recv_queue_resources(ost_handle, chunks_num, &reused_recv_queue_count, &post_recv_queue_count) != 0) {
         OST_LOG_ERROR("Failed: unable to acquire recv queue resources "
-                      "(len=%u, chunk_count=%u, client_key=%u).",
+                      "(len=%u, chunk_count=%u, client_key=%lu).",
                       len,
                       chunks_num,
                       client_key);
         free(chunks);
         return -1;
     }
-    OST_LOG_DEBUG(1, "Recv queue resources prepared (client_key=%u, chunk_count=%u, reused=%u, need_post=%u).",
-                 client_key,
-                 chunks_num,
-                 reused_recv_queue_count,
-                 post_recv_queue_count);
+    OST_LOG_DEBUG(1,
+                  "Recv queue resources prepared (client_key=%lu, chunk_count=%u, reused=%u, need_post=%u).",
+                  client_key,
+                  chunks_num,
+                  reused_recv_queue_count,
+                  post_recv_queue_count);
 
     if (register_tasks_and_bind_chunks(
             ost_handle, chunks, chunks_num, RECV_TASK, recv_task_worker_func, urma_info, &sync_handle, notify_callback)
         != 0) {
         OST_LOG_ERROR("Failed: unable to register async recv tasks "
-                      "(client_key=%u, chunk_count=%u).",
+                      "(client_key=%lu, chunk_count=%u).",
                       client_key,
                       chunks_num);
         release_recv_queue_resources(ost_handle, post_recv_queue_count, reused_recv_queue_count);
@@ -1310,14 +1346,15 @@ uint32_t os_transport_recv(void *handle,
         return -1;
     }
 
-    OST_LOG_DEBUG(1, "Async recv request registered successfully (client_key=%u, chunk_count=%u).", client_key, chunks_num);
+    OST_LOG_DEBUG(
+        1, "Async recv request registered successfully (client_key=%lu, chunk_count=%u).", client_key, chunks_num);
     for (uint32_t i = reused_recv_queue_count; i < chunks_num; i++) {
         if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
             uint32_t successful_post_count = i - reused_recv_queue_count;
             uint32_t unposted_count = post_recv_queue_count - successful_post_count;
             release_recv_queue_resources(ost_handle, unposted_count, reused_recv_queue_count + successful_post_count);
             OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
-                          "(len=%u, chunk_count=%u, client_key=%u, reused=%u, posted=%u, remaining=%u).",
+                          "(len=%u, chunk_count=%u, client_key=%lu, reused=%u, posted=%u, remaining=%u).",
                           len,
                           chunks_num,
                           client_key,
@@ -1354,6 +1391,9 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     if (cr->flag.bs.s_r) { // recv
         if (opcode == URMA_CR_OPC_SEND_WITH_IMM) {
             user_data = (TransportData)cr->imm_data;
+            uint64_t encoded_request_id = user_data.bs.request_id;
+            uint64_t raw_request_id = decode_request_id(encoded_request_id);
+            user_data.bs.request_id = raw_request_id;
         } else {
             OST_LOG_ERROR("Unknown opcode %d", opcode);
             return -1;
@@ -1366,7 +1406,7 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
         }
     }
 
-    uint32_t request_id = user_data.bs.request_id;
+    uint64_t request_id = user_data.bs.request_id;
     /*
      * 线程池会保存本次completion的user_data副本；后续recv worker再把对应副本的
      * 指针传入notify_callback，避免传递当前栈变量地址。
@@ -1374,27 +1414,27 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     ret = thread_pool_wake_up_worker_by_req_id(pool, request_id, &user_data);
     if (opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
         release_recv_queue_resources(ost_handle, 1, 0);
-        OST_LOG_DEBUG(1, "Recv queue resource released after completion (request_id=%u).", request_id);
+        OST_LOG_DEBUG(1, "Recv queue resource released after completion (request_id=%lu).", request_id);
     }
     if (ret != 0) {
-        OST_LOG_DEBUG(2, "Failed to wake worker for completion event "
-                     "(request_id=%u, opcode=%d, chunk_id=%u, chunk_type=%u, chunk_size=%u, imm64=0x%016llx).",
-                     request_id,
-                     opcode,
-                     (uint32_t)user_data.bs.chunk_id,
-                     (uint32_t)user_data.bs.chunk_type,
-                     (uint32_t)user_data.bs.chunk_size,
-                     (unsigned long long)user_data.user_ctx);
+        OST_LOG_DEBUG(2,
+                      "Failed to wake worker for completion event "
+                      "(request_id=%lu, opcode=%d, chunk_id=%u, chunk_type=%u, imm64=0x%016llx).",
+                      request_id,
+                      opcode,
+                      (uint32_t)user_data.bs.chunk_id,
+                      (uint32_t)user_data.bs.chunk_type,
+                      (unsigned long long)user_data.user_ctx);
     }
 
     return ret;
 }
 
-static uint32_t wait_and_free_sync_common(
-    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
+static uint32_t
+wait_and_free_sync_common(void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
 {
     uint32_t wait_ret = 0;
-    uint32_t request_id;
+    uint64_t request_id;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     task_group_t *task_group;
 
@@ -1417,10 +1457,11 @@ static uint32_t wait_and_free_sync_common(
 
     request_id = task_group->tasks[0].request_id;
 
-    OST_LOG_DEBUG(1, "Waiting for request completion (request_id=%u, total_tasks=%lu, timeout_ms=%ld).",
-                 request_id,
-                 sync_handle->total_tasks,
-                 (long)timeout_ms);
+    OST_LOG_DEBUG(1,
+                  "Waiting for request completion (request_id=%lu, total_tasks=%lu, timeout_ms=%ld).",
+                  request_id,
+                  sync_handle->total_tasks,
+                  (long)timeout_ms);
 
     if (timeout_ms < 0) {
         wait_ret = wait_for_task_complete(sync_handle);
@@ -1435,7 +1476,7 @@ static uint32_t wait_and_free_sync_common(
         }
         task_sync_add_canceled_tasks(sync_handle, (uint64_t)canceled, wait_ret == OS_TRANSPORT_WAIT_TIMEOUT);
         OST_LOG_WARN("Request wait did not complete successfully; canceled queued tasks "
-                     "(request_id=%u, ret=%u, canceled=%d, timeout_ms=%ld).",
+                     "(request_id=%lu, ret=%u, canceled=%d, timeout_ms=%ld).",
                      request_id,
                      wait_ret,
                      canceled,
@@ -1463,10 +1504,10 @@ static uint32_t wait_and_free_sync_common(
     }
 
     if (wait_ret == 0) {
-        OST_LOG_DEBUG(1, "Request completed and resources released successfully (request_id=%u).", request_id);
+        OST_LOG_DEBUG(1, "Request completed and resources released successfully (request_id=%lu).", request_id);
     } else {
         OST_LOG_WARN("Request finished with non-success status; release requested "
-                     "(request_id=%u, completed=%lu, canceled=%lu, total=%lu, ret=%u).",
+                     "(request_id=%lu, completed=%lu, canceled=%lu, total=%lu, ret=%u).",
                      request_id,
                      completed,
                      canceled,
@@ -1481,13 +1522,13 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle, urma_status_
     return wait_and_free_sync_common(handle, sync_handle, -1, urma_status);
 }
 
-uint32_t wait_and_free_sync_timeout(
-    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
+uint32_t
+wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
 {
     return wait_and_free_sync_common(handle, sync_handle, timeout_ms, urma_status);
 }
 
-uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id)
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint64_t request_id)
 {
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     task_sync_t *sync = NULL;
@@ -1503,7 +1544,7 @@ uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint
 
     int ret = thread_pool_cancel_tasks_by_req(ost_handle->thread_pool, request_id);
     if (ret < 0) {
-        OST_LOG_WARN("Failed to cancel tasks for request_id=%u.", request_id);
+        OST_LOG_WARN("Failed to cancel tasks for request_id=%lu.", request_id);
         return -1;
     }
 
@@ -1523,7 +1564,7 @@ uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint
         }
     }
 
-    OST_LOG_DEBUG(1, "Tasks cancelled successfully for request_id=%u (removed=%d).", request_id, ret);
+    OST_LOG_DEBUG(1, "Tasks cancelled successfully for request_id=%lu (removed=%d).", request_id, ret);
     return 0;
 }
 

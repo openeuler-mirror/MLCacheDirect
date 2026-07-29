@@ -101,10 +101,9 @@
 ```c
 typedef union {
     struct {
-        uint64_t chunk_type : 2;
-        uint64_t chunk_id : 6;
-        uint64_t chunk_size : 24;
-        uint64_t request_id : 32;
+        uint64_t request_id : 60;
+        uint64_t chunk_type : 1;
+        uint64_t chunk_id : 3;
     } bs;
     uint64_t user_ctx;
 } os_transport_user_data_t;
@@ -112,9 +111,9 @@ typedef union {
 
 这是库中最关键的 completion 上下文，编码了：
 
-- `request_id`：整批请求的唯一标识
+- `request_id`：整批请求的唯一标识。API 接收连续低 40 位 ID；WRITE_WITH_IMM 发送时，库内部将其编码到
+  传输字段的 `[59:40]` 和 `[19:0]`，接收 completion 后再还原。
 - `chunk_id`：当前是第几个 chunk
-- `chunk_size`：当前 chunk 的字节数
 - `chunk_type`：当前 chunk 的类型
   - `NOT_SPLIT`
   - `MIDDLE_CHUNK`
@@ -168,7 +167,6 @@ typedef int (*notify_callback_t)(void *user_data);
 
 - `request_id`
 - `chunk_id`
-- `chunk_size`
 - `chunk_type`
 
 然后自行决定后续动作，例如：
@@ -270,7 +268,7 @@ int os_transport_log_reg(int level, log_callback_t cb);
 
 - 当 `len <= DEFAULT_CHUNK_SIZE` 时，按单 chunk 处理。
 - 当 `len > DEFAULT_CHUNK_SIZE` 时，拆成多个 chunk。
-- 每个 chunk 都会有自己的 `chunk_id`、`chunk_size` 和 `chunk_type`。
+- 每个 chunk 都会有自己的 `chunk_id` 和 `chunk_type`，最多支持 8 个 chunk。
 
 ### 6.2 send 路径分片特点
 
@@ -350,8 +348,8 @@ uint32_t os_transport_send(void *handle,
                            ost_buffer_info_t *local_src,
                            ost_buffer_info_t *remote_dst,
                            uint32_t len,
-                           uint32_t server_key,
-                           uint32_t client_key,
+                           uint64_t server_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            urma_status_t *urma_status);
 ```
@@ -367,8 +365,9 @@ uint32_t os_transport_send(void *handle,
 
 说明：
 
-- `client_key` 最终会作为 `request_id` 写入 completion 透传字段。
-- `server_key` 会用于另一侧 completion/上下文区分。
+- `server_key` 和 `client_key` 必须位于 `0` 到 `(1ULL << 40) - 1` 范围内，超出范围时接口返回失败。
+- `client_key` 会由库内部编码后写入 completion 透传字段，接收侧还原后再作为 `request_id` 使用。
+- `server_key` 会用于本端 completion/上下文区分。
 - `urma_status` 可为空。单分片或多分片首片调用 `urma_write_with_notify()` 失败时，
   接口返回非 0，并通过该参数原样返回底层 URMA 状态；其他库内错误返回非 0 时，该参数保持为
   `URMA_SUCCESS`。
@@ -381,7 +380,7 @@ uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
                            ost_device_info_t *device_dst,
                            uint32_t len,
-                           uint32_t client_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            notify_callback_t notify_callback);
 ```
@@ -393,6 +392,9 @@ uint32_t os_transport_recv(void *handle,
 - 向 URMA 的 `jfr` 投递 recv 请求
 - completion 到来后回调上层 `notify_callback`
 - 返回 `task_sync_t` 给调用方等待整批完成
+
+`client_key` 必须位于 `0` 到 `(1ULL << 40) - 1` 范围内；回调收到的是还原后的连续低 40 位
+`request_id`。
 
 这个接口和旧版最大的不同是：
 
@@ -432,7 +434,7 @@ uint32_t wait_and_free_sync(void *handle,
 ### 7.7 取消指定请求的任务
 
 ```c
-uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id);
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint64_t request_id);
 ```
 
 作用：
@@ -487,13 +489,13 @@ uint32_t os_transport_destroy(void *handle);
 
 URMA completion 到来
   -> os_transport_wake_up_task()
-      -> 解析 request_id/chunk_id/chunk_size/chunk_type
+      -> 解析 request_id/chunk_id/chunk_type
       -> 按 request_id 唤醒 worker
           -> worker 执行 recv task
               -> notify_callback(&os_transport_user_data_t_copy)
 
 上层 notify_callback
-  -> 根据 chunk_id / chunk_size 查找业务上下文
+  -> 根据 chunk_id 查找业务上下文
   -> 视需要执行 cudaMemcpy / cudaMemcpyAsync / 其他处理
 
 调用方
@@ -517,9 +519,8 @@ static int my_notify_callback(void *user_data)
         return -1;
     }
 
-    uint32_t request_id = ud->bs.request_id;
+    uint64_t request_id = ud->bs.request_id;
     uint32_t chunk_id = ud->bs.chunk_id;
-    uint32_t chunk_size = ud->bs.chunk_size;
     uint32_t chunk_type = ud->bs.chunk_type;
 
     // 1. 根据 request_id 找到这次请求在上层保存的上下文
@@ -527,7 +528,6 @@ static int my_notify_callback(void *user_data)
     // 3. 执行 cudaMemcpyAsync(...) 或其他处理
     // 4. 如有需要，在 LAST_CHUNK 时做额外收尾
 
-    (void)chunk_size;
     (void)chunk_type;
     return 0;
 }

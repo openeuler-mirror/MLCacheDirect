@@ -26,7 +26,7 @@ typedef struct {
     urma_jetty_t *jetty;
     urma_target_seg_t *local_tseg;
     ost_device_info_t device_info; // 设备信息
-    uint32_t request_id;           // 请求ID
+    uint64_t request_id;           // 请求ID
 } urma_recv_info_t;
 
 typedef union {

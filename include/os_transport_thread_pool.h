@@ -16,7 +16,7 @@ typedef void (*TaskPrepareCb)(void *task_arg, void *user_data);
  */
 typedef struct {
     uint64_t task_id;            // 唯一任务ID
-    uint32_t request_id;         // 请求ID（相同批次任务此值相同）
+    uint64_t request_id;         // 请求ID（相同批次任务此值相同）
     TaskPrepareCb prepare_cb;    // 任务执行前准备回调
     int (*task_func)(void *arg); // 任务执行函数
     void *task_arg;              // 任务参数（用户自行管理内存）
@@ -68,7 +68,7 @@ int thread_pool_start(ThreadPoolHandle handle);
  * @param user_data os_transport_wake_up_task解析出的completion user_data指针
  * @return 0=成功，-1=失败
  */
-int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data);
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint64_t request_id, void *user_data);
 
 /**
  * @brief 外部提交单个任务
@@ -81,7 +81,7 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
  * @return 任务ID（0=失败）
  */
 uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
-                                 uint32_t request_id,
+                                 uint64_t request_id,
                                  int (*task_func)(void *arg),
                                  void *task_arg,
                                  TaskCompleteCb complete_cb,
@@ -112,7 +112,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
  * @param request_id 请求ID
  * @return 销毁的任务数量，-1表示参数错误
  */
-int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id);
+int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint64_t request_id);
 
 /**
  * @brief 销毁线程池（等待所有任务完成，释放资源）

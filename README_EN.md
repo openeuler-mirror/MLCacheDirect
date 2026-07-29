@@ -101,10 +101,9 @@ Defined in `include/os_transport.h`:
 ```c
 typedef union {
     struct {
-        uint64_t chunk_type : 2;
-        uint64_t chunk_id : 6;
-        uint64_t chunk_size : 24;
-        uint64_t request_id : 32;
+        uint64_t request_id : 60;
+        uint64_t chunk_type : 1;
+        uint64_t chunk_id : 3;
     } bs;
     uint64_t user_ctx;
 } os_transport_user_data_t;
@@ -112,9 +111,10 @@ typedef union {
 
 This is the most critical completion context within the library, encoding the following information:
 
-- `request_id`: unique identifier for the entire batch of requests.
+- `request_id`: unique identifier for the entire request batch. The API accepts a contiguous 40-bit ID. For
+  WRITE_WITH_IMM, the library encodes it into bits `[59:40]` and `[19:0]` of the transport field and restores it
+  when the completion is received.
 - `chunk_id`: index of the current chunk.
-- `chunk_size`: size of the current chunk in bytes.
 - `chunk_type`: type of the current chunk.
   - `NOT_SPLIT`
   - `MIDDLE_CHUNK`
@@ -167,7 +167,6 @@ This means that the upper layer can obtain the following within `notify_callback
 
 - `request_id`
 - `chunk_id`
-- `chunk_size`
 - `chunk_type`
 
 Based on this information, the upper layer can decide the subsequent actions, such as:
@@ -264,7 +263,7 @@ The default is **2 MB**.
 
 - When `len <= DEFAULT_CHUNK_SIZE`, it is processed as a single chunk.
 - When `len > DEFAULT_CHUNK_SIZE`, it is split into multiple chunks.
-- Each chunk is assigned its own `chunk_id`, `chunk_size`, and `chunk_type`.
+- Each chunk is assigned its own `chunk_id` and `chunk_type`, with at most 8 chunks supported.
 
 ### 6.2 Send Path Chunking Characteristics
 
@@ -344,8 +343,8 @@ uint32_t os_transport_send(void *handle,
                            ost_buffer_info_t *local_src,
                            ost_buffer_info_t *remote_dst,
                            uint32_t len,
-                           uint32_t server_key,
-                           uint32_t client_key,
+                           uint64_t server_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            urma_status_t *urma_status);
 ```
@@ -360,8 +359,11 @@ Purposes:
 
 Description:
 
-- `client_key` is ultimately written into the completion pass-through field as `request_id`.
-- `server_key` is used for completion or context differentiation on the peer side.
+- `server_key` and `client_key` must be between `0` and `(1ULL << 40) - 1`; the API fails for values outside this
+  range.
+- The library encodes `client_key` before writing it to the completion pass-through field. The receive side
+  restores it before using it as `request_id`.
+- `server_key` is used for local completion or context differentiation.
 - `urma_status` is optional. If a single-chunk write or the first chunk of a split write fails in
   `urma_write_with_notify()`, the API returns non-zero and reports the original URMA status through this parameter.
   For other library-side failures, the parameter remains `URMA_SUCCESS`.
@@ -375,7 +377,7 @@ uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
                            ost_device_info_t *device_dst,
                            uint32_t len,
-                           uint32_t client_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            notify_callback_t notify_callback);
 ```
@@ -387,6 +389,9 @@ Purposes:
 - Posts receive requests to the URMA `jfr`.
 - Invokes the upper-level`notify_callback` upon completion arrival.
 - Returns a `task_sync_t` handle for the caller to wait for the entire batch to complete.
+
+`client_key` must be between `0` and `(1ULL << 40) - 1`. The callback receives the restored contiguous 40-bit
+`request_id`.
 
 Difference between this API and the legacy version:
 
@@ -426,7 +431,7 @@ Purposes:
 ### 7.7 Cancelling Tasks for a Specific Request
 
 ```c
-uint32_t os_transport_cancel_tasks(void *handle, uint32_t request_id);
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint64_t request_id);
 ```
 
 Purposes:
@@ -480,13 +485,13 @@ Caller
 
 URMA completion arrival
   -> os_transport_wake_up_task()
-      -> Parse request_id/chunk_id/chunk_size/chunk_type.
+      -> Parse request_id/chunk_id/chunk_type.
       -> Wake up the worker by request_id.
           -> The worker executes the recv task.
               -> notify_callback(&os_transport_user_data_t_copy)
 
 Upper-layer notify_callback
-  -> Match context by chunk_id/chunk_size.
+  -> Match context by chunk_id.
   -> Trigger handling, such as cudaMemcpy/cudaMemcpyAsync.
 
 Caller
@@ -510,9 +515,8 @@ static int my_notify_callback(void *user_data)
         return -1;
     }
 
-    uint32_t request_id = ud->bs.request_id;
+    uint64_t request_id = ud->bs.request_id;
     uint32_t chunk_id = ud->bs.chunk_id;
-    uint32_t chunk_size = ud->bs.chunk_size;
     uint32_t chunk_type = ud->bs.chunk_type;
 
     // 1. Find the upper-layer context saved for this request based on request_id.
@@ -520,7 +524,6 @@ static int my_notify_callback(void *user_data)
     // 3. Execute cudaMemcpyAsync(...) or perform other processing.
     // 4. If needed, perform additional cleanup or post-processing on the LAST_CHUNK.
 
-    (void)chunk_size;
     (void)chunk_type;
     return 0;
 }

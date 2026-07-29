@@ -27,7 +27,7 @@ typedef struct TaskNode {
 } TaskNode;
 
 typedef struct PendingReqNode {
-    uint32_t request_id;
+    uint64_t request_id;
     // 每个唤醒事件携带一份user_data副本，避免多个completion覆盖同一request上下文
     TransportData user_data;
     struct PendingReqNode *next;
@@ -55,7 +55,7 @@ typedef struct {
  * @brief 请求上下文（用于记录request_id与worker的绑定及批次信息）
  */
 typedef struct RequestContext {
-    uint32_t request_id;
+    uint64_t request_id;
     int worker_idx;          // 绑定的 worker 索引
     int pending_count;       // 剩余任务数
     TaskCompleteCb batch_cb; // 批次完成回调

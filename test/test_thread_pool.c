@@ -2,7 +2,8 @@
  * test_thread_pool.c - 线程池单元测试
  *
  * 编译命令：
- *   gcc -g -o test_thread_pool src/os_transport_thread_pool.c src/os_transport_log.c test/test_thread_pool.c -lpthread -Iinclude
+ *   gcc -g -o test_thread_pool src/os_transport_thread_pool.c src/os_transport_log.c test/test_thread_pool.c -lpthread
+ * -Iinclude
  */
 
 #include "os_transport_thread_pool.h"
@@ -44,12 +45,12 @@ static void test_state_init(int total)
     g_state.total_tasks = total;
 }
 
-static void wake_request(ThreadPoolHandle pool, uint32_t req_id)
+static void wake_request(ThreadPoolHandle pool, uint64_t req_id)
 {
     assert(thread_pool_wake_up_worker_by_req_id(pool, req_id, NULL) == 0);
 }
 
-static RequestContext *find_test_req_context(ThreadPoolHandle pool, uint32_t req_id)
+static RequestContext *find_test_req_context(ThreadPoolHandle pool, uint64_t req_id)
 {
     for (int i = 0; i < REQ_HASH_SIZE; i++) {
         RequestContext *ctx = pool->req_hash[i];
@@ -63,7 +64,7 @@ static RequestContext *find_test_req_context(ThreadPoolHandle pool, uint32_t req
     return NULL;
 }
 
-static void append_test_pending_req(WorkerThread *worker, uint32_t req_id, const TransportData *user_data)
+static void append_test_pending_req(WorkerThread *worker, uint64_t req_id, const TransportData *user_data)
 {
     PendingReqNode *node = calloc(1, sizeof(PendingReqNode));
     assert(node != NULL);
@@ -159,8 +160,8 @@ static void batch_complete_cb(uint64_t task_id, bool success, void *user_data)
 {
     (void)task_id;
     (void)success;
-    uint32_t req_id = (uint32_t)(uintptr_t)user_data;
-    printf("Batch complete for req %u\n", req_id);
+    uint64_t req_id = (uint64_t)(uintptr_t)user_data;
+    printf("Batch complete for req %lu\n", (unsigned long)req_id);
     pthread_mutex_lock(&g_state.lock);
     g_state.batch_completed_count++;
     pthread_cond_signal(&g_state.cond);
@@ -189,8 +190,8 @@ static void test_single_tasks(ThreadPoolHandle pool)
     wake_request(pool, req2);
 
     test_state_wait_completion();
-    assert((g_state.exec_order[0] == 1 && g_state.exec_order[1] == 2) ||
-           (g_state.exec_order[0] == 2 && g_state.exec_order[1] == 1));
+    assert((g_state.exec_order[0] == 1 && g_state.exec_order[1] == 2)
+           || (g_state.exec_order[0] == 2 && g_state.exec_order[1] == 1));
     printf("Test 1 passed.\n");
 }
 
@@ -436,7 +437,6 @@ static void test_match_user_ctx(ThreadPoolHandle pool)
         data[i].bs.request_id = req;
         data[i].bs.chunk_id = (uint64_t)(i + 1);
         data[i].bs.chunk_type = (i == 2) ? 2U : 1U;
-        data[i].bs.chunk_size = 128U + (uint64_t)i;
 
         tasks[i].request_id = req;
         tasks[i].prepare_cb = prepare_match_task;
@@ -452,7 +452,7 @@ static void test_match_user_ctx(ThreadPoolHandle pool)
     free(ids);
 
     TransportData wrong = data[0];
-    wrong.bs.chunk_id = 15;
+    wrong.bs.chunk_id = 7;
     assert(thread_pool_wake_up_worker_by_req_id(pool, req, &wrong) == 0);
     usleep(50000);
 
@@ -502,7 +502,7 @@ static void test_cancel_pending_and_destroy_queued(void)
 
     TransportData pending_data = {0};
     pending_data.bs.request_id = req;
-    pending_data.bs.chunk_id = 9;
+    pending_data.bs.chunk_id = 7;
     append_test_pending_req(&cancel_pool->workers[worker_idx], req, &pending_data);
 
     int canceled = thread_pool_cancel_tasks_by_req(cancel_pool, req);

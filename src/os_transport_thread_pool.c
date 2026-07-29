@@ -80,9 +80,9 @@ void mock_event_queue_destroy(void)
 #endif
 
 // 哈希函数
-static uint32_t hash_req_id(uint32_t req_id)
+static uint32_t hash_req_id(uint64_t req_id)
 {
-    return (uint32_t)(req_id ^ (req_id >> 20)) % REQ_HASH_SIZE;
+    return (uint32_t)(req_id % REQ_HASH_SIZE);
 }
 
 // 内部任务包装
@@ -93,7 +93,7 @@ typedef struct {
     TaskCompleteCb complete_cb;
     void *user_data;
     uint64_t task_id;
-    uint32_t request_id;
+    uint64_t request_id;
     bool success;
 } InternalTask;
 
@@ -113,10 +113,12 @@ static int internal_task_wrapper(void *arg)
         itask->complete_cb(itask->task_id, itask->success, itask->user_data);
     }
     if (ret != 0) {
-        OST_LOG_WARN(
-            "Worker task returned error (task_id=%lu, request_id=%u, ret=%d).", itask->task_id, itask->request_id, ret);
+        OST_LOG_WARN("Worker task returned error (task_id=%lu, request_id=%lu, ret=%d).",
+                     itask->task_id,
+                     itask->request_id,
+                     ret);
     }
-    OST_LOG_DEBUG(2, "Taskid = %lu request_id=%u completed", itask->task_id, itask->request_id);
+    OST_LOG_DEBUG(2, "Taskid = %lu request_id=%lu completed", itask->task_id, itask->request_id);
     free(itask);
     return ret;
 }
@@ -181,18 +183,12 @@ static uint32_t thread_pool_user_data_chunk_type(const TransportData *data)
     return data ? (uint32_t)data->bs.chunk_type : 0;
 }
 
-static uint32_t thread_pool_user_data_chunk_size(const TransportData *data)
-{
-    return data ? (uint32_t)data->bs.chunk_size : 0;
-}
-
 // 从 worker 队列中取出匹配 request_id 和 completion user_data 的任务（必须已持有 worker->mutex）。
 // Pipeline H2D recv 同一 request_id 下会注册多个 chunk task，completion 可以乱序到达。
 // 对设置了 has_match_user_ctx 的任务，必须同时匹配 request_id + full imm64，避免 chunk1 completion
 // 错配到 chunk0 task。没有 match key 的历史任务保持原 request_id 匹配语义。
-static ThreadPoolTask *worker_queue_pop_by_req_and_user_data(WorkerThread *worker,
-                                                             uint32_t req_id,
-                                                             const TransportData *notify_data)
+static ThreadPoolTask *
+worker_queue_pop_by_req_and_user_data(WorkerThread *worker, uint64_t req_id, const TransportData *notify_data)
 {
     uint64_t notify_raw64 = thread_pool_user_data_raw64(notify_data);
     TaskNode *prev = NULL;
@@ -225,15 +221,14 @@ static ThreadPoolTask *worker_queue_pop_by_req_and_user_data(WorkerThread *worke
     }
 
     if (first_req_node && first_req_node->task && first_req_node->task->has_match_user_ctx) {
-        OST_LOG_WARN("No exact matched task for completion (worker=%d, request_id=%u, notify_imm64=0x%016llx, "
-                     "notify_chunk=%u, notify_type=%u, notify_size=%u, first_expected_imm64=0x%016llx, "
+        OST_LOG_WARN("No exact matched task for completion (worker=%d, request_id=%lu, notify_imm64=0x%016llx, "
+                     "notify_chunk=%u, notify_type=%u, first_expected_imm64=0x%016llx, "
                      "queue_size=%u, pending_count=%u).",
                      worker ? worker->worker_idx : -1,
                      req_id,
                      (unsigned long long)notify_raw64,
                      thread_pool_user_data_chunk_id(notify_data),
                      thread_pool_user_data_chunk_type(notify_data),
-                     thread_pool_user_data_chunk_size(notify_data),
                      (unsigned long long)first_req_node->task->match_user_ctx,
                      worker ? worker->queue_size : 0,
                      worker ? worker->pending_req_count : 0);
@@ -242,11 +237,11 @@ static ThreadPoolTask *worker_queue_pop_by_req_and_user_data(WorkerThread *worke
 }
 
 // 向 worker 的待执行队列追加 request_id 以及对应completion user_data（必须已持有 worker->mutex）
-static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id, void *user_data)
+static bool worker_pending_req_push(WorkerThread *worker, uint64_t req_id, void *user_data)
 {
     PendingReqNode *node = malloc(sizeof(PendingReqNode));
     if (!node) {
-        OST_LOG_ERROR("Failed: unable to allocate PendingReqNode for worker %d, request_id=%u.",
+        OST_LOG_ERROR("Failed: unable to allocate PendingReqNode for worker %d, request_id=%lu.",
                       worker ? worker->worker_idx : -1,
                       req_id);
         return false;
@@ -270,7 +265,7 @@ static bool worker_pending_req_push(WorkerThread *worker, uint32_t req_id, void 
 }
 
 // 从 worker 的待执行队列取出 request_id 以及对应completion user_data（必须已持有 worker->mutex）
-static bool worker_pending_req_pop(WorkerThread *worker, uint32_t *req_id, TransportData *user_data)
+static bool worker_pending_req_pop(WorkerThread *worker, uint64_t *req_id, TransportData *user_data)
 {
     PendingReqNode *node = worker->pending_req_head;
     if (!node)
@@ -305,7 +300,7 @@ static void worker_pending_req_clear(WorkerThread *worker)
 }
 
 // 从 worker 的待执行 request 队列中删除指定 request_id（必须已持有 worker->mutex）
-static uint32_t worker_pending_req_remove_by_req(WorkerThread *worker, uint32_t req_id)
+static uint32_t worker_pending_req_remove_by_req(WorkerThread *worker, uint64_t req_id)
 {
     PendingReqNode *prev = NULL;
     PendingReqNode *curr = worker->pending_req_head;
@@ -377,7 +372,7 @@ static WorkerThread *select_best_worker(ThreadPoolHandle pool)
 }
 
 // 哈希表操作
-static RequestContext *find_req_context_locked(ThreadPoolHandle pool, uint32_t req_id)
+static RequestContext *find_req_context_locked(ThreadPoolHandle pool, uint64_t req_id)
 {
     uint32_t h = hash_req_id(req_id);
     RequestContext *ctx = pool->req_hash[h];
@@ -397,7 +392,7 @@ static void insert_req_context_locked(ThreadPoolHandle pool, RequestContext *ctx
     pool->req_hash[h] = ctx;
 }
 
-static bool remove_req_context_locked(ThreadPoolHandle pool, uint32_t req_id)
+static bool remove_req_context_locked(ThreadPoolHandle pool, uint64_t req_id)
 {
     uint32_t h = hash_req_id(req_id);
     RequestContext **p = &pool->req_hash[h];
@@ -414,13 +409,13 @@ static bool remove_req_context_locked(ThreadPoolHandle pool, uint32_t req_id)
 }
 
 // worker 执行任务并处理计数
-static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint32_t req_id, TransportData *user_data)
+static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint64_t req_id, TransportData *user_data)
 {
     ThreadPoolHandle pool = worker->pool;
     int ret;
 
     if (!task || !task->task_func) {
-        OST_LOG_ERROR("Failed: invalid task for worker_process_task (worker=%d, request_id=%u, task=%p).",
+        OST_LOG_ERROR("Failed: invalid task for worker_process_task (worker=%d, request_id=%lu, task=%p).",
                       worker ? worker->worker_idx : -1,
                       req_id,
                       (void *)task);
@@ -447,16 +442,16 @@ static void worker_process_task(WorkerThread *worker, ThreadPoolTask *task, uint
 
         if (batch_cb) {
             batch_cb(0, true, batch_data);
-            OST_LOG_DEBUG(1, "Request batch completed (request_id=%u, worker=%d).", req_id, worker->worker_idx);
+            OST_LOG_DEBUG(1, "Request batch completed (request_id=%lu, worker=%d).", req_id, worker->worker_idx);
         }
     } else {
         pthread_mutex_unlock(&pool->req_hash_mutex);
         OST_LOG_WARN(
-            "No request context found after task execution (request_id=%u, worker=%d).", req_id, worker->worker_idx);
+            "No request context found after task execution (request_id=%lu, worker=%d).", req_id, worker->worker_idx);
     }
 
     if (ret != 0) {
-        OST_LOG_WARN("Task execution failed in worker_process_task (request_id=%u, worker=%d, ret=%d).",
+        OST_LOG_WARN("Task execution failed in worker_process_task (request_id=%lu, worker=%d, ret=%d).",
                      req_id,
                      worker->worker_idx,
                      ret);
@@ -495,7 +490,7 @@ static void *worker_routine(void *arg)
             break;
         }
 
-        uint32_t req_to_exec;
+        uint64_t req_to_exec;
         TransportData user_data = {0};
         if (!worker_pending_req_pop(worker, &req_to_exec, &user_data)) {
             worker->state = WORKER_STATE_IDLE;
@@ -509,13 +504,13 @@ static void *worker_routine(void *arg)
             worker_process_task(worker, task, req_to_exec, &user_data);
             pthread_mutex_lock(&worker->mutex);
         } else {
-            OST_LOG_WARN("Wakeup received without matching queued task (worker=%d, request_id=%u, chunk_id=%u, "
-                         "chunk_type=%u, chunk_size=%u, queue_size=%u, pending_count=%u).",
+            OST_LOG_WARN("Wakeup received without matching queued task (worker=%d, request_id=%lu"
+                         ", chunk_id=%u, "
+                         "chunk_type=%u, queue_size=%u, pending_count=%u).",
                          worker->worker_idx,
                          req_to_exec,
                          (uint32_t)user_data.bs.chunk_id,
                          (uint32_t)user_data.bs.chunk_type,
-                         (uint32_t)user_data.bs.chunk_size,
                          worker->queue_size,
                          worker->pending_req_count);
             worker->state = WORKER_STATE_IDLE;
@@ -718,7 +713,7 @@ int thread_pool_start(ThreadPoolHandle handle)
     return 0;
 }
 
-int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data)
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint64_t request_id, void *user_data)
 {
     if (!handle) {
         OST_LOG_ERROR("Failed: handle is NULL in thread_pool_wake_up_worker_by_req_id.");
@@ -735,14 +730,14 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
     pthread_mutex_unlock(&handle->req_hash_mutex);
 
     if (worker_idx < 0) {
-        OST_LOG_DEBUG(2, "No context for request_id %u", request_id);
+        OST_LOG_DEBUG(2, "No context for request_id %lu", request_id);
         return -1;
     }
     WorkerThread *worker = &handle->workers[worker_idx];
     pthread_mutex_lock(&worker->mutex);
     if (!worker_pending_req_push(worker, request_id, user_data)) {
         pthread_mutex_unlock(&worker->mutex);
-        OST_LOG_ERROR("Failed to enqueue pending request %u for worker %d", request_id, worker->worker_idx);
+        OST_LOG_ERROR("Failed to enqueue pending request %lu for worker %d", request_id, worker->worker_idx);
         return -1;
     }
     pthread_cond_signal(&worker->cond_task);
@@ -752,7 +747,7 @@ int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t reque
 
 // 单任务提交
 uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
-                                 uint32_t request_id,
+                                 uint64_t request_id,
                                  int (*task_func)(void *),
                                  void *task_arg,
                                  TaskCompleteCb complete_cb,
@@ -763,17 +758,17 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
         return 0;
     }
     if (!task_func) {
-        OST_LOG_ERROR("Failed: task_func is NULL in thread_pool_submit_task (request_id=%u).", request_id);
+        OST_LOG_ERROR("Failed: task_func is NULL in thread_pool_submit_task (request_id=%lu).", request_id);
         return 0;
     }
     if (!handle->is_running) {
-        OST_LOG_WARN("Thread pool is not running when submitting task (request_id=%u).", request_id);
+        OST_LOG_WARN("Thread pool is not running when submitting task (request_id=%lu).", request_id);
         return 0;
     }
 
     InternalTask *itask = malloc(sizeof(InternalTask));
     if (!itask) {
-        OST_LOG_ERROR("Failed: unable to allocate InternalTask (request_id=%u).", request_id);
+        OST_LOG_ERROR("Failed: unable to allocate InternalTask (request_id=%lu).", request_id);
         return 0;
     }
     itask->user_func = task_func;
@@ -786,7 +781,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
 
     ThreadPoolTask *task = malloc(sizeof(ThreadPoolTask));
     if (!task) {
-        OST_LOG_ERROR("Failed: unable to allocate ThreadPoolTask (request_id=%u).", request_id);
+        OST_LOG_ERROR("Failed: unable to allocate ThreadPoolTask (request_id=%lu).", request_id);
         free(itask);
         return 0;
     }
@@ -811,7 +806,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
 
     RequestContext *new_ctx = malloc(sizeof(RequestContext));
     if (!new_ctx) {
-        OST_LOG_ERROR("Failed: unable to allocate RequestContext (request_id=%u).", request_id);
+        OST_LOG_ERROR("Failed: unable to allocate RequestContext (request_id=%lu).", request_id);
         free(task);
         free(itask);
         return 0;
@@ -826,7 +821,7 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
     pthread_mutex_lock(&worker->mutex);
     if (!worker_queue_push(worker, task)) {
         pthread_mutex_unlock(&worker->mutex);
-        OST_LOG_ERROR("Failed: unable to enqueue task %lu to worker %d (request_id=%u).",
+        OST_LOG_ERROR("Failed: unable to enqueue task %lu to worker %d (request_id=%lu).",
                       task->task_id,
                       worker->worker_idx,
                       request_id);
@@ -847,14 +842,14 @@ uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
         insert_req_context_locked(handle, new_ctx);
         pthread_mutex_unlock(&handle->req_hash_mutex);
     }
-    OST_LOG_DEBUG(1, "Task %lu (req=%u) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
+    OST_LOG_DEBUG(1, "Task %lu (req=%lu) submitted to worker %d", task->task_id, request_id, worker->worker_idx);
     return task->task_id;
 }
 
 // 创建单个批量任务节点
 static bool create_batch_node(ThreadPoolHandle handle,
                               ThreadPoolTask *src,
-                              uint32_t req_id,
+                              uint64_t req_id,
                               TaskCompleteCb complete_cb,
                               void *user_data,
                               TaskNode **pnode,
@@ -862,7 +857,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
 {
     InternalTask *itask = malloc(sizeof(InternalTask));
     if (!itask) {
-        OST_LOG_ERROR("Failed: unable to allocate InternalTask for batch request_id=%u.", req_id);
+        OST_LOG_ERROR("Failed: unable to allocate InternalTask for batch request_id=%lu.", req_id);
         return false;
     }
     itask->user_func = src->task_func;
@@ -875,7 +870,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
 
     ThreadPoolTask *task = malloc(sizeof(ThreadPoolTask));
     if (!task) {
-        OST_LOG_ERROR("Failed: unable to allocate ThreadPoolTask for batch request_id=%u.", req_id);
+        OST_LOG_ERROR("Failed: unable to allocate ThreadPoolTask for batch request_id=%lu.", req_id);
         free(itask);
         return false;
     }
@@ -893,7 +888,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
 
     TaskNode *node = malloc(sizeof(TaskNode));
     if (!node) {
-        OST_LOG_ERROR("Failed: unable to allocate TaskNode for batch request_id=%u.", req_id);
+        OST_LOG_ERROR("Failed: unable to allocate TaskNode for batch request_id=%lu.", req_id);
         free(task);
         free(itask);
         return false;
@@ -908,7 +903,7 @@ static bool create_batch_node(ThreadPoolHandle handle,
 static bool validate_and_select_worker(ThreadPoolHandle handle,
                                        ThreadPoolTask *tasks,
                                        uint32_t task_count,
-                                       uint32_t *req_id,
+                                       uint64_t *req_id,
                                        WorkerThread **worker,
                                        uint64_t **task_ids)
 {
@@ -928,7 +923,7 @@ static bool validate_and_select_worker(ThreadPoolHandle handle,
     for (uint32_t i = 1; i < task_count; i++) {
         if (tasks[i].request_id != *req_id) {
             OST_LOG_ERROR("Failed: inconsistent request_id in batch submission "
-                          "(expected=%u, actual=%u, index=%u).",
+                          "(expected=%lu, actual=%lu, index=%u).",
                           *req_id,
                           tasks[i].request_id,
                           i);
@@ -938,13 +933,13 @@ static bool validate_and_select_worker(ThreadPoolHandle handle,
     *task_ids = malloc(task_count * sizeof(uint64_t));
     if (!*task_ids) {
         OST_LOG_ERROR(
-            "Failed: unable to allocate task_ids array for batch request_id=%u (task_count=%u).", *req_id, task_count);
+            "Failed: unable to allocate task_ids array for batch request_id=%lu (task_count=%u).", *req_id, task_count);
         return false;
     }
 
     *worker = select_best_worker(handle);
     if (!*worker) {
-        OST_LOG_ERROR("Failed: no available worker for batch request_id=%u.", *req_id);
+        OST_LOG_ERROR("Failed: no available worker for batch request_id=%lu.", *req_id);
         free(*task_ids);
         return false;
     }
@@ -955,7 +950,7 @@ static bool validate_and_select_worker(ThreadPoolHandle handle,
 static TaskNode *build_batch_nodes(ThreadPoolHandle handle,
                                    ThreadPoolTask *tasks,
                                    uint32_t task_count,
-                                   uint32_t req_id,
+                                   uint64_t req_id,
                                    TaskCompleteCb complete_cb,
                                    void *user_data,
                                    uint64_t *task_ids,
@@ -968,7 +963,7 @@ static TaskNode *build_batch_nodes(ThreadPoolHandle handle,
         TaskNode *node;
         if (!create_batch_node(handle, &tasks[i], req_id, complete_cb, user_data, &node, &task_ids[i])) {
             OST_LOG_ERROR("Failed: create_batch_node returned false "
-                          "(request_id=%u, index=%u).",
+                          "(request_id=%lu, index=%u).",
                           req_id,
                           i);
             // 清理已创建的节点
@@ -1008,7 +1003,7 @@ static void attach_nodes_to_worker(WorkerThread *worker, TaskNode *head, TaskNod
 
 // 批量提交辅助：更新上下文
 static bool update_batch_context(ThreadPoolHandle handle,
-                                 uint32_t req_id,
+                                 uint64_t req_id,
                                  int worker_idx,
                                  uint32_t task_count,
                                  TaskCompleteCb batch_complete_cb,
@@ -1025,7 +1020,7 @@ static bool update_batch_context(ThreadPoolHandle handle,
     ctx = malloc(sizeof(RequestContext));
     if (!ctx) {
         pthread_mutex_unlock(&handle->req_hash_mutex);
-        OST_LOG_ERROR("Failed: unable to allocate RequestContext for batch request_id=%u.", req_id);
+        OST_LOG_ERROR("Failed: unable to allocate RequestContext for batch request_id=%lu.", req_id);
         return false;
     }
     ctx->request_id = req_id;
@@ -1048,7 +1043,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
                                          TaskCompleteCb batch_complete_cb,
                                          void *batch_user_data)
 {
-    uint32_t req_id;
+    uint64_t req_id;
     WorkerThread *target_worker;
     uint64_t *task_ids;
 
@@ -1060,7 +1055,7 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
     uint32_t created = 0;
     TaskNode *head = build_batch_nodes(handle, tasks, task_count, req_id, complete_cb, user_data, task_ids, &created);
     if (!head) {
-        OST_LOG_ERROR("Failed: build_batch_nodes returned NULL (request_id=%u, task_count=%u).", req_id, task_count);
+        OST_LOG_ERROR("Failed: build_batch_nodes returned NULL (request_id=%lu, task_count=%u).", req_id, task_count);
         free(task_ids);
         return NULL;
     }
@@ -1073,14 +1068,15 @@ uint64_t *thread_pool_submit_batch_tasks(ThreadPoolHandle handle,
 
     if (!update_batch_context(
             handle, req_id, target_worker->worker_idx, task_count, batch_complete_cb, batch_user_data)) {
-        OST_LOG_ERROR("Failed to update context for req %u", req_id);
+        OST_LOG_ERROR("Failed to update context for req %lu", req_id);
     }
-    OST_LOG_DEBUG(1, "Batch of %u tasks (req=%u) submitted to worker %d", task_count, req_id, target_worker->worker_idx);
+    OST_LOG_DEBUG(
+        1, "Batch of %u tasks (req=%lu) submitted to worker %d", task_count, req_id, target_worker->worker_idx);
     return task_ids;
 }
 
 // 从 worker 队列中取消指定 request_id 的任务（返回移除数量）
-static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
+static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint64_t req_id)
 {
     pthread_mutex_lock(&worker->mutex);
     TaskNode *prev = NULL;
@@ -1111,14 +1107,14 @@ static uint32_t cancel_in_worker_queue(WorkerThread *worker, uint32_t req_id)
     uint32_t removed_pending = worker_pending_req_remove_by_req(worker, req_id);
     pthread_mutex_unlock(&worker->mutex);
     if (removed_pending > 0) {
-        OST_LOG_DEBUG(2,
-            "Removed %u pending wakeups for req %u from worker %d.", removed_pending, req_id, worker->worker_idx);
+        OST_LOG_DEBUG(
+            2, "Removed %u pending wakeups for req %lu from worker %d.", removed_pending, req_id, worker->worker_idx);
     }
     return removed;
 }
 
 // 取消后更新上下文
-static void update_context_after_cancel(ThreadPoolHandle handle, uint32_t request_id, uint32_t removed)
+static void update_context_after_cancel(ThreadPoolHandle handle, uint64_t request_id, uint32_t removed)
 {
     pthread_mutex_lock(&handle->req_hash_mutex);
     RequestContext *ctx = find_req_context_locked(handle, request_id);
@@ -1133,14 +1129,14 @@ static void update_context_after_cancel(ThreadPoolHandle handle, uint32_t reques
 }
 
 // 根据 request_id 销毁所有未执行的任务
-int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id)
+int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint64_t request_id)
 {
     if (!handle) {
         OST_LOG_ERROR("Failed: handle is NULL in thread_pool_cancel_tasks_by_req.");
         return -1;
     }
     if (!handle->is_running) {
-        OST_LOG_WARN("Cancel request ignored because thread pool is not running (request_id=%u).", request_id);
+        OST_LOG_WARN("Cancel request ignored because thread pool is not running (request_id=%lu).", request_id);
         return -1;
     }
 
@@ -1154,16 +1150,16 @@ int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id
     pthread_mutex_unlock(&handle->req_hash_mutex);
 
     if (worker_idx < 0) {
-        OST_LOG_DEBUG(1, "No request context found when canceling request_id=%u.", request_id);
+        OST_LOG_DEBUG(1, "No request context found when canceling request_id=%lu.", request_id);
         return 0;
     }
 
     uint32_t removed = cancel_in_worker_queue(&handle->workers[worker_idx], request_id);
     if (removed > 0) {
         update_context_after_cancel(handle, request_id, removed);
-        OST_LOG_DEBUG(1, "Canceled %u queued tasks for request_id=%u.", removed, request_id);
+        OST_LOG_DEBUG(1, "Canceled %u queued tasks for request_id=%lu.", removed, request_id);
     } else {
-        OST_LOG_DEBUG(1, "No queued tasks needed cancellation for request_id=%u.", request_id);
+        OST_LOG_DEBUG(1, "No queued tasks needed cancellation for request_id=%lu.", request_id);
     }
     return (int)removed;
 }
