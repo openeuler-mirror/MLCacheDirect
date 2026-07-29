@@ -231,7 +231,8 @@ Key points of the current design:
 
 Responsible for URMA encapsulation:
 
-- `urma_write_with_notify()`
+- `urma_write_chunk()`
+- `urma_write_notify()`
 - `urma_recv_with_notify()`
 
 Send path: Transmits data via `URMA_OPC_WRITE_IMM`, carrying `notify_data`/`user_ctx`.
@@ -460,7 +461,8 @@ Remote/Local completion arrival
   -> os_transport_wake_up_task()
       -> Wake up the worker by request_id.
           -> The worker executes the next send task.
-              -> urma_write_with_notify()
+              -> urma_write_notify()
+              -> urma_write_chunk()
 
 Caller
   -> wait_and_free_sync()

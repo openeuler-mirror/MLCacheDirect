@@ -199,7 +199,8 @@ typedef int (*notify_callback_t)(void *user_data);
 
 `send_task_worker_func()` 负责调用：
 
-- `urma_write_with_notify()`
+- `urma_write_chunk()`
+- `urma_write_notify()`
 
 把后续 chunk 继续发出去。
 
@@ -236,7 +237,8 @@ typedef int (*notify_callback_t)(void *user_data);
 
 负责 URMA 封装：
 
-- `urma_write_with_notify()`
+- `urma_write_chunk()`
+- `urma_write_notify()`
 - `urma_recv_with_notify()`
 
 send 路径通过 `URMA_OPC_WRITE_IMM` 发送，并携带 `notify_data` / `user_ctx`。  
@@ -277,7 +279,8 @@ int os_transport_log_reg(int level, log_callback_t cb);
 1. 主线程先把整批 send task 注册到线程池；
 2. 立即手动发送第一个 chunk；
 3. 后续 chunk 由 completion 驱动 worker 逐个继续发送；
-4. 调用方通过 `wait_and_free_sync()` 等待整批完成。
+4. 最后一个 chunk 发送后的本地 completion 由额外的尾片通知 task 承接；
+5. 调用方通过 `wait_and_free_sync()` 等待整批完成。
 
 ### 6.3 recv 路径分片特点
 
@@ -359,6 +362,7 @@ uint32_t os_transport_send(void *handle,
 - 生成异步 send task
 - 首片立即发送
 - 后续分片由 notify 驱动 worker 继续发送
+- 尾片发送完成后的本地 notify 由额外 task 承接
 - 返回 `task_sync_t` 供调用方等待整批完成
 
 说明：
@@ -463,7 +467,9 @@ uint32_t os_transport_destroy(void *handle);
   -> os_transport_wake_up_task()
       -> 按 request_id 唤醒 worker
           -> worker 执行下一片 send task
-              -> urma_write_with_notify()
+              // 最后一个task只通知，不传输chunk
+              -> urma_write_notify()
+              -> urma_write_chunk()
 
 调用方
   -> wait_and_free_sync()

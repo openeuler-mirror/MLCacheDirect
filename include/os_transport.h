@@ -31,6 +31,9 @@ typedef int (*notify_callback_t)(void *user_data);
 #define DEFAULT_CHUNK_SIZE          (2 * 1024 * 1024) // 2MB
 #define DEFAULT_RECV_QUEUE_CAPACITY 256               // 默认接收队列容量
 
+#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 4) - 1)
+#define OS_TRANSPORT_MAX_CHUNK_NUM ((uint32_t)(OS_TRANSPORT_MAX_CHUNK_ID + 1))
+
 typedef union {
     struct {
         uint64_t request_id : 10; // 10位

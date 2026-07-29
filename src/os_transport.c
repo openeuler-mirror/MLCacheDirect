@@ -14,8 +14,6 @@
 // 全局初始化状态
 static int g_inited = 0;
 
-#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 4) - 1)
-#define OS_TRANSPORT_MAX_CHUNK_NUM ((uint32_t)(OS_TRANSPORT_MAX_CHUNK_ID + 1))
 #define OS_TRANSPORT_WAIT_TIMEOUT 1U
 #define OS_TRANSPORT_WAIT_ERROR   ((uint32_t) - 1)
 
@@ -619,20 +617,19 @@ static void construct_send_task_arg(send_task_arg_t *arg,
     os_transport_user_data_t user_data_server = {0};
     os_transport_user_data_t user_data_client = {0};
 
-    user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
-    user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
     if (chunk_id == OS_TRANSPORT_MAX_CHUNK_ID) {
         OST_LOG_WARN("chunk_id=%lu exceeds user data bitfield range (max=%lu), value will be truncated.",
                      (unsigned long)chunk_id,
                      (unsigned long)OS_TRANSPORT_MAX_CHUNK_ID);
     }
-    user_data_server.bs.chunk_id = chunk_id;
-    user_data_server.bs.chunk_size = encode_transport_chunk_size(chunk_info->len);
 
+    user_data_server.bs.request_id = write_info.user_ctx_server.bs.request_id; // 将server_key作为request_id传入
+    user_data_server.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
+    user_data_server.bs.chunk_id   = chunk_id;
+    user_data_server.bs.chunk_size = chunk_info ? encode_transport_chunk_size(chunk_info->len) : 0;
+
+    user_data_client.bs = user_data_server.bs;
     user_data_client.bs.request_id = write_info.user_ctx_client.bs.request_id; // 将client_key作为request_id传入
-    user_data_client.bs.chunk_type = is_last_chunk ? LAST_CHUNK : MIDDLE_CHUNK;
-    user_data_client.bs.chunk_id = chunk_id;
-    user_data_client.bs.chunk_size = encode_transport_chunk_size(chunk_info->len);
 
     arg->write_info = write_info;
     arg->write_info.user_ctx_server = user_data_server;
@@ -681,13 +678,25 @@ static ThreadPoolTask construct_worker_task(
 
 static urma_status_t do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
 {
-    urma_status_t ret = urma_write_with_notify(write_info, chunk_info);
-    if (ret != URMA_SUCCESS) {
-        OST_LOG_ERROR("Failed: urma_write_with_notify returned %d for request_id=%u, chunk_id=%lu.",
-                      (int)ret,
+    urma_status_t ret = urma_write_notify(write_info, chunk_info);
+    if (ret != 0) {
+        OST_LOG_ERROR("Failed: urma_write_notify returned %d for request_id=%u, chunk_id=%lu.",
+                      ret,
                       write_info.user_ctx_client.bs.request_id,
                       write_info.user_ctx_client.bs.chunk_id);
+        return ret;
     }
+
+    if (chunk_info != NULL) {
+        ret = urma_write_chunk(write_info, chunk_info);
+        if (ret != 0) {
+            OST_LOG_ERROR("Failed: urma_write_chunk returned %d for request_id=%u, chunk_id=%lu.",
+                          ret,
+                          write_info.user_ctx_server.bs.request_id,
+                          write_info.user_ctx_server.bs.chunk_id);
+        }
+    }
+
     return ret;
 }
 
@@ -812,11 +821,12 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
                                urma_info_t urma_info,
                                task_sync_t *sync)
 {
-    // 第0个chunk由调用线程发送，剩余chunk注册为task供worker线程发送，因此task_num为chunk_num-1
-    uint32_t task_num = chunk_num - 1;
+    // 第0个chunk由调用线程发送；task_num-1个发送task，最后1个task承接尾片本地完成通知。
+    uint32_t task_num = chunk_num;
     uint64_t *task_ids = NULL;
     task_group_t *task_group = NULL;
     send_task_arg_t *task_args = NULL;
+    uint32_t i, chunk_idx;
 
     if (chunk_num < 2) {
         OST_LOG_ERROR("Failed: chunk_num must be >= 2 for async send path "
@@ -836,15 +846,20 @@ static int register_send_tasks(os_transport_handle_t *ost_handle,
 
     sync->total_tasks = task_num;
     // 从第1个chunk开始注册task，第0个chunk由调用线程发送，确保task_id与chunk_id保持一致，便于追踪和调试
-    for (uint32_t i = 0; i < task_num; i++) {
-        uint32_t chunk_idx = i + 1;
-        bool is_last_chunk = (chunk_idx == chunk_num - 1);
+    for (i = 0, chunk_idx = 1; i < task_num; i++, chunk_idx++) {
+        bool is_last_chunk = (chunk_idx >= chunk_num - 1);
         uint32_t request_id = (uint32_t)(urma_info.write_info.user_ctx_server.bs.request_id);
 
         construct_send_task_arg(
-            &task_args[i], urma_info.write_info, &chunks[chunk_idx], chunk_idx, is_last_chunk, sync);
+            &task_args[i], urma_info.write_info, 
+            chunk_idx < chunk_num ? &chunks[chunk_idx] : NULL, 
+            chunk_idx, is_last_chunk, sync);
         task_group->tasks[i] = construct_worker_task(chunk_idx, request_id, task_func, &task_args[i], NULL);
     }
+    for (i = task_num - 1; i > 0; i--) {
+        task_args[i].write_info.user_ctx_client.bs = task_args[i - 1].write_info.user_ctx_client.bs;
+    }
+    task_args[0].write_info.user_ctx_client.bs = urma_info.write_info.user_ctx_client.bs;
 
     task_ids =
         thread_pool_submit_batch_tasks(ost_handle->thread_pool, task_group->tasks, task_num, NULL, NULL, NULL, NULL);
@@ -1006,31 +1021,6 @@ static int register_tasks_and_bind_chunks(os_transport_handle_t *ost_handle,
     return 0;
 }
 
-static urma_status_t send_single_chunk(urma_jetty_info_t *jetty_info,
-                                       ost_buffer_info_t *local_src,
-                                       ost_buffer_info_t *remote_dst,
-                                       uint32_t len,
-                                       uint32_t server_key,
-                                       uint32_t client_key)
-{
-    urma_write_info_t write_info = build_write_info(jetty_info, local_src, remote_dst, len, server_key, client_key);
-    write_info.user_ctx_server.bs.chunk_type = LAST_CHUNK;
-    write_info.user_ctx_client.bs.chunk_type = LAST_CHUNK;
-    chunk_info_t chunk = {.src = local_src[0].addr, .dst = remote_dst[0].addr, .len = len};
-    urma_status_t ret = urma_write_with_notify(write_info, &chunk);
-    if (ret != URMA_SUCCESS) {
-        OST_LOG_ERROR("Failed: URMA write_with_notify returned failure "
-                      "(ret=%d, len=%u, server_key=%u, client_key=%u, src=0x%lx, dst=0x%lx).",
-                      (int)ret,
-                      len,
-                      server_key,
-                      client_key,
-                      chunk.src,
-                      chunk.dst);
-    }
-    return ret;
-}
-
 uint32_t os_transport_reg_jfc(urma_jfce_t *jfce, urma_jfc_t *jfc, void *handle)
 {
     os_transport_handle_t *ost_handle;
@@ -1156,10 +1146,9 @@ init_fail:
  * 发送数据的函数实现
  * 1. 如果数据长度小于等于DEFAULT_CHUNK_SIZE，则直接发送；
  * 2. 如果数据长度大于DEFAULT_CHUNK_SIZE，则拆分为多个chunk，每个chunk的大小不超过DEFAULT_CHUNK_SIZE
- * 3.
- * 将剩余chunk注册为对应task，最后一个chunk使用的回调函数负责唤醒os_transport_send的线程继续执行。
+ * 3. 将剩余chunk注册为发送task，并额外注册一个task承接最后一个chunk发送后的本地完成通知。
  * 4. 手动发送第一个chunk，触发notify机制，后续chunk的发送由对应的worker线程完成。
- * 5. os_transport_send的线程等待所有chunk发送完成后返回。
+ * 5. os_transport_send返回后，线程调用wait_and_free_sync/_timeout等待所有task完成。其中最后一个完成通知task用于标记所有task完成。
  */
 uint32_t os_transport_send(void *handle,
                            urma_jetty_info_t *jetty_info,
@@ -1196,17 +1185,6 @@ uint32_t os_transport_send(void *handle,
     OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_SEND_BEGIN, ret);
 #endif
 
-    if (len <= DEFAULT_CHUNK_SIZE) {
-        urma_status_t write_ret;
-        OST_LOG_DEBUG(1,
-            "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
-        write_ret = send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
-        if (urma_status) {
-            *urma_status = write_ret;
-        }
-        return write_ret == URMA_SUCCESS ? 0 : (uint32_t)-1;
-    }
-
     if (send_split_chunks(local_src, remote_dst, len, &chunks, &chunks_num) != 0) {
         return ret;
     }
@@ -1239,7 +1217,7 @@ uint32_t os_transport_send(void *handle,
         first_chunk_ret = (urma_status_t)first_chunk_inject_ret;
     } else {
 #endif
-        first_chunk_ret = urma_write_with_notify(write_info, &chunks[0]);
+        first_chunk_ret = urma_write_chunk(write_info, &chunks[0]);
 #if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
     }
 #endif
@@ -1361,28 +1339,34 @@ uint32_t os_transport_recv(void *handle,
 
 int os_transport_wake_up_task(void *handle, void *cr_t)
 {
-    int ret;
-
     if (!handle || !cr_t) {
         OST_LOG_ERROR("Failed: invalid arguments in os_transport_wake_up_task (handle=%p, cr_t=%p).", handle, cr_t);
         return -1;
     }
 
+    int ret;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     urma_cr_t *cr = (urma_cr_t *)cr_t;
     ThreadPoolHandle pool = ost_handle->thread_pool;
     TransportData user_data = {0};
     urma_cr_opcode_t opcode = cr->opcode;
-    if (opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
-        user_data = (TransportData)cr->imm_data;
-    } else if (opcode == URMA_CR_OPC_SEND) {
-        user_data = (TransportData)cr->user_ctx;
-    } else {
-        OST_LOG_ERROR("Unknown opcode %d", opcode);
-        return -1;
-    }
-    uint32_t request_id = user_data.bs.request_id;
 
+    if (cr->flag.bs.s_r) { // recv
+        if (opcode == URMA_CR_OPC_SEND_WITH_IMM) {
+            user_data = (TransportData)cr->imm_data;
+        } else {
+            OST_LOG_ERROR("Unknown opcode %d", opcode);
+            return -1;
+        }
+    } else { // send
+        user_data = (TransportData)cr->user_ctx;
+        if (user_data.bs.chunk_id >= OS_TRANSPORT_MAX_CHUNK_NUM) {
+            OST_LOG_INFO("ignore opcode %d", opcode);
+            return 0;
+        }
+    }
+
+    uint32_t request_id = user_data.bs.request_id;
     /*
      * 线程池会保存本次completion的user_data副本；后续recv worker再把对应副本的
      * 指针传入notify_callback，避免传递当前栈变量地址。
