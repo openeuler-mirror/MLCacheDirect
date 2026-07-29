@@ -85,7 +85,8 @@ uint32_t os_transport_send(void *handle,
                            uint32_t len,
                            uint32_t server_key,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle);
+                           task_sync_t **ret_sync_handle,
+                           urma_status_t *urma_status);
 
 uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
@@ -97,7 +98,13 @@ uint32_t os_transport_recv(void *handle,
 
 int os_transport_wake_up_task(void *handle, void *cr_t);
 
-uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
+/*
+ * urma_status is optional. For a send request, it receives the first
+ * non-success status from an asynchronous urma_write_with_notify() call.
+ * A non-zero API return with urma_status == URMA_SUCCESS indicates a transport
+ * library error rather than a task-function error.
+ */
+uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle, urma_status_t *urma_status);
 
 /*
  * Wait for a split request to finish, but only up to timeout_ms milliseconds.
@@ -106,7 +113,8 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
  * resources are released immediately when it is safe to do so. Running tasks,
  * if any, are allowed to finish and release the resources themselves.
  */
-uint32_t wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms);
+uint32_t wait_and_free_sync_timeout(
+    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status);
 
 uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id);
 

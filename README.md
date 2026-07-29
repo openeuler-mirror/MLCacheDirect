@@ -349,7 +349,8 @@ uint32_t os_transport_send(void *handle,
                            uint32_t len,
                            uint32_t server_key,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle);
+                           task_sync_t **ret_sync_handle,
+                           urma_status_t *urma_status);
 ```
 
 作用：
@@ -364,6 +365,10 @@ uint32_t os_transport_send(void *handle,
 
 - `client_key` 最终会作为 `request_id` 写入 completion 透传字段。
 - `server_key` 会用于另一侧 completion/上下文区分。
+- `urma_status` 可为空。单分片或多分片首片调用 `urma_write_with_notify()` 失败时，
+  接口返回非 0，并通过该参数原样返回底层 URMA 状态；其他库内错误返回非 0 时，该参数保持为
+  `URMA_SUCCESS`。
+- 多分片首片成功后，后续异步 write 的状态由 `wait_and_free_sync()` 返回。
 
 ### 7.4 recv 接口
 
@@ -406,7 +411,9 @@ int os_transport_wake_up_task(void *handle, void *cr_t);
 ### 7.6 等待并释放同步资源
 
 ```c
-uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
+uint32_t wait_and_free_sync(void *handle,
+                            task_sync_t *sync_handle,
+                            urma_status_t *urma_status);
 ```
 
 作用：
@@ -414,6 +421,9 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
 - 等待当前请求整批任务结束
 - 如果中途检测到任务未完整完成，则按 `request_id` 取消剩余任务
 - 释放同步对象、chunk 数组和任务组资源
+- `urma_status` 可为空。对于 send 请求，它返回异步 write task 的第一个非成功 URMA 状态。
+  wait 返回非 0 且该状态为 `URMA_SUCCESS`，表示超时、取消或库内部错误；该状态非成功则表示
+  write task 失败。
 
 ### 7.7 取消指定请求的任务
 
@@ -722,4 +732,3 @@ URMA_LIB_DIR=/usr/lib64 \
 1. `request_id -> 业务上下文` 映射；
 2. `chunk_id -> host/device 偏移` 映射；
 3. `notify_callback` 中的 H2D / 完成同步策略。
-

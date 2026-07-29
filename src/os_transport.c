@@ -385,6 +385,20 @@ static void task_sync_add_canceled_tasks(task_sync_t *sync, uint64_t canceled_ta
     }
 }
 
+// 保存send task调用URMA接口返回的第一个非成功状态，后续由wait接口返回给调用者。
+static void update_urma_status(task_sync_t *sync, urma_status_t urma_status)
+{
+    if (!sync || urma_status == URMA_SUCCESS) {
+        return;
+    }
+
+    pthread_mutex_lock(&sync->mutex);
+    if (sync->urma_status == URMA_SUCCESS) {
+        sync->urma_status = urma_status;
+    }
+    pthread_mutex_unlock(&sync->mutex);
+}
+
 static void mark_task_group_completed(task_sync_t *sync, bool task_success)
 {
     bool should_free = false;
@@ -665,13 +679,12 @@ static ThreadPoolTask construct_worker_task(
     return task;
 }
 
-static int do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
+static urma_status_t do_send_chunk_for_worker(urma_write_info_t write_info, chunk_info_t *chunk_info)
 {
-    int ret = 0;
-    ret = (int)urma_write_with_notify(write_info, chunk_info);
-    if (ret != 0) {
+    urma_status_t ret = urma_write_with_notify(write_info, chunk_info);
+    if (ret != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: urma_write_with_notify returned %d for request_id=%u, chunk_id=%lu.",
-                      ret,
+                      (int)ret,
                       write_info.user_ctx_client.bs.request_id,
                       write_info.user_ctx_client.bs.chunk_id);
     }
@@ -704,7 +717,7 @@ static void prepare_recv_task_user_data(void *task_arg, void *user_data)
 // worker线程执行的send任务函数，负责发送chunk
 static int send_task_worker_func(void *arg)
 {
-    int ret = 0;
+    urma_status_t ret = URMA_SUCCESS;
     uint32_t request_id;
     uint32_t chunk_id;
     uint32_t chunk_len;
@@ -722,11 +735,12 @@ static int send_task_worker_func(void *arg)
     sync = send_task_arg->sync;
 
     ret = do_send_chunk_for_worker(send_task_arg->write_info, send_task_arg->chunk_info);
-    if (ret != 0) {
+    if (ret != URMA_SUCCESS) {
         OST_LOG_WARN("Send worker task failed (request_id=%u, chunk_id=%u, len=%u).", request_id, chunk_id, chunk_len);
     }
-    mark_task_group_completed(sync, ret == 0 ? true : false);
-    return ret;
+    update_urma_status(sync, ret);
+    mark_task_group_completed(sync, ret == URMA_SUCCESS ? true : false);
+    return (int)ret;
 }
 
 // worker线程执行的recv任务函数，负责H2D操作
@@ -992,28 +1006,29 @@ static int register_tasks_and_bind_chunks(os_transport_handle_t *ost_handle,
     return 0;
 }
 
-static int send_single_chunk(urma_jetty_info_t *jetty_info,
-                             ost_buffer_info_t *local_src,
-                             ost_buffer_info_t *remote_dst,
-                             uint32_t len,
-                             uint32_t server_key,
-                             uint32_t client_key)
+static urma_status_t send_single_chunk(urma_jetty_info_t *jetty_info,
+                                       ost_buffer_info_t *local_src,
+                                       ost_buffer_info_t *remote_dst,
+                                       uint32_t len,
+                                       uint32_t server_key,
+                                       uint32_t client_key)
 {
     urma_write_info_t write_info = build_write_info(jetty_info, local_src, remote_dst, len, server_key, client_key);
     write_info.user_ctx_server.bs.chunk_type = LAST_CHUNK;
     write_info.user_ctx_client.bs.chunk_type = LAST_CHUNK;
     chunk_info_t chunk = {.src = local_src[0].addr, .dst = remote_dst[0].addr, .len = len};
-    if (urma_write_with_notify(write_info, &chunk) != URMA_SUCCESS) {
+    urma_status_t ret = urma_write_with_notify(write_info, &chunk);
+    if (ret != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: URMA write_with_notify returned failure "
-                      "(len=%u, server_key=%u, client_key=%u, src=0x%lx, dst=0x%lx).",
+                      "(ret=%d, len=%u, server_key=%u, client_key=%u, src=0x%lx, dst=0x%lx).",
+                      (int)ret,
                       len,
                       server_key,
                       client_key,
                       chunk.src,
                       chunk.dst);
-        return -1;
     }
-    return 0;
+    return ret;
 }
 
 uint32_t os_transport_reg_jfc(urma_jfce_t *jfce, urma_jfc_t *jfc, void *handle)
@@ -1153,7 +1168,8 @@ uint32_t os_transport_send(void *handle,
                            uint32_t len,
                            uint32_t server_key,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle)
+                           task_sync_t **ret_sync_handle,
+                           urma_status_t *urma_status)
 {
     urma_write_info_t write_info;
     urma_info_t urma_info;
@@ -1165,6 +1181,9 @@ uint32_t os_transport_send(void *handle,
 
     if (ret_sync_handle) {
         *ret_sync_handle = NULL;
+    }
+    if (urma_status) {
+        *urma_status = URMA_SUCCESS;
     }
 
     OST_LOG_DEBUG(1, "Submitting send request (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
@@ -1178,9 +1197,14 @@ uint32_t os_transport_send(void *handle,
 #endif
 
     if (len <= DEFAULT_CHUNK_SIZE) {
+        urma_status_t write_ret;
         OST_LOG_DEBUG(1,
             "Using single-chunk send path (len=%u, server_key=%u, client_key=%u).", len, server_key, client_key);
-        return send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
+        write_ret = send_single_chunk(jetty_info, local_src, remote_dst, len, server_key, client_key);
+        if (urma_status) {
+            *urma_status = write_ret;
+        }
+        return write_ret == URMA_SUCCESS ? 0 : (uint32_t)-1;
     }
 
     if (send_split_chunks(local_src, remote_dst, len, &chunks, &chunks_num) != 0) {
@@ -1226,7 +1250,11 @@ uint32_t os_transport_send(void *handle,
                       chunks_num,
                       server_key,
                       client_key);
+        if (urma_status) {
+            *urma_status = first_chunk_ret;
+        }
         // 如果第一个chunk发送失败，应该直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
+        // 资源所有权语义：调用方需要通过wait接口取消后续任务并释放sync资源。
         pthread_mutex_lock(&sync_handle->mutex);
         sync_handle->request_completed = 1;
         pthread_cond_signal(&sync_handle->cond);
@@ -1378,12 +1406,17 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     return ret;
 }
 
-static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle, int64_t timeout_ms)
+static uint32_t wait_and_free_sync_common(
+    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
 {
     uint32_t wait_ret = 0;
     uint32_t request_id;
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     task_group_t *task_group;
+
+    if (urma_status) {
+        *urma_status = URMA_SUCCESS;
+    }
 
     if (!ost_handle || !sync_handle) {
         OST_LOG_ERROR("Failed: invalid arguments (handle=%p, sync_handle=%p).", handle, (void *)sync_handle);
@@ -1434,7 +1467,12 @@ static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle
     uint64_t completed = sync_handle->completed_tasks;
     uint64_t canceled = sync_handle->canceled_tasks;
     uint64_t total = sync_handle->total_tasks;
+    urma_status_t saved_urma_status = sync_handle->urma_status;
     pthread_mutex_unlock(&sync_handle->mutex);
+
+    if (urma_status) {
+        *urma_status = saved_urma_status;
+    }
 
     if (should_free) {
         free_sync_owned_resources(sync_handle);
@@ -1451,17 +1489,18 @@ static uint32_t wait_and_free_sync_common(void *handle, task_sync_t *sync_handle
                      total,
                      wait_ret);
     }
-    return wait_ret;
+    return saved_urma_status == URMA_SUCCESS ? wait_ret : OS_TRANSPORT_WAIT_ERROR;
 }
 
-uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle)
+uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle, urma_status_t *urma_status)
 {
-    return wait_and_free_sync_common(handle, sync_handle, -1);
+    return wait_and_free_sync_common(handle, sync_handle, -1, urma_status);
 }
 
-uint32_t wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms)
+uint32_t wait_and_free_sync_timeout(
+    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status)
 {
-    return wait_and_free_sync_common(handle, sync_handle, timeout_ms);
+    return wait_and_free_sync_common(handle, sync_handle, timeout_ms, urma_status);
 }
 
 uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id)

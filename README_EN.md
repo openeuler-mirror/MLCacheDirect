@@ -345,7 +345,8 @@ uint32_t os_transport_send(void *handle,
                            uint32_t len,
                            uint32_t server_key,
                            uint32_t client_key,
-                           task_sync_t **ret_sync_handle);
+                           task_sync_t **ret_sync_handle,
+                           urma_status_t *urma_status);
 ```
 
 Purposes:
@@ -360,6 +361,11 @@ Description:
 
 - `client_key` is ultimately written into the completion pass-through field as `request_id`.
 - `server_key` is used for completion or context differentiation on the peer side.
+- `urma_status` is optional. If a single-chunk write or the first chunk of a split write fails in
+  `urma_write_with_notify()`, the API returns non-zero and reports the original URMA status through this parameter.
+  For other library-side failures, the parameter remains `URMA_SUCCESS`.
+- After the first chunk of a split write succeeds, statuses from subsequent asynchronous writes are reported by
+  `wait_and_free_sync()`.
 
 ### 7.4 Recv API
 
@@ -402,7 +408,9 @@ Purposes:
 ### 7.6 Waiting and Freeing Synchronization Resources
 
 ```c
-uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle);
+uint32_t wait_and_free_sync(void *handle,
+                            task_sync_t *sync_handle,
+                            urma_status_t *urma_status);
 ```
 
 Purposes:
@@ -410,6 +418,9 @@ Purposes:
 - Blocks to wait for the entire batch of tasks for the current request to complete.
 - Cancels remaining unexecuted tasks by `request_id` if a failure or incomplete completion is detected midway.
 - Frees the synchronization objects, chunk arrays, and task group resources.
+- `urma_status` is optional. For a send request, it reports the first non-success URMA status from an asynchronous
+  write task. A non-zero wait result with `URMA_SUCCESS` indicates a timeout, cancellation, or library-side failure;
+  a non-success URMA status indicates a write-task failure.
 
 ### 7.7 Cancelling Tasks for a Specific Request
 
