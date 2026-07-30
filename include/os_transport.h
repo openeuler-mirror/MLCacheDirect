@@ -30,17 +30,20 @@ typedef int (*notify_callback_t)(void *user_data);
 
 #define DEFAULT_CHUNK_SIZE          (2 * 1024 * 1024) // 2MB
 #define DEFAULT_RECV_QUEUE_CAPACITY 256               // 默认接收队列容量
+#define REQUEST_ID_BITS             60U               // request_id传输字段占用的位数
+#define REQUEST_ID_EFFECTIVE_BITS   40U               // API传入的request_id仅低40位有效
+#define CHUNK_TYPE_BITS             1                 // chunk_type占用的位数
+#define CHUNK_ID_BITS               3                 // chunk_id占用的位数
 
-#define OS_TRANSPORT_MAX_CHUNK_ID ((1ULL << 4) - 1)
+#define OS_TRANSPORT_MAX_CHUNK_ID  ((1ULL << CHUNK_ID_BITS) - 1)
 #define OS_TRANSPORT_MAX_CHUNK_NUM ((uint32_t)(OS_TRANSPORT_MAX_CHUNK_ID + 1))
 
 typedef union {
     struct {
-        uint64_t request_id : 10; // 10位
-        uint64_t chunk_type : 1; // 1位：0表示非尾片，1表示尾片
-        uint64_t chunk_id : 4;   // 4位：最多支持16个分片
-        uint64_t chunk_size : 1; // 1位：0表示2MB，1表示4MB
-        uint64_t rsv : 48;
+        uint64_t request_id : REQUEST_ID_BITS; // 实际可用40位；API使用连续低40位，内部将WRITE_WITH_IMM
+                                               // 的request_id编码到传输字段的[59:40]和[19:0]。
+        uint64_t chunk_type : CHUNK_TYPE_BITS; // 1位：0表示非尾片，1表示尾片
+        uint64_t chunk_id : CHUNK_ID_BITS;     // 3位：最多支持8个分片
     } bs;
     uint64_t user_ctx;
 } os_transport_user_data_t;
@@ -86,8 +89,8 @@ uint32_t os_transport_send(void *handle,
                            ost_buffer_info_t *local_src,
                            ost_buffer_info_t *remote_dst,
                            uint32_t len,
-                           uint32_t server_key,
-                           uint32_t client_key,
+                           uint64_t server_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            urma_status_t *urma_status);
 
@@ -95,7 +98,7 @@ uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
                            ost_device_info_t *device_dst,
                            uint32_t len,
-                           uint32_t client_key,
+                           uint64_t client_key,
                            task_sync_t **ret_sync_handle,
                            notify_callback_t notify_callback);
 
@@ -116,10 +119,10 @@ uint32_t wait_and_free_sync(void *handle, task_sync_t *sync_handle, urma_status_
  * resources are released immediately when it is safe to do so. Running tasks,
  * if any, are allowed to finish and release the resources themselves.
  */
-uint32_t wait_and_free_sync_timeout(
-    void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status);
+uint32_t
+wait_and_free_sync_timeout(void *handle, task_sync_t *sync_handle, int64_t timeout_ms, urma_status_t *urma_status);
 
-uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint32_t request_id);
+uint32_t os_transport_cancel_tasks(void *handle, task_sync_t **sync_handle, uint64_t request_id);
 
 uint32_t os_transport_destroy(void *handle);
 

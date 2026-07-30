@@ -65,7 +65,7 @@ static urma_status_t urma_write_internal(urma_write_info_t write_info,
         ret = urma_post_jetty_send_wr(write_info.jetty, &wr, &bad_wr);
     } else {
         OST_LOG_ERROR("Failed: neither jfs nor jetty is available for write request "
-                      "(request_id=%u, chunk_id=%u, len=%u).",
+                      "(request_id=%lu, chunk_id=%u, len=%u).",
                       write_info.user_ctx_client.bs.request_id,
                       write_info.user_ctx_client.bs.chunk_id,
                       chunk_info ? chunk_info->len : 0);
@@ -74,7 +74,7 @@ static urma_status_t urma_write_internal(urma_write_info_t write_info,
 
     if (ret != URMA_SUCCESS) {
         OST_LOG_ERROR("Failed: URMA write post returned %d "
-                      "(request_id=%u, chunk_id=%u, len=%u).",
+                      "(request_id=%lu, chunk_id=%u, len=%u).",
                       (int)ret,
                       write_info.user_ctx_client.bs.request_id,
                       write_info.user_ctx_client.bs.chunk_id,
@@ -115,7 +115,10 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
         for (int loop = 0; loop < RQE_PREFILL_MULTIPLE_DUPLEX; loop++) {
             ret = urma_post_jetty_recv_wr(recv_info.jetty, &wr, &bad_wr);
             if (ret != URMA_SUCCESS) {
-                OST_LOG_ERROR("Failed: URMA jetty recv post returned %d (request_id=%u, index=%u).", (int)ret, recv_info.request_id, loop);
+                OST_LOG_ERROR("Failed: URMA jetty recv post returned %d (request_id=%lu, index=%u).",
+                              (int)ret,
+                              recv_info.request_id,
+                              loop);
                 break;
             }
         }
@@ -123,14 +126,14 @@ urma_status_t urma_recv_with_notify(urma_recv_info_t recv_info, struct chunk_inf
         ret = urma_post_jfr_wr(recv_info.jfr, &wr, &bad_wr);
     } else {
         OST_LOG_ERROR("Failed: neither jetty nor jfr is available for recv request "
-                      "(request_id=%u, len=%u).",
+                      "(request_id=%lu, len=%u).",
                       recv_info.request_id,
                       chunk_info->len);
         return URMA_FAIL;
     }
 
     if (ret != URMA_SUCCESS) {
-        OST_LOG_ERROR("Failed: URMA recv post returned %d via %s (request_id=%u, len=%u).",
+        OST_LOG_ERROR("Failed: URMA recv post returned %d via %s (request_id=%lu, len=%u).",
                       (int)ret,
                       recv_info.jetty ? "jetty" : "jfr",
                       recv_info.request_id,

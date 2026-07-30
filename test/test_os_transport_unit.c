@@ -20,13 +20,13 @@ static int g_mock_pool_start_fail = 0;
 static int g_mock_submit_fail = 0;
 static uint32_t g_mock_destroy_calls = 0;
 static uint32_t g_mock_last_submit_task_count = 0;
-static uint32_t g_mock_last_submit_request_id = 0;
+static uint64_t g_mock_last_submit_request_id = 0;
 static void *g_mock_last_submit_task_arg0 = NULL;
 static int g_mock_cancel_ret = 0;
 static uint32_t g_mock_cancel_calls = 0;
-static uint32_t g_mock_cancel_last_request_id = 0;
+static uint64_t g_mock_cancel_last_request_id = 0;
 static uint32_t g_mock_wake_calls = 0;
-static uint32_t g_mock_wake_last_request_id = 0;
+static uint64_t g_mock_wake_last_request_id = 0;
 static os_transport_user_data_t g_mock_wake_last_user_data;
 
 /* URMA mock controls and observations. */
@@ -97,7 +97,7 @@ int thread_pool_start(ThreadPoolHandle handle)
 }
 
 uint64_t thread_pool_submit_task(ThreadPoolHandle handle,
-                                 uint32_t request_id,
+                                 uint64_t request_id,
                                  int (*task_func)(void *arg),
                                  void *task_arg,
                                  TaskCompleteCb complete_cb,
@@ -151,7 +151,7 @@ int async_poll_notify(ThreadPoolHandle handle, uint32_t notify_type, void *data)
     return 0;
 }
 
-int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id)
+int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint64_t request_id)
 {
     if (!handle) {
         return -1;
@@ -161,7 +161,7 @@ int thread_pool_cancel_tasks_by_req(ThreadPoolHandle handle, uint32_t request_id
     return g_mock_cancel_ret;
 }
 
-int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint32_t request_id, void *user_data)
+int thread_pool_wake_up_worker_by_req_id(ThreadPoolHandle handle, uint64_t request_id, void *user_data)
 {
     if (!handle) {
         return -1;
@@ -410,7 +410,9 @@ static void test_update_and_validate_and_build(void)
     local_src.tseg = (urma_target_seg_t *)0x40;
     remote_dst.tseg = (urma_target_seg_t *)0x50;
 
-    write_info = build_write_info(&jetty_info, &local_src, &remote_dst, 123, 456, 789);
+    const uint64_t raw_client_key = 0xABCDE12345ULL;
+    const uint64_t encoded_client_key = 0xABCDE0000012345ULL;
+    write_info = build_write_info(&jetty_info, &local_src, &remote_dst, 123, 456, raw_client_key);
     assert(write_info.jfs == jetty_info.jfs);
     assert(write_info.jetty == jetty_info.jetty);
     assert(write_info.target_jfr == jetty_info.tjetty);
@@ -419,14 +421,37 @@ static void test_update_and_validate_and_build(void)
     assert(write_info.flag.value == 0);
     assert(write_info.user_ctx_server.bs.request_id == 456);
     assert(write_info.user_ctx_server.bs.chunk_type == MIDDLE_CHUNK);
-    assert(write_info.user_ctx_server.bs.chunk_size == 0);
-    assert(write_info.user_ctx_client.bs.request_id == 789);
+    assert(write_info.user_ctx_client.bs.request_id == encoded_client_key);
     assert(write_info.user_ctx_client.bs.chunk_type == MIDDLE_CHUNK);
-    assert(write_info.user_ctx_client.bs.chunk_size == 0);
     assert(validate_send_input(&handle, &jetty_info, &local_src, &remote_dst, 1, &sync_handle) == 0);
     assert(validate_recv_input(&handle, &local_src, &device_dst, 1, &sync_handle, test_notify_cb) == 0);
 
     g_inited = 0;
+}
+
+/*
+ * Request ID codec tests.
+ * Verify all effective bits round-trip and unsupported high bits are rejected.
+ */
+static void test_request_id_codec(void)
+{
+    const uint64_t request_ids[] = {
+        0,
+        URMA_REQ_ID_FIELD_MASK,
+        1ULL << URMA_REQ_ID_FIELD_WIDTH,
+        0xABCDE12345ULL,
+        OS_TRANSPORT_MAX_REQUEST_ID,
+    };
+
+    for (size_t i = 0; i < sizeof(request_ids) / sizeof(request_ids[0]); i++) {
+        uint64_t encoded_request_id = encode_request_id(request_ids[i]);
+        assert((encoded_request_id & (URMA_REQ_ID_FIELD_MASK << URMA_REQ_ID_FIELD_WIDTH)) == 0);
+        assert(decode_request_id(encoded_request_id) == request_ids[i]);
+        assert(is_request_id_valid(request_ids[i]));
+    }
+
+    assert(encode_request_id(0xABCDE12345ULL) == 0xABCDE0000012345ULL);
+    assert(!is_request_id_valid(OS_TRANSPORT_MAX_REQUEST_ID + 1));
 }
 
 /*
@@ -469,21 +494,28 @@ static void test_recv_queue_limiter_and_wake_up(void)
     cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
     assert(os_transport_wake_up_task(&handle, &cr) == -1);
 
-    user_data.bs.request_id = 0x3FF;
+    const uint64_t raw_request_id = 0xABCDE12345ULL;
+    const uint64_t encoded_request_id = 0xABCDE0000012345ULL;
+    user_data.bs.request_id = raw_request_id;
     user_data.bs.chunk_id = 7;
     user_data.bs.chunk_type = LAST_CHUNK;
     cr.opcode = URMA_CR_OPC_SEND;
     cr.user_ctx = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == 0);
     assert(g_mock_wake_calls == 1);
-    assert(g_mock_wake_last_request_id == 0x3FF);
+    assert(g_mock_wake_last_request_id == raw_request_id);
     assert(g_mock_wake_last_user_data.user_ctx == user_data.user_ctx);
     assert(handle.recv_queue_available == 1);
 
+    user_data.bs.request_id = encoded_request_id;
     cr.opcode = URMA_CR_OPC_WRITE_WITH_IMM;
     cr.imm_data = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == 0);
     assert(g_mock_wake_calls == 2);
+    assert(g_mock_wake_last_request_id == raw_request_id);
+    assert(g_mock_wake_last_user_data.bs.request_id == raw_request_id);
+    assert(g_mock_wake_last_user_data.bs.chunk_id == 7);
+    assert(g_mock_wake_last_user_data.bs.chunk_type == LAST_CHUNK);
     assert(handle.recv_queue_available == 2);
 
     handle.thread_pool = NULL;
@@ -572,7 +604,6 @@ static void test_construct_and_worker_helper_functions(void)
     user_client = send_arg.write_info.user_ctx_client;
     assert(user_server.bs.chunk_type == MIDDLE_CHUNK);
     assert(user_server.bs.chunk_id == 5);
-    assert(user_server.bs.chunk_size == 0);
     assert(user_server.bs.request_id == 77);
     assert(user_client.bs.chunk_type == MIDDLE_CHUNK);
     assert(user_client.bs.request_id == 99);
@@ -613,13 +644,11 @@ static void test_user_data_bitfield_limits(void)
 {
     os_transport_user_data_t user_data = {0};
 
-    assert(OS_TRANSPORT_MAX_CHUNK_ID == 15U);
-    assert(OS_TRANSPORT_MAX_CHUNK_NUM == 16U);
+    assert(OS_TRANSPORT_MAX_CHUNK_ID == 7U);
+    assert(OS_TRANSPORT_MAX_CHUNK_NUM == 8U);
 
     user_data.bs.chunk_id = OS_TRANSPORT_MAX_CHUNK_ID;
-    user_data.bs.chunk_size = 0;
     assert(user_data.bs.chunk_id == OS_TRANSPORT_MAX_CHUNK_ID);
-    assert(user_data.bs.chunk_size == 0);
 }
 
 /*
@@ -665,7 +694,6 @@ static void test_do_chunk_and_worker_funcs(void)
     notify_data.bs.request_id = 55;
     notify_data.bs.chunk_id = 3;
     notify_data.bs.chunk_type = LAST_CHUNK;
-    notify_data.bs.chunk_size = 0;
     prepare_recv_task_user_data(&recv_arg, &notify_data);
     assert(recv_task_worker_func(&recv_arg) == 0);
     assert(g_mock_notify_calls == 1);
@@ -796,15 +824,19 @@ static void test_construct_and_bind_functions(void)
            == (uint32_t)-1);
     assert(construct_and_register_worker_task(&ost_handle, NULL, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, NULL, NULL)
+    assert(construct_and_register_worker_task(
+               &ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, NULL, NULL)
            == (uint32_t)-1);
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 0, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
+    assert(construct_and_register_worker_task(
+               &ost_handle, chunks_send, 0, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, NULL_TASK, dummy_task_func, urma_info, &sync, NULL)
+    assert(construct_and_register_worker_task(
+               &ost_handle, chunks_send, 2, NULL_TASK, dummy_task_func, urma_info, &sync, NULL)
            == (uint32_t)-1);
 
-    assert(construct_and_register_worker_task(&ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
+    assert(construct_and_register_worker_task(
+               &ost_handle, chunks_send, 2, SEND_TASK, dummy_task_func, urma_info, &sync, NULL)
            == 0);
     assert(sync != NULL);
     free_sync_owned_resources(sync);
@@ -935,23 +967,45 @@ static void test_init_destroy_and_send_recv_api(void)
     g_inited = 0;
     sync = (task_sync_t *)0xBAD;
     assert(os_transport_send(
-               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync,
-               &urma_status)
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync, &urma_status)
            == (uint32_t)-1);
     assert(urma_status == URMA_SUCCESS);
 
     g_inited = 1;
+    sync = (task_sync_t *)0xBAD;
+    assert(os_transport_send(&send_handle,
+                             &jetty_info,
+                             &local_src,
+                             &remote_dst,
+                             DEFAULT_CHUNK_SIZE,
+                             OS_TRANSPORT_MAX_REQUEST_ID + 1,
+                             2,
+                             &sync,
+                             &urma_status)
+           == (uint32_t)-1);
+    assert(sync == NULL);
+    assert(g_mock_urma_write_calls == 0);
+    assert(os_transport_send(&send_handle,
+                             &jetty_info,
+                             &local_src,
+                             &remote_dst,
+                             DEFAULT_CHUNK_SIZE,
+                             1,
+                             OS_TRANSPORT_MAX_REQUEST_ID + 1,
+                             &sync,
+                             &urma_status)
+           == (uint32_t)-1);
+    assert(g_mock_urma_write_calls == 0);
+
     g_mock_urma_write_status = URMA_SUCCESS;
     assert(os_transport_send(
-               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync,
-               &urma_status)
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync, &urma_status)
            == 0);
     assert(urma_status == URMA_SUCCESS);
 
     g_mock_urma_write_status = TEST_URMA_STATUS_FIRST;
     assert(os_transport_send(
-               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync,
-               &urma_status)
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync, &urma_status)
            == (uint32_t)-1);
     assert(urma_status == TEST_URMA_STATUS_FIRST);
 
@@ -962,8 +1016,7 @@ static void test_init_destroy_and_send_recv_api(void)
     urma_status = TEST_URMA_STATUS_FIRST;
     assert(
         os_transport_send(
-            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync,
-            &urma_status)
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync, &urma_status)
         == (uint32_t)-1);
     assert(sync == NULL);
     assert(urma_status == URMA_SUCCESS);
@@ -975,8 +1028,7 @@ static void test_init_destroy_and_send_recv_api(void)
     sync = (task_sync_t *)0xAAAA;
     assert(
         os_transport_send(
-            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync,
-            &urma_status)
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 100, 200, &sync, &urma_status)
         == (uint32_t)-1);
     assert(urma_status == TEST_URMA_STATUS_SECOND);
     assert(sync != NULL);
@@ -992,8 +1044,7 @@ static void test_init_destroy_and_send_recv_api(void)
     sync = NULL;
     assert(
         os_transport_send(
-            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync,
-            &urma_status)
+            &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 64, 101, 201, &sync, &urma_status)
         == 0);
     assert(urma_status == URMA_SUCCESS);
     assert(sync != NULL);
@@ -1013,6 +1064,18 @@ static void test_init_destroy_and_send_recv_api(void)
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
 
     g_inited = 1;
+    reset_mocks();
+    assert(os_transport_recv(&send_handle,
+                             &host_src,
+                             &device_dst,
+                             64,
+                             OS_TRANSPORT_MAX_REQUEST_ID + 1,
+                             &sync,
+                             test_notify_cb)
+           == (uint32_t)-1);
+    assert(sync == NULL);
+    assert(g_mock_urma_recv_calls == 0);
+
     reset_mocks();
     g_mock_submit_fail = 1;
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
@@ -1137,6 +1200,7 @@ int main(void)
     RUN_TEST(test_init_task_sync_and_free_helpers);
     RUN_TEST(test_wait_for_task_complete_and_mark);
     RUN_TEST(test_update_and_validate_and_build);
+    RUN_TEST(test_request_id_codec);
     RUN_TEST(test_recv_queue_limiter_and_wake_up);
     RUN_TEST(test_split_chunk_functions);
     RUN_TEST(test_construct_and_worker_helper_functions);
