@@ -426,6 +426,14 @@ rh2d_batch_data::Data LoadOrGenerateData(int count, int batch, const std::vector
         return data;
     }
 
+    std::string compatible_path;
+    if (rh2d_batch_data::LoadCompatible(signature, count, GetMaxValueSize(cache_configs), data,
+                                        compatible_path, error)) {
+        std::cout << "[Main] Loaded first " << count << " records from compatible test data cache: "
+                  << compatible_path << std::endl;
+        return data;
+    }
+
     std::cout << "[Main] No usable test data cache (" << error << "): " << cache_path << std::endl;
     GenerateAndCacheData(count, batch, cache_configs, signature, cache_path, data);
     return data;

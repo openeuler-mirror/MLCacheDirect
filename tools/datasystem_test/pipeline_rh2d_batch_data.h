@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <dirent.h>
 #include <fstream>
 #include <iomanip>
 #include <random>
@@ -62,6 +63,18 @@ inline std::string BuildCachePath(const std::string &signature)
     return stream.str();
 }
 
+inline std::string GetConfigSignature(const std::string &signature)
+{
+    size_t separator = signature.find(';');
+    return separator == std::string::npos ? std::string() : signature.substr(separator + 1);
+}
+
+inline bool IsCompatibleSignature(const std::string &actual, const std::string &expected)
+{
+    std::string actualConfig = GetConfigSignature(actual);
+    return !actualConfig.empty() && actualConfig == GetConfigSignature(expected);
+}
+
 template <typename T>
 inline bool WriteNumber(std::ofstream &output, const T &value)
 {
@@ -89,7 +102,7 @@ inline bool WriteHeader(std::ofstream &output, const std::string &signature, uin
 }
 
 inline bool ReadHeader(std::ifstream &input, const std::string &expectedSignature, uint64_t expectedCount,
-                       std::string &error)
+                       uint64_t &storedCount, std::string &error)
 {
     static const std::string expectedMagic("RH2DDATA", 8);
     char magic[8] = {};
@@ -103,16 +116,17 @@ inline bool ReadHeader(std::ifstream &input, const std::string &expectedSignatur
         error = "invalid or incomplete cache header";
         return false;
     }
-    if (version != 1 || endian != 0x01020304 || count != expectedCount || signatureSize > 4096) {
+    if (version != 1 || endian != 0x01020304 || count < expectedCount || signatureSize > 4096) {
         error = "cache metadata does not match this request";
         return false;
     }
     std::string signature(signatureSize, '\0');
     input.read(signature.data(), signature.size());
-    if (!input.good() || signature != expectedSignature) {
+    if (!input.good() || !IsCompatibleSignature(signature, expectedSignature)) {
         error = "cache parameter signature does not match this request";
         return false;
     }
+    storedCount = count;
     return true;
 }
 
@@ -172,7 +186,8 @@ inline bool Load(const std::string &path, const std::string &signature, size_t e
         error = "cache file does not exist";
         return false;
     }
-    if (!ReadHeader(input, signature, expectedCount, error)) return false;
+    uint64_t storedCount = 0;
+    if (!ReadHeader(input, signature, expectedCount, storedCount, error)) return false;
     Data loaded;
     loaded.reserve(expectedCount);
     for (size_t index = 0; index < expectedCount; ++index) {
@@ -185,6 +200,38 @@ inline bool Load(const std::string &path, const std::string &signature, size_t e
     }
     data.swap(loaded);
     return true;
+}
+
+inline bool IsCacheFileName(const std::string &name)
+{
+    static const std::string prefix = "pipeline_rh2d_batch_data_";
+    static const std::string suffix = ".bin";
+    return name.compare(0, prefix.size(), prefix) == 0 && name.size() > prefix.size() + suffix.size() &&
+           name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+inline bool LoadCompatible(const std::string &signature, size_t expectedCount, size_t maxValueSize,
+                           Data &data, std::string &loadedPath, std::string &error)
+{
+    DIR *directory = opendir(".");
+    if (directory == nullptr) {
+        error = "failed to scan current directory";
+        return false;
+    }
+    bool loaded = false;
+    while (dirent *entry = readdir(directory)) {
+        std::string path = entry->d_name;
+        std::string loadError;
+        if (!IsCacheFileName(path) || !Load(path, signature, expectedCount, maxValueSize, data, loadError)) {
+            continue;
+        }
+        loadedPath = path;
+        loaded = true;
+        break;
+    }
+    closedir(directory);
+    if (!loaded) error = "no compatible cache with enough records was found";
+    return loaded;
 }
 
 template <typename ProgressCallback>
