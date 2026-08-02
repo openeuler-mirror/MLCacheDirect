@@ -76,6 +76,11 @@ target_compile_options(pipeline_rh2d_batch_test PRIVATE
     $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
 )
 
+add_executable(pipeline_rh2d_batch_data_generator pipeline_rh2d_batch_data_generator.cpp)
+target_compile_options(pipeline_rh2d_batch_data_generator PRIVATE
+    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
+)
+
 #################### fault injection test util ##################
 
 add_executable(pipeline_h2d_fault_test pipeline_h2d_fault_test.cpp)

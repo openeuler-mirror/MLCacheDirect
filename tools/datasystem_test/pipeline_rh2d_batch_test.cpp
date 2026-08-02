@@ -1,5 +1,6 @@
 #include "datasystem/kv_client.h"
 #include "datasystem/utils/connection.h"
+#include "pipeline_rh2d_batch_data.h"
 #include <iomanip>
 #include <vector>
 #include <sstream>
@@ -373,6 +374,61 @@ std::string GenerateRandomString(size_t length) {
         result += charset[dist(rng)];
     }
     return result;
+}
+
+std::vector<rh2d_batch_data::SizeConfig> BuildCacheSizeConfigs(const std::vector<SizeConfig>& configs) {
+    std::vector<rh2d_batch_data::SizeConfig> cache_configs;
+    cache_configs.reserve(configs.size());
+    for (const auto& config : configs) {
+        cache_configs.push_back({config.size, config.count});
+    }
+    return cache_configs;
+}
+
+size_t GetMaxValueSize(const std::vector<rh2d_batch_data::SizeConfig>& configs) {
+    size_t max_size = 0;
+    for (const auto& config : configs) {
+        max_size = std::max(max_size, config.size);
+    }
+    return max_size;
+}
+
+void GenerateAndCacheData(int count, int batch, const std::vector<rh2d_batch_data::SizeConfig>& configs,
+                          const std::string& signature, const std::string& cache_path,
+                          rh2d_batch_data::Data& data) {
+    std::cout << "[Main] Generating " << count << " random key-value pairs..." << std::endl;
+    int progress_interval = std::max(1, count / 20);
+    rh2d_batch_data::Generate(count, batch, configs, data, [&](size_t generated) {
+        if (static_cast<int>(generated) % progress_interval == 0 || generated == static_cast<size_t>(count)) {
+            int progress = static_cast<int>(generated) * 100 / count;
+            std::cout << "[Main] Generate progress: " << std::setw(3) << progress << "% ("
+                      << generated << "/" << count << ")" << std::endl;
+        }
+    });
+    std::cout << "[Main] Data generation completed." << std::endl;
+
+    std::string error;
+    if (rh2d_batch_data::Save(cache_path, signature, data, error)) {
+        std::cout << "[Main] Test data cached: " << cache_path << std::endl;
+    } else {
+        std::cerr << "[Main] Warning: failed to cache test data: " << error << std::endl;
+    }
+}
+
+rh2d_batch_data::Data LoadOrGenerateData(int count, int batch, const std::vector<SizeConfig>& configs) {
+    auto cache_configs = BuildCacheSizeConfigs(configs);
+    std::string signature = rh2d_batch_data::BuildSignature(count, batch, cache_configs);
+    std::string cache_path = rh2d_batch_data::BuildCachePath(signature);
+    rh2d_batch_data::Data data;
+    std::string error;
+    if (rh2d_batch_data::Load(cache_path, signature, count, GetMaxValueSize(cache_configs), data, error)) {
+        std::cout << "[Main] Loaded test data cache: " << cache_path << std::endl;
+        return data;
+    }
+
+    std::cout << "[Main] No usable test data cache (" << error << "): " << cache_path << std::endl;
+    GenerateAndCacheData(count, batch, cache_configs, signature, cache_path, data);
+    return data;
 }
 
 class RemoteH2DTest {
@@ -1952,55 +2008,8 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
 
-    // Generate data based on size configuration
-    std::cout << "[Main] Generating " << args.count << " random key-value pairs..." << std::endl;
-    std::vector<std::pair<std::string, std::string>> all_data;
-    all_data.reserve(args.count);
-    int progress_interval = std::max(1, args.count / 20); // Print progress every 5%
-
-    int num_batches = args.count / args.batch;
-    for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-        // Calculate how many keys for each size in this batch
-        std::vector<std::pair<size_t, int>> batch_sizes;
-        int allocated = 0;
-
-        for (const auto& config : size_configs) {
-            if (config.count == -1) {
-                // Remaining keys in batch
-                int remaining = args.batch - allocated;
-                if (remaining > 0) {
-                    batch_sizes.push_back({config.size, remaining});
-                    allocated = args.batch;
-                }
-            } else {
-                int count = std::min(config.count, args.batch - allocated);
-                if (count > 0) {
-                    batch_sizes.push_back({config.size, count});
-                    allocated += count;
-                }
-            }
-            if (allocated >= args.batch) break;
-        }
-
-        // Generate data for this batch
-        for (const auto& sc : batch_sizes) {
-            size_t size = sc.first;
-            int count = sc.second;
-            for (int j = 0; j < count; ++j) {
-                std::string key = "key_" + std::to_string(all_data.size()) + "_" + GenerateRandomString(8);
-                std::string value = GenerateRandomString(size);
-                all_data.emplace_back(key, value);
-
-                if (static_cast<int>(all_data.size()) % progress_interval == 0 ||
-                    static_cast<int>(all_data.size()) == args.count) {
-                    int progress = static_cast<int>(all_data.size()) * 100 / args.count;
-                    std::cout << "[Main] Generate progress: " << std::setw(3) << progress << "% ("
-                              << all_data.size() << "/" << args.count << ")" << std::endl;
-                }
-            }
-        }
-    }
-    std::cout << "[Main] Data generation completed." << std::endl;
+    std::vector<std::pair<std::string, std::string>> all_data =
+        LoadOrGenerateData(args.count, args.batch, size_configs);
 
     // For kps mode, run the KPS test directly without pre-setting data
     if (args.cmd == "kps") {
