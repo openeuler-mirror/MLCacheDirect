@@ -720,7 +720,7 @@ public:
         for (int round = 0; round < num_batches; ++round) {
             std::vector<std::string> keys;
             std::vector<void*> dev_ptrs;
-            std::vector<std::string> values;
+            std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
 
             int start = round * batch;
             int end = std::min((round + 1) * batch, total_keys);
@@ -745,7 +745,7 @@ public:
             }
 
             auto get_start = std::chrono::high_resolution_clock::now();
-            Status rc = client_->Get(keys, values, 6000000);
+            Status rc = client_->Get(keys, readOnlyBuffers, 6000000);
             auto get_end = std::chrono::high_resolution_clock::now();
 
             double get_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
@@ -760,8 +760,12 @@ public:
 
             auto h2d_start = std::chrono::high_resolution_clock::now();
             for (size_t i = 0; i < keys.size(); ++i) {
-                if ((err = cudaMemcpy(dev_ptrs[i], values[i].c_str(),
-                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                if (i >= readOnlyBuffers.size() || !readOnlyBuffers[i]) {
+                    TLOG(thread_id_, "Get returned empty buffer for key " << i);
+                    continue;
+                }
+                if ((err = cudaMemcpy(dev_ptrs[i], readOnlyBuffers[i]->ImmutableData(),
+                        readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                 }
             }
@@ -775,7 +779,7 @@ public:
             TLOG(thread_id_, "Round " << round << " Get: " << get_duration_us << " us, H2D: " << h2d_duration_us << " us");
 
             if (verify_data_) {
-                CheckDataBatchHost(start, values);
+                CheckDataBatchHost(start, readOnlyBuffers);
             }
 
             // Only free if we allocated per-batch
@@ -947,9 +951,9 @@ public:
             // ========== Phase 2: Batch Get (MGetH2D or Get+H2D) ==========
             if (origin_get) {
                 // Use original Get + cudaMemcpy
-                std::vector<std::string> values;
+                std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
                 auto get_start = std::chrono::high_resolution_clock::now();
-                Status getRc = client_->Get(keys, values);
+                Status getRc = client_->Get(keys, readOnlyBuffers);
                 auto get_end = std::chrono::high_resolution_clock::now();
 
                 double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
@@ -972,21 +976,25 @@ public:
                     }
 
                     for (size_t i = 0; i < keys.size(); ++i) {
+                        if (i >= readOnlyBuffers.size() || !readOnlyBuffers[i]) {
+                            TLOG(thread_id_, "Get returned empty buffer for key " << i);
+                            continue;
+                        }
                         void* dev_ptr = preallocated_batches[batch_slot].empty() ? nullptr : preallocated_batches[batch_slot][i];
                         if (dev_ptr) {
                             // Use pre-allocated memory
-                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
-                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                            if ((err = cudaMemcpy(dev_ptr, readOnlyBuffers[i]->ImmutableData(),
+                                    readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                             }
                         } else {
                             // Fallback: allocate on-the-fly if pre-allocation failed
-                            if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                            if ((err = cudaMalloc(&dev_ptr, readOnlyBuffers[i]->GetSize())) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMalloc failed for Get+H2D: " << cudaGetErrorString(err));
                                 break;
                             }
-                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
-                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                            if ((err = cudaMemcpy(dev_ptr, readOnlyBuffers[i]->ImmutableData(),
+                                    readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                             }
                             cudaFree(dev_ptr);  // Free immediately after use
@@ -1186,14 +1194,16 @@ private:
 #endif
     }
 
-    void CheckDataBatchHost(int startIdx, const std::vector<std::string>& values) {
+    void CheckDataBatchHost(int startIdx, std::vector<Optional<ReadOnlyBuffer>>& readOnlyBuffers) {
 #ifdef USE_CUDA_MOCK
         TLOG(thread_id_, "CheckDataBatch skipped in mock mode (no real GPU memory to verify)");
 #else
         bool is_failed = false;
-        for (size_t i = 0; i < values.size(); i++) {
+        for (size_t i = 0; i < readOnlyBuffers.size(); i++) {
             auto& expected = data_[startIdx + i].second;
-            if (values[i] != expected) {
+            if (!readOnlyBuffers[i]
+                || readOnlyBuffers[i]->GetSize() != static_cast<int64_t>(expected.size())
+                || std::memcmp(readOnlyBuffers[i]->ImmutableData(), expected.data(), expected.size()) != 0) {
                 TLOG(thread_id_, "Data mismatch at index " << (startIdx + i));
                 is_failed = true;
             }

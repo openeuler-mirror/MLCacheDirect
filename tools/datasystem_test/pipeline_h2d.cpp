@@ -452,7 +452,7 @@ public:
 
         std::vector<std::string> keys;
         std::vector<std::string> failkeys;
-        std::vector<std::string> values;
+        std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
         cudaError_t err;
         std::vector<void *> dev_ptrs;
 
@@ -486,7 +486,7 @@ public:
 
         TIMER_START(Get);
         TIMER_START(OriginGet);
-        Status rc = client_->Get(keys, values, timeout_ms);
+        Status rc = client_->Get(keys, readOnlyBuffers, timeout_ms);
         TIMER_END(thread_id_, Get, "Get");
 
         if (rc.IsError()) {
@@ -497,8 +497,9 @@ public:
             }
             return;
         }
-        if (values.size() != keys.size()) {
-            TLOG(thread_id_, "get response size mismatch, keys=" << keys.size() << ", values=" << values.size());
+        if (readOnlyBuffers.size() != keys.size()) {
+            TLOG(thread_id_, "get response size mismatch, keys=" << keys.size()
+                             << ", buffers=" << readOnlyBuffers.size());
             FreeCudaPtrs(dev_ptrs);
             if (barrier_) {
                 barrier_->Stop();
@@ -508,9 +509,12 @@ public:
 
         TIMER_START(H2D);
         for (size_t i = 0; i < keys.size(); i++) {
-            if ((err = cudaMemcpy(
-                     dev_ptrs[i], values[i].c_str(), (values[i].length() + 1) * sizeof(char), cudaMemcpyHostToDevice))
-                != cudaSuccess) {
+            if (!readOnlyBuffers[i]) {
+                TLOG(thread_id_, "get returned empty buffer for " << i << "th key");
+                continue;
+            }
+            if ((err = cudaMemcpy(dev_ptrs[i], readOnlyBuffers[i]->ImmutableData(), readOnlyBuffers[i]->GetSize(),
+                                  cudaMemcpyHostToDevice)) != cudaSuccess) {
                 TLOG(thread_id_, "failed to do cudaMemcpy for " << i << "th: " << cudaGetErrorString(err));
             }
         }
@@ -527,19 +531,22 @@ public:
         }
 
         for (size_t i = 0; i < data_.size(); i++) {
-            if (values[i] != data_[i].second) {
+            const bool bufferMismatch = !readOnlyBuffers[i]
+                                        || readOnlyBuffers[i]->GetSize() != static_cast<int64_t>(data_[i].second.size())
+                                        || std::memcmp(readOnlyBuffers[i]->ImmutableData(), data_[i].second.data(),
+                                                       data_[i].second.size()) != 0;
+            if (bufferMismatch) {
                 TLOG(thread_id_,
                      "############################## " << i << " th data is not same ###############################");
-                std::ofstream a("/tmp/expect_T" + std::to_string(thread_id_)),
-                    b("/tmp/real_T" + std::to_string(thread_id_));
-                auto &data = data_[i].second;
-                for (size_t j = 0; j < data.size(); j += 80) {
-                    size_t len = (j + 80 < data.size()) ? 80 : (data.size() - j);
-                    a << data.substr(j, len) << std::endl;
-                    b << values[i].substr(j, len) << std::endl;
+                std::ofstream expectFile("/tmp/expect_T" + std::to_string(thread_id_), std::ios::binary);
+                std::ofstream realFile("/tmp/real_T" + std::to_string(thread_id_), std::ios::binary);
+                expectFile.write(data_[i].second.data(), data_[i].second.size());
+                if (readOnlyBuffers[i]) {
+                    realFile.write(static_cast<const char *>(readOnlyBuffers[i]->ImmutableData()),
+                                   readOnlyBuffers[i]->GetSize());
                 }
-                a.close();
-                b.close();
+                expectFile.close();
+                realFile.close();
                 std::system(
                     ("diff /tmp/expect_T" + std::to_string(thread_id_) + " /tmp/real_T" + std::to_string(thread_id_))
                         .c_str());
