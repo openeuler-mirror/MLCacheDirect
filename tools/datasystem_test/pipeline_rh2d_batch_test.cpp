@@ -1,5 +1,6 @@
 #include "datasystem/kv_client.h"
 #include "datasystem/utils/connection.h"
+#include "pipeline_rh2d_batch_data.h"
 #include <iomanip>
 #include <vector>
 #include <sstream>
@@ -375,6 +376,69 @@ std::string GenerateRandomString(size_t length) {
     return result;
 }
 
+std::vector<rh2d_batch_data::SizeConfig> BuildCacheSizeConfigs(const std::vector<SizeConfig>& configs) {
+    std::vector<rh2d_batch_data::SizeConfig> cache_configs;
+    cache_configs.reserve(configs.size());
+    for (const auto& config : configs) {
+        cache_configs.push_back({config.size, config.count});
+    }
+    return cache_configs;
+}
+
+size_t GetMaxValueSize(const std::vector<rh2d_batch_data::SizeConfig>& configs) {
+    size_t max_size = 0;
+    for (const auto& config : configs) {
+        max_size = std::max(max_size, config.size);
+    }
+    return max_size;
+}
+
+void GenerateAndCacheData(int count, int batch, const std::vector<rh2d_batch_data::SizeConfig>& configs,
+                          const std::string& signature, const std::string& cache_path,
+                          rh2d_batch_data::Data& data) {
+    std::cout << "[Main] Generating " << count << " random key-value pairs..." << std::endl;
+    int progress_interval = std::max(1, count / 20);
+    rh2d_batch_data::Generate(count, batch, configs, data, [&](size_t generated) {
+        if (static_cast<int>(generated) % progress_interval == 0 || generated == static_cast<size_t>(count)) {
+            int progress = static_cast<int>(generated) * 100 / count;
+            std::cout << "[Main] Generate progress: " << std::setw(3) << progress << "% ("
+                      << generated << "/" << count << ")" << std::endl;
+        }
+    });
+    std::cout << "[Main] Data generation completed." << std::endl;
+
+    std::string error;
+    if (rh2d_batch_data::Save(cache_path, signature, data, error)) {
+        std::cout << "[Main] Test data cached: " << cache_path << std::endl;
+    } else {
+        std::cerr << "[Main] Warning: failed to cache test data: " << error << std::endl;
+    }
+}
+
+rh2d_batch_data::Data LoadOrGenerateData(int count, int batch, const std::vector<SizeConfig>& configs) {
+    auto cache_configs = BuildCacheSizeConfigs(configs);
+    std::string signature = rh2d_batch_data::BuildSignature(count, batch, cache_configs);
+    std::string cache_path = rh2d_batch_data::BuildCachePath(signature);
+    rh2d_batch_data::Data data;
+    std::string error;
+    if (rh2d_batch_data::Load(cache_path, signature, count, GetMaxValueSize(cache_configs), data, error)) {
+        std::cout << "[Main] Loaded test data cache: " << cache_path << std::endl;
+        return data;
+    }
+
+    std::string compatible_path;
+    if (rh2d_batch_data::LoadCompatible(signature, count, GetMaxValueSize(cache_configs), data,
+                                        compatible_path, error)) {
+        std::cout << "[Main] Loaded first " << count << " records from compatible test data cache: "
+                  << compatible_path << std::endl;
+        return data;
+    }
+
+    std::cout << "[Main] No usable test data cache (" << error << "): " << cache_path << std::endl;
+    GenerateAndCacheData(count, batch, cache_configs, signature, cache_path, data);
+    return data;
+}
+
 class RemoteH2DTest {
 public:
     RemoteH2DTest(const std::string& host, int port, int thread_id, int gpu_id, bool verify_data = true,
@@ -720,7 +784,7 @@ public:
         for (int round = 0; round < num_batches; ++round) {
             std::vector<std::string> keys;
             std::vector<void*> dev_ptrs;
-            std::vector<std::string> values;
+            std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
 
             int start = round * batch;
             int end = std::min((round + 1) * batch, total_keys);
@@ -745,7 +809,7 @@ public:
             }
 
             auto get_start = std::chrono::high_resolution_clock::now();
-            Status rc = client_->Get(keys, values, 6000000);
+            Status rc = client_->Get(keys, readOnlyBuffers, 6000000);
             auto get_end = std::chrono::high_resolution_clock::now();
 
             double get_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
@@ -760,8 +824,12 @@ public:
 
             auto h2d_start = std::chrono::high_resolution_clock::now();
             for (size_t i = 0; i < keys.size(); ++i) {
-                if ((err = cudaMemcpy(dev_ptrs[i], values[i].c_str(),
-                        values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                if (i >= readOnlyBuffers.size() || !readOnlyBuffers[i]) {
+                    TLOG(thread_id_, "Get returned empty buffer for key " << i);
+                    continue;
+                }
+                if ((err = cudaMemcpy(dev_ptrs[i], readOnlyBuffers[i]->ImmutableData(),
+                        readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                     TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                 }
             }
@@ -775,7 +843,7 @@ public:
             TLOG(thread_id_, "Round " << round << " Get: " << get_duration_us << " us, H2D: " << h2d_duration_us << " us");
 
             if (verify_data_) {
-                CheckDataBatchHost(start, values);
+                CheckDataBatchHost(start, readOnlyBuffers);
             }
 
             // Only free if we allocated per-batch
@@ -947,9 +1015,9 @@ public:
             // ========== Phase 2: Batch Get (MGetH2D or Get+H2D) ==========
             if (origin_get) {
                 // Use original Get + cudaMemcpy
-                std::vector<std::string> values;
+                std::vector<Optional<ReadOnlyBuffer>> readOnlyBuffers;
                 auto get_start = std::chrono::high_resolution_clock::now();
-                Status getRc = client_->Get(keys, values);
+                Status getRc = client_->Get(keys, readOnlyBuffers);
                 auto get_end = std::chrono::high_resolution_clock::now();
 
                 double get_us = std::chrono::duration_cast<std::chrono::microseconds>(get_end - get_start).count();
@@ -972,21 +1040,25 @@ public:
                     }
 
                     for (size_t i = 0; i < keys.size(); ++i) {
+                        if (i >= readOnlyBuffers.size() || !readOnlyBuffers[i]) {
+                            TLOG(thread_id_, "Get returned empty buffer for key " << i);
+                            continue;
+                        }
                         void* dev_ptr = preallocated_batches[batch_slot].empty() ? nullptr : preallocated_batches[batch_slot][i];
                         if (dev_ptr) {
                             // Use pre-allocated memory
-                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
-                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                            if ((err = cudaMemcpy(dev_ptr, readOnlyBuffers[i]->ImmutableData(),
+                                    readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                             }
                         } else {
                             // Fallback: allocate on-the-fly if pre-allocation failed
-                            if ((err = cudaMalloc(&dev_ptr, values[i].size() + 1)) != cudaSuccess) {
+                            if ((err = cudaMalloc(&dev_ptr, readOnlyBuffers[i]->GetSize())) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMalloc failed for Get+H2D: " << cudaGetErrorString(err));
                                 break;
                             }
-                            if ((err = cudaMemcpy(dev_ptr, values[i].c_str(),
-                                    values[i].length() + 1, cudaMemcpyHostToDevice)) != cudaSuccess) {
+                            if ((err = cudaMemcpy(dev_ptr, readOnlyBuffers[i]->ImmutableData(),
+                                    readOnlyBuffers[i]->GetSize(), cudaMemcpyHostToDevice)) != cudaSuccess) {
                                 TLOG(thread_id_, "cudaMemcpy failed for key " << i << ": " << cudaGetErrorString(err));
                             }
                             cudaFree(dev_ptr);  // Free immediately after use
@@ -1186,14 +1258,16 @@ private:
 #endif
     }
 
-    void CheckDataBatchHost(int startIdx, const std::vector<std::string>& values) {
+    void CheckDataBatchHost(int startIdx, std::vector<Optional<ReadOnlyBuffer>>& readOnlyBuffers) {
 #ifdef USE_CUDA_MOCK
         TLOG(thread_id_, "CheckDataBatch skipped in mock mode (no real GPU memory to verify)");
 #else
         bool is_failed = false;
-        for (size_t i = 0; i < values.size(); i++) {
+        for (size_t i = 0; i < readOnlyBuffers.size(); i++) {
             auto& expected = data_[startIdx + i].second;
-            if (values[i] != expected) {
+            if (!readOnlyBuffers[i]
+                || readOnlyBuffers[i]->GetSize() != static_cast<int64_t>(expected.size())
+                || std::memcmp(readOnlyBuffers[i]->ImmutableData(), expected.data(), expected.size()) != 0) {
                 TLOG(thread_id_, "Data mismatch at index " << (startIdx + i));
                 is_failed = true;
             }
@@ -1942,55 +2016,8 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
 
-    // Generate data based on size configuration
-    std::cout << "[Main] Generating " << args.count << " random key-value pairs..." << std::endl;
-    std::vector<std::pair<std::string, std::string>> all_data;
-    all_data.reserve(args.count);
-    int progress_interval = std::max(1, args.count / 20); // Print progress every 5%
-
-    int num_batches = args.count / args.batch;
-    for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-        // Calculate how many keys for each size in this batch
-        std::vector<std::pair<size_t, int>> batch_sizes;
-        int allocated = 0;
-
-        for (const auto& config : size_configs) {
-            if (config.count == -1) {
-                // Remaining keys in batch
-                int remaining = args.batch - allocated;
-                if (remaining > 0) {
-                    batch_sizes.push_back({config.size, remaining});
-                    allocated = args.batch;
-                }
-            } else {
-                int count = std::min(config.count, args.batch - allocated);
-                if (count > 0) {
-                    batch_sizes.push_back({config.size, count});
-                    allocated += count;
-                }
-            }
-            if (allocated >= args.batch) break;
-        }
-
-        // Generate data for this batch
-        for (const auto& sc : batch_sizes) {
-            size_t size = sc.first;
-            int count = sc.second;
-            for (int j = 0; j < count; ++j) {
-                std::string key = "key_" + std::to_string(all_data.size()) + "_" + GenerateRandomString(8);
-                std::string value = GenerateRandomString(size);
-                all_data.emplace_back(key, value);
-
-                if (static_cast<int>(all_data.size()) % progress_interval == 0 ||
-                    static_cast<int>(all_data.size()) == args.count) {
-                    int progress = static_cast<int>(all_data.size()) * 100 / args.count;
-                    std::cout << "[Main] Generate progress: " << std::setw(3) << progress << "% ("
-                              << all_data.size() << "/" << args.count << ")" << std::endl;
-                }
-            }
-        }
-    }
-    std::cout << "[Main] Data generation completed." << std::endl;
+    std::vector<std::pair<std::string, std::string>> all_data =
+        LoadOrGenerateData(args.count, args.batch, size_configs);
 
     // For kps mode, run the KPS test directly without pre-setting data
     if (args.cmd == "kps") {
