@@ -35,7 +35,7 @@ typedef int (*notify_callback_t)(void *user_data);
 #define CHUNK_TYPE_BITS             1                 // chunk_type占用的位数
 #define CHUNK_ID_BITS               3                 // chunk_id占用的位数
 
-#define OS_TRANSPORT_MAX_CHUNK_ID  ((1ULL << CHUNK_ID_BITS) - 1)
+#define OS_TRANSPORT_MAX_CHUNK_ID  ((1ULL << CHUNK_ID_BITS) - 2)
 #define OS_TRANSPORT_MAX_CHUNK_NUM ((uint32_t)(OS_TRANSPORT_MAX_CHUNK_ID + 1))
 
 typedef union {

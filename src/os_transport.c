@@ -1401,7 +1401,7 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
     } else { // send
         user_data = (TransportData)cr->user_ctx;
         if (user_data.bs.chunk_id >= OS_TRANSPORT_MAX_CHUNK_NUM) {
-            OST_LOG_INFO("ignore opcode %d", opcode);
+            OST_LOG_DEBUG(1, "ignore send_imm opcode %d", opcode);
             return 0;
         }
     }
