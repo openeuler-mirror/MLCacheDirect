@@ -29,7 +29,6 @@ int os_transport_log_reg(int level, log_callback_t cb);
 typedef int (*notify_callback_t)(void *user_data);
 
 #define DEFAULT_CHUNK_SIZE          (2 * 1024 * 1024) // 2MB
-#define DEFAULT_RECV_QUEUE_CAPACITY 256               // 默认接收队列容量
 #define REQUEST_ID_BITS             60U               // request_id传输字段占用的位数
 #define REQUEST_ID_EFFECTIVE_BITS   40U               // API传入的request_id仅低40位有效
 #define CHUNK_TYPE_BITS             1                 // chunk_type占用的位数

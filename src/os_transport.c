@@ -26,77 +26,6 @@ static uint64_t make_transport_user_data_raw64(uint64_t request_id, uint32_t chu
     return user_data.user_ctx;
 }
 
-// init和destroy接收队列限制器，ost_handle外部调用时已校验非空
-static int init_recv_queue_limiter(os_transport_handle_t *ost_handle, uint32_t recv_queue_capacity)
-{
-    int ret;
-    uint32_t capacity = recv_queue_capacity == 0 ? DEFAULT_RECV_QUEUE_CAPACITY : recv_queue_capacity;
-
-    ret = pthread_mutex_init(&ost_handle->recv_queue_mutex, NULL);
-    if (ret != 0) {
-        OST_LOG_ERROR("Failed: pthread_mutex_init returned %d in init_recv_queue_limiter.", ret);
-        return -1;
-    }
-
-    ost_handle->recv_queue_available = capacity;
-    ost_handle->recv_queue_acquired = 0;
-    OST_LOG_INFO("Recv queue limiter enabled (available=%u, acquired=%u).",
-                 ost_handle->recv_queue_available,
-                 ost_handle->recv_queue_acquired);
-    return 0;
-}
-
-static void destroy_recv_queue_limiter(os_transport_handle_t *ost_handle)
-{
-    pthread_mutex_destroy(&ost_handle->recv_queue_mutex);
-}
-
-static int acquire_recv_queue_resources(os_transport_handle_t *ost_handle,
-                                        uint32_t count,
-                                        uint32_t *reused_count,
-                                        uint32_t *post_count)
-{
-    uint32_t reused;
-    uint32_t required_new;
-
-    if (!ost_handle || !reused_count || !post_count) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&ost_handle->recv_queue_mutex);
-    reused = ost_handle->recv_queue_acquired < count ? ost_handle->recv_queue_acquired : count;
-    required_new = count - reused;
-    if (ost_handle->recv_queue_available < required_new) {
-        OST_LOG_WARN("Recv queue resources are insufficient (available=%u, acquired=%u, requested=%u, reusable=%u).",
-                     ost_handle->recv_queue_available,
-                     ost_handle->recv_queue_acquired,
-                     count,
-                     reused);
-        pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
-        return -1;
-    }
-
-    ost_handle->recv_queue_acquired -= reused;
-    ost_handle->recv_queue_available -= required_new;
-    pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
-
-    *reused_count = reused;
-    *post_count = required_new;
-    return 0;
-}
-
-static void release_recv_queue_resources(os_transport_handle_t *ost_handle, uint32_t available, uint32_t acquired)
-{
-    if (!ost_handle || (available == 0 && acquired == 0)) {
-        return;
-    }
-
-    pthread_mutex_lock(&ost_handle->recv_queue_mutex);
-    ost_handle->recv_queue_available += available;
-    ost_handle->recv_queue_acquired += acquired;
-    pthread_mutex_unlock(&ost_handle->recv_queue_mutex);
-}
-
 static int alloc_task_group(task_group_t **task_group_out, uint32_t task_num, uint32_t task_arg_size)
 {
 #if defined(OS_TRANSPORT_WITH_INJECT) && OS_TRANSPORT_WITH_INJECT
@@ -1106,12 +1035,8 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
     ost_handle->urma_ctx = urma_ctx;
     ost_handle->worker_thread_num = ost_cfg->worker_thread_num;
     ost_handle->urma_event_mode = ost_cfg->urma_event_mode;
-
-    if (init_recv_queue_limiter(ost_handle, ost_cfg->recv_queue_capacity) != 0) {
-        OST_LOG_ERROR("Failed: init_recv_queue_limiter returned error.");
-        free(ost_handle);
-        return -1;
-    }
+    ost_handle->recv_ctx.recv_queue_capacity = ost_cfg->recv_queue_capacity;
+    pthread_spin_init(&ost_handle->recv_ctx.lock, PTHREAD_PROCESS_PRIVATE);
 
     g_inited = 1;
 
@@ -1122,7 +1047,6 @@ uint32_t os_transport_init(urma_context_t *urma_ctx, os_transport_cfg_t *ost_cfg
         if (ost_cfg->worker_thread_num == 0) {
             OST_LOG_WARN("os_transport initialized without worker threads because worker_thread_num is 0.");
             g_inited = 0;
-            destroy_recv_queue_limiter(ost_handle);
             free(ost_handle);
             return 0;
         }
@@ -1158,7 +1082,6 @@ destroy_thread_pool:
     ost_handle->thread_pool = NULL;
 init_fail:
     g_inited = 0;
-    destroy_recv_queue_limiter(ost_handle);
     free(ost_handle);
     return -1;
 }
@@ -1273,6 +1196,51 @@ uint32_t os_transport_send(void *handle,
     return 0;
 }
 
+static urma_status_t urma_recv_ctx_init(urma_recv_info_t recv_info, urma_recv_ctx_t *recv_ctx)
+{
+    urma_status_t ret = URMA_SUCCESS;
+    chunk_info_t empty_chunk = {0};
+
+    if (recv_ctx->jetty == recv_info.jetty) {
+        return URMA_SUCCESS;
+    }
+
+    pthread_spin_lock(&recv_ctx->lock);
+    if (recv_ctx->jetty != recv_info.jetty) {
+        for (uint32_t i = 0; i < recv_ctx->recv_queue_capacity * RQE_PREFILL_MULTIPLE_DUPLEX; i++) {
+            ret = urma_recv_with_notify(recv_info, &empty_chunk);
+            if (ret != URMA_SUCCESS) {
+                OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error %d "
+                              "(index=%u, recv_queue_capacity=%u).",
+                              ret, i, recv_ctx->recv_queue_capacity);
+                break;
+            }
+        }
+        // urma_jfrwq_overflow() return URMA_ENOMEM if JFR work queue is full.
+        if (ret == URMA_SUCCESS || ret == URMA_ENOMEM) {
+            recv_ctx->jetty = recv_info.jetty;
+        }
+    }
+    pthread_spin_unlock(&recv_ctx->lock);
+
+    return ret;
+}
+
+static urma_status_t urma_recv_ctx_add(const urma_recv_ctx_t *recv_ctx)
+{
+    urma_status_t ret;
+    chunk_info_t empty_chunk = {0};
+    urma_recv_info_t recv_info = {
+        .jetty = recv_ctx->jetty,
+    };
+
+    ret = urma_recv_with_notify(recv_info, &empty_chunk);
+    if (ret != URMA_SUCCESS) {
+        OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error %d ", ret);
+    }
+    return ret;
+}
+
 uint32_t os_transport_recv(void *handle,
                            ost_buffer_info_t *host_src,
                            ost_device_info_t *device_dst,
@@ -1281,12 +1249,11 @@ uint32_t os_transport_recv(void *handle,
                            task_sync_t **ret_sync_handle,
                            notify_callback_t notify_callback)
 {
+    urma_status_t ret;
     urma_info_t urma_info = {0};
     os_transport_handle_t *ost_handle = (os_transport_handle_t *)handle;
     chunk_info_t *chunks;
     uint32_t chunks_num;
-    uint32_t reused_recv_queue_count = 0;
-    uint32_t post_recv_queue_count = 0;
     task_sync_t *sync_handle = NULL;
 
     if (ret_sync_handle) {
@@ -1308,9 +1275,6 @@ uint32_t os_transport_recv(void *handle,
     uint32_t inject_ret = 0;
     OS_TRANSPORT_INJECT_POINT(OS_TRANSPORT_INJECT_RECV_BEGIN, inject_ret);
 #endif
-    if (recv_split_chunks(host_src, device_dst, len, &chunks, &chunks_num) != 0) {
-        return -1;
-    }
 
     urma_info.recv_info = (urma_recv_info_t){.jfr = device_dst->jfr,
                                              .jetty = device_dst->jetty,
@@ -1318,21 +1282,14 @@ uint32_t os_transport_recv(void *handle,
                                              .device_info = *device_dst,
                                              .request_id = client_key};
 
-    if (acquire_recv_queue_resources(ost_handle, chunks_num, &reused_recv_queue_count, &post_recv_queue_count) != 0) {
-        OST_LOG_ERROR("Failed: unable to acquire recv queue resources "
-                      "(len=%u, chunk_count=%u, client_key=%lu).",
-                      len,
-                      chunks_num,
-                      client_key);
-        free(chunks);
+    if (recv_split_chunks(host_src, device_dst, len, &chunks, &chunks_num) != 0) {
         return -1;
     }
+
     OST_LOG_DEBUG(1,
-                  "Recv queue resources prepared (client_key=%lu, chunk_count=%u, reused=%u, need_post=%u).",
+                  "Recv queue resources prepared (client_key=%lu, chunk_count=%u).",
                   client_key,
-                  chunks_num,
-                  reused_recv_queue_count,
-                  post_recv_queue_count);
+                  chunks_num);
 
     if (register_tasks_and_bind_chunks(
             ost_handle, chunks, chunks_num, RECV_TASK, recv_task_worker_func, urma_info, &sync_handle, notify_callback)
@@ -1341,33 +1298,26 @@ uint32_t os_transport_recv(void *handle,
                       "(client_key=%lu, chunk_count=%u).",
                       client_key,
                       chunks_num);
-        release_recv_queue_resources(ost_handle, post_recv_queue_count, reused_recv_queue_count);
         free(chunks);
         return -1;
     }
 
     OST_LOG_DEBUG(
         1, "Async recv request registered successfully (client_key=%lu, chunk_count=%u).", client_key, chunks_num);
-    for (uint32_t i = reused_recv_queue_count; i < chunks_num; i++) {
-        if (urma_recv_with_notify(urma_info.recv_info, &chunks[i]) != URMA_SUCCESS) {
-            uint32_t successful_post_count = i - reused_recv_queue_count;
-            uint32_t unposted_count = post_recv_queue_count - successful_post_count;
-            release_recv_queue_resources(ost_handle, unposted_count, reused_recv_queue_count + successful_post_count);
-            OST_LOG_ERROR("Failed: urma_recv_with_notify returned URMA error "
-                          "(len=%u, chunk_count=%u, client_key=%lu, reused=%u, posted=%u, remaining=%u).",
-                          len,
-                          chunks_num,
-                          client_key,
-                          reused_recv_queue_count,
-                          successful_post_count,
-                          unposted_count);
-            // 如果recv提交失败，应该直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
-            pthread_mutex_lock(&sync_handle->mutex);
-            sync_handle->request_completed = 1;
-            pthread_cond_signal(&sync_handle->cond);
-            pthread_mutex_unlock(&sync_handle->mutex);
-            return -1;
-        }
+
+    ret = urma_recv_ctx_init(urma_info.recv_info, &ost_handle->recv_ctx);
+    if (ret != URMA_SUCCESS && ret != URMA_ENOMEM) {
+        OST_LOG_ERROR("Failed: urma_recv_init_once returned URMA error "
+                      "(len=%u, chunk_count=%u, client_key=%lu).",
+                      len,
+                      chunks_num,
+                      client_key);
+        // 如果recv提交失败，应该直接标记整个请求完成，唤醒等待线程，并不要求后续task执行完成，避免死锁
+        pthread_mutex_lock(&sync_handle->mutex);
+        sync_handle->request_completed = 1;
+        pthread_cond_signal(&sync_handle->cond);
+        pthread_mutex_unlock(&sync_handle->mutex);
+        return -1;
     }
     *ret_sync_handle = sync_handle;
 
@@ -1394,6 +1344,8 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
             uint64_t encoded_request_id = user_data.bs.request_id;
             uint64_t raw_request_id = decode_request_id(encoded_request_id);
             user_data.bs.request_id = raw_request_id;
+
+            urma_recv_ctx_add(&ost_handle->recv_ctx);
         } else {
             OST_LOG_ERROR("Unknown opcode %d", opcode);
             return -1;
@@ -1412,10 +1364,6 @@ int os_transport_wake_up_task(void *handle, void *cr_t)
      * 指针传入notify_callback，避免传递当前栈变量地址。
      */
     ret = thread_pool_wake_up_worker_by_req_id(pool, request_id, &user_data);
-    if (opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
-        release_recv_queue_resources(ost_handle, 1, 0);
-        OST_LOG_DEBUG(1, "Recv queue resource released after completion (request_id=%lu).", request_id);
-    }
     if (ret != 0) {
         OST_LOG_DEBUG(2,
                       "Failed to wake worker for completion event "
@@ -1589,7 +1537,8 @@ uint32_t os_transport_destroy(void *handle)
         thread_pool_destroy(ost_handle->thread_pool);
         ost_handle->thread_pool = NULL;
     }
-    destroy_recv_queue_limiter(ost_handle);
+
+    pthread_spin_destroy(&ost_handle->recv_ctx.lock);
 
     g_inited = 0;
     OST_LOG_INFO("Succeeded: resources released and thread pool stopped "

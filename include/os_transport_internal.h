@@ -43,14 +43,18 @@ struct task_sync {
     chunk_info_t *chunks;     // 本次请求关联的chunk数组，由主线程统一释放
 };
 
+typedef struct {
+    uint32_t recv_queue_capacity;
+    urma_jetty_t *jetty;
+    pthread_spinlock_t lock;
+} urma_recv_ctx_t;
+
 typedef struct os_transport_handle {
     urma_context_t *urma_ctx;
     uint32_t worker_thread_num;
     bool urma_event_mode;
     ThreadPoolHandle thread_pool;
-    pthread_mutex_t recv_queue_mutex;
-    uint32_t recv_queue_available;
-    uint32_t recv_queue_acquired;
+    urma_recv_ctx_t recv_ctx;
 } os_transport_handle_t;
 
 typedef enum {
