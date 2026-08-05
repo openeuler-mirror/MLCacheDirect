@@ -49,11 +49,10 @@ static urma_status_t urma_write_internal(urma_write_info_t write_info,
         wr.rw.dst = dst_sg;
     } else if (opcode == URMA_OPC_SEND_IMM) {
         wr.send.src = src_sg;
-        // 将client_key作为notify_data传入，方便worker线程回调时区分不同请求
-        wr.send.imm_data = write_info.user_ctx_client.user_ctx;
         wr.send.tseg = NULL;
-
-        // set chunk_id invalid to ignore urma_cr_t this time.
+        // 通知对端
+        wr.send.imm_data = write_info.user_ctx_client.user_ctx;
+        // 本端返回，与URMA_OPC_WRITE区别开
         uint64_t invalid_chunk_id = OS_TRANSPORT_MAX_CHUNK_NUM;
         os_transport_user_data_t *user_ctx_server = (os_transport_user_data_t *)&wr.user_ctx;
         user_ctx_server->bs.chunk_id = invalid_chunk_id;
