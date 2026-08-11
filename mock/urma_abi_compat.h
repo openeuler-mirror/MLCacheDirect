@@ -50,6 +50,9 @@ typedef enum urma_status_t {
     URMA_E_IO = -9,
 } urma_status_t;
 
+#define URMA_ENOMEM URMA_E_NO_MEM
+#define URMA_OPC_SEND_IMM URMA_OPC_WRITE_IMM
+
 typedef enum urma_opcode_t {
     URMA_OPC_WRITE = 0,
     URMA_OPC_READ = 1,
@@ -706,6 +709,13 @@ struct urma_cr_t {
     uint64_t user_ctx;  // DS reads as void* / uint64_t
     int opcode;
     int immediate_data;
+    union {
+        struct {
+            uint32_t s_r : 1;
+            uint32_t reserved : 31;
+        } bs;
+        uint32_t value;
+    } flag;
     uint64_t imm_data;
     int reserved;
 };
@@ -735,6 +745,13 @@ struct urma_rw_wr_t {
 };
 typedef struct urma_rw_wr_t urma_rw_wr_t;
 
+struct urma_send_wr_t {
+    urma_sg_t src;
+    urma_target_seg_t *tseg;
+    uint64_t imm_data;
+};
+typedef struct urma_send_wr_t urma_send_wr_t;
+
 // JFS (jetty send) work request
 struct urma_jfs_wr;  // forward decl for self-reference in next
 typedef struct urma_jfs_wr urma_jfs_wr_t;
@@ -744,7 +761,10 @@ struct urma_jfs_wr {
     urma_jfs_wr_flag_t flag;
     urma_target_jetty_t *tjetty;
     uint64_t user_ctx;  // SDK: void* but DS sometimes stores uint64_t
-    urma_rw_wr_t rw;
+    union {
+        urma_rw_wr_t rw;
+        urma_send_wr_t send;
+    };
     urma_jfs_wr_t *next;
 };
 
