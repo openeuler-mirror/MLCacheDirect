@@ -180,7 +180,17 @@ void thread_pool_destroy(ThreadPoolHandle handle)
     free(handle);
 }
 
-urma_status_t urma_write_with_notify(urma_write_info_t write_info, struct chunk_info *chunk_info)
+urma_status_t urma_write_chunk(urma_write_info_t write_info, struct chunk_info *chunk_info)
+{
+    g_mock_urma_write_calls++;
+    g_mock_last_write_info = write_info;
+    if (chunk_info) {
+        g_mock_last_write_chunk = *chunk_info;
+    }
+    return g_mock_urma_write_status;
+}
+
+urma_status_t urma_write_notify(urma_write_info_t write_info, struct chunk_info *chunk_info)
 {
     g_mock_urma_write_calls++;
     g_mock_last_write_info = write_info;
@@ -455,60 +465,54 @@ static void test_request_id_codec(void)
 }
 
 /*
- * Recv queue limiter and wake-up tests.
- * Verify queue resource reuse/release accounting and completion opcode handling.
+ * os_transport_wake_up_task tests.
+ * Verify recv/send completion decode paths and invalid-argument guards.
  */
-static void test_recv_queue_limiter_and_wake_up(void)
+static void test_wake_up_task(void)
 {
     os_transport_handle_t handle = {0};
-    uint32_t reused = 0;
-    uint32_t posted = 0;
     os_transport_user_data_t user_data = {0};
     urma_cr_t cr = {0};
 
     reset_mocks();
-    assert(init_recv_queue_limiter(&handle, 2) == 0);
     handle.thread_pool = (ThreadPoolHandle)0x1234;
-
-    assert(acquire_recv_queue_resources(NULL, 1, &reused, &posted) == -1);
-    assert(acquire_recv_queue_resources(&handle, 1, NULL, &posted) == -1);
-    assert(acquire_recv_queue_resources(&handle, 1, &reused, NULL) == -1);
-
-    handle.recv_queue_acquired = 1;
-    assert(acquire_recv_queue_resources(&handle, 3, &reused, &posted) == 0);
-    assert(reused == 1);
-    assert(posted == 2);
-    assert(handle.recv_queue_available == 0);
-    assert(handle.recv_queue_acquired == 0);
-
-    assert(acquire_recv_queue_resources(&handle, 1, &reused, &posted) == -1);
-    release_recv_queue_resources(NULL, 1, 1);
-    release_recv_queue_resources(&handle, 0, 0);
-    release_recv_queue_resources(&handle, 1, 2);
-    assert(handle.recv_queue_available == 1);
-    assert(handle.recv_queue_acquired == 2);
 
     assert(os_transport_wake_up_task(NULL, &cr) == -1);
     assert(os_transport_wake_up_task(&handle, NULL) == -1);
 
-    cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
+    /* recv 路径：未知 opcode 返回错误 */
+    cr.flag.bs.s_r = 1;
+    cr.opcode = URMA_CR_OPC_WRITE_WITH_IMM;
     assert(os_transport_wake_up_task(&handle, &cr) == -1);
 
+    /* send 路径：从 user_ctx 还原 request_id 并唤醒对应 worker */
     const uint64_t raw_request_id = 0xABCDE12345ULL;
-    const uint64_t encoded_request_id = 0xABCDE0000012345ULL;
     user_data.bs.request_id = raw_request_id;
-    user_data.bs.chunk_id = 7;
+    user_data.bs.chunk_id = 5;
     user_data.bs.chunk_type = LAST_CHUNK;
+    memset(&cr, 0, sizeof(cr));
     cr.opcode = URMA_CR_OPC_SEND;
     cr.user_ctx = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == 0);
     assert(g_mock_wake_calls == 1);
     assert(g_mock_wake_last_request_id == raw_request_id);
     assert(g_mock_wake_last_user_data.user_ctx == user_data.user_ctx);
-    assert(handle.recv_queue_available == 1);
 
-    user_data.bs.request_id = encoded_request_id;
+    /* send 路径：chunk_id 超界（尾片完成通知）被忽略，不唤醒 worker */
+    user_data.bs.chunk_id = OS_TRANSPORT_MAX_CHUNK_NUM;
+    memset(&cr, 0, sizeof(cr));
     cr.opcode = URMA_CR_OPC_WRITE_WITH_IMM;
+    cr.user_ctx = user_data.user_ctx;
+    assert(os_transport_wake_up_task(&handle, &cr) == 0);
+    assert(g_mock_wake_calls == 1);
+
+    /* recv 路径：从 imm_data 解码 request_id 并唤醒对应 worker */
+    user_data.bs.request_id = encode_request_id(raw_request_id);
+    user_data.bs.chunk_id = 7;
+    user_data.bs.chunk_type = LAST_CHUNK;
+    memset(&cr, 0, sizeof(cr));
+    cr.flag.bs.s_r = 1;
+    cr.opcode = URMA_CR_OPC_SEND_WITH_IMM;
     cr.imm_data = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == 0);
     assert(g_mock_wake_calls == 2);
@@ -516,13 +520,18 @@ static void test_recv_queue_limiter_and_wake_up(void)
     assert(g_mock_wake_last_user_data.bs.request_id == raw_request_id);
     assert(g_mock_wake_last_user_data.bs.chunk_id == 7);
     assert(g_mock_wake_last_user_data.bs.chunk_type == LAST_CHUNK);
-    assert(handle.recv_queue_available == 2);
+    /* recv 路径会补充投递一个 recv（recv_ctx_add） */
+    assert(g_mock_urma_recv_calls == 1);
 
+    /* 无线程池时唤醒失败 */
     handle.thread_pool = NULL;
+    user_data.bs.request_id = raw_request_id;
+    user_data.bs.chunk_id = 5;
+    memset(&cr, 0, sizeof(cr));
+    cr.opcode = URMA_CR_OPC_SEND;
+    cr.user_ctx = user_data.user_ctx;
     assert(os_transport_wake_up_task(&handle, &cr) == -1);
-    assert(handle.recv_queue_available == 3);
-
-    destroy_recv_queue_limiter(&handle);
+    assert(g_mock_wake_calls == 2);
 }
 
 /*
@@ -644,8 +653,8 @@ static void test_user_data_bitfield_limits(void)
 {
     os_transport_user_data_t user_data = {0};
 
-    assert(OS_TRANSPORT_MAX_CHUNK_ID == 7U);
-    assert(OS_TRANSPORT_MAX_CHUNK_NUM == 8U);
+    assert(OS_TRANSPORT_MAX_CHUNK_ID == 6U);
+    assert(OS_TRANSPORT_MAX_CHUNK_NUM == 7U);
 
     user_data.bs.chunk_id = OS_TRANSPORT_MAX_CHUNK_ID;
     assert(user_data.bs.chunk_id == OS_TRANSPORT_MAX_CHUNK_ID);
@@ -763,16 +772,19 @@ static void test_register_task_functions(void)
 
     assert(init_task_sync(&sync) == 0);
     assert(register_send_tasks(&ost_handle, chunks, 3, dummy_task_func, urma_info, sync) == 0);
-    assert(sync->total_tasks == 2);
+    assert(sync->total_tasks == 3);
     assert(sync->task_group != NULL);
-    assert(sync->task_group->task_num == 2);
+    assert(sync->task_group->task_num == 3);
     send_args = (send_task_arg_t *)sync->task_group->task_args;
     assert(send_args[0].chunk_info == &chunks[1]);
     assert(send_args[0].is_last_chunk == false);
     assert(send_args[1].chunk_info == &chunks[2]);
     assert(send_args[1].is_last_chunk == true);
+    /* 最后一个task承接尾片本地完成通知，不带chunk */
+    assert(send_args[2].chunk_info == NULL);
+    assert(send_args[2].is_last_chunk == true);
     assert(sync->task_group->tasks[0].request_id == 0x3FF);
-    assert(g_mock_last_submit_task_count == 2);
+    assert(g_mock_last_submit_task_count == 3);
     free_sync_owned_resources(sync);
 
     assert(init_task_sync(&sync) == 0);
@@ -859,36 +871,15 @@ static void test_construct_and_bind_functions(void)
 }
 
 /*
- * Single-chunk send and JFC registration tests.
- * Verify single write behavior plus os_transport_reg_jfc gate conditions.
+ * os_transport_reg_jfc gate and registration tests.
+ * Verify jfc binding is gated on initialization and handle validity.
  */
-static void test_send_single_chunk_and_reg_jfc(void)
+static void test_reg_jfc(void)
 {
-    urma_jetty_info_t jetty_info = {0};
-    ost_buffer_info_t local_src = {0};
-    ost_buffer_info_t remote_dst = {0};
     struct _ThreadPool pool = {0};
     os_transport_handle_t handle = {0};
 
     reset_mocks();
-    jetty_info.jfs = (urma_jfs_t *)0x10;
-    jetty_info.jetty = (urma_jetty_t *)0x20;
-    jetty_info.tjetty = (urma_target_jetty_t *)0x30;
-    local_src.addr = 0x1111;
-    local_src.tseg = (urma_target_seg_t *)0x40;
-    remote_dst.addr = 0x2222;
-    remote_dst.tseg = (urma_target_seg_t *)0x50;
-
-    g_mock_urma_write_status = URMA_SUCCESS;
-    assert(send_single_chunk(&jetty_info, &local_src, &remote_dst, 64, 7, 8) == 0);
-    assert(g_mock_urma_write_calls == 1);
-    assert(g_mock_last_write_chunk.src == 0x1111);
-    assert(g_mock_last_write_chunk.dst == 0x2222);
-    assert(g_mock_last_write_chunk.len == 64);
-
-    g_mock_urma_write_status = TEST_URMA_STATUS_FIRST;
-    assert(send_single_chunk(&jetty_info, &local_src, &remote_dst, 64, 7, 8) == TEST_URMA_STATUS_FIRST);
-
     g_inited = 0;
     assert(os_transport_reg_jfc((urma_jfce_t *)0x1, (urma_jfc_t *)0x2, &handle) == (uint32_t)-1);
     g_inited = 1;
@@ -999,13 +990,13 @@ static void test_init_destroy_and_send_recv_api(void)
 
     g_mock_urma_write_status = URMA_SUCCESS;
     assert(os_transport_send(
-               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync, &urma_status)
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync, &urma_status)
            == 0);
     assert(urma_status == URMA_SUCCESS);
 
     g_mock_urma_write_status = TEST_URMA_STATUS_FIRST;
     assert(os_transport_send(
-               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE, 1, 2, &sync, &urma_status)
+               &send_handle, &jetty_info, &local_src, &remote_dst, DEFAULT_CHUNK_SIZE + 1, 1, 2, &sync, &urma_status)
            == (uint32_t)-1);
     assert(urma_status == TEST_URMA_STATUS_FIRST);
 
@@ -1057,7 +1048,6 @@ static void test_init_destroy_and_send_recv_api(void)
     device_dst.dst = (void *)0x4400;
     device_dst.jetty = (urma_jetty_t *)0x4401;
     device_dst.jfr = (urma_jfr_t *)0x4402;
-    send_handle.recv_queue_available = DEFAULT_RECV_QUEUE_CAPACITY;
     sync = NULL;
 
     g_inited = 0;
@@ -1081,13 +1071,19 @@ static void test_init_destroy_and_send_recv_api(void)
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == (uint32_t)-1);
 
     reset_mocks();
+    /* 栈上 handle 的 recv_ctx 未初始化，需与 os_transport_init 保持一致 */
+    pthread_spin_init(&send_handle.recv_ctx.lock, PTHREAD_PROCESS_PRIVATE);
+    /* recv 注册成功后通过 recv_ctx 预填 recv_queue_capacity * RQE_PREFILL_MULTIPLE_DUPLEX 个 recv */
+    send_handle.recv_ctx.recv_queue_capacity = 1;
     assert(os_transport_recv(&send_handle, &host_src, &device_dst, 64, 88, &sync, test_notify_cb) == 0);
     assert(sync != NULL);
-    assert(g_mock_urma_recv_calls == 1);
+    assert(g_mock_urma_recv_calls == RQE_PREFILL_MULTIPLE_DUPLEX);
     assert(g_mock_last_recv_info.request_id == 88);
-    assert(g_mock_last_recv_chunk.src == 0x3300);
-    assert(g_mock_last_recv_chunk.dst == 0x4400);
-    assert(g_mock_last_recv_chunk.len == 64);
+    assert(g_mock_last_recv_info.jetty == device_dst.jetty);
+    /* 预填的 recv 使用空 chunk */
+    assert(g_mock_last_recv_chunk.src == 0);
+    assert(g_mock_last_recv_chunk.dst == 0);
+    assert(g_mock_last_recv_chunk.len == 0);
     /* API behavior test only: avoid asserting chunk ownership contract here. */
     sync->chunks = NULL;
     free_sync_owned_resources(sync);
@@ -1201,7 +1197,7 @@ int main(void)
     RUN_TEST(test_wait_for_task_complete_and_mark);
     RUN_TEST(test_update_and_validate_and_build);
     RUN_TEST(test_request_id_codec);
-    RUN_TEST(test_recv_queue_limiter_and_wake_up);
+    RUN_TEST(test_wake_up_task);
     RUN_TEST(test_split_chunk_functions);
     RUN_TEST(test_construct_and_worker_helper_functions);
     RUN_TEST(test_user_data_bitfield_limits);
@@ -1210,7 +1206,7 @@ int main(void)
     RUN_TEST(test_construct_and_bind_functions);
 
     /* Public API behavior and regression scenarios. */
-    RUN_TEST(test_send_single_chunk_and_reg_jfc);
+    RUN_TEST(test_reg_jfc);
     RUN_TEST(test_init_destroy_and_send_recv_api);
     RUN_TEST(test_wait_and_free_sync);
     RUN_TEST(test_os_transport_cancel_tasks);
