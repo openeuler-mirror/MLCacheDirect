@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using datasystem::ConnectOptions;
@@ -190,7 +191,7 @@ bool ParseArgs(int argc, char **argv, Options &options)
 bool ValidateOptions(const Options &options)
 {
     const bool validCommand = options.command == "set" || options.command == "get"
-                              || options.command == "roundtrip";
+                              || options.command == "roundtrip" || options.command == "shell";
     if (!validCommand || options.port <= 0 || options.port > 65535) {
         return false;
     }
@@ -200,7 +201,7 @@ bool ValidateOptions(const Options &options)
 
 void PrintUsage(const char *program)
 {
-    std::cout << "Usage: " << program << " <host> <set|get|roundtrip> [options]\n"
+    std::cout << "Usage: " << program << " <host> <set|get|roundtrip|shell> [options]\n"
               << "  --port=N                 Worker port, default 18481\n"
               << "  --count=N                Keys per thread, default 1\n"
               << "  --value_size=N           Bytes per value, default 3670016\n"
@@ -210,7 +211,24 @@ void PrintUsage(const char *program)
               << "  --timeout_ms=N           Get timeout, default 60000\n"
               << "  --enable_local_cache=B   Local-cache mode, default true\n"
               << "  --cleanup_before=B       Delete keys before Set, default true\n"
-              << "  --delete_after=B         Delete keys after test, default false\n";
+              << "  --delete_after=B         Delete keys after test, default false\n"
+              << "\nShell commands:\n"
+              << "  create <key> [size]       Create and fill a Buffer, but do not Set it\n"
+              << "  set <key>                 Set a Buffer created by the create command\n"
+              << "  get <key> [size]          Get, H2D, D2H and verify a value\n"
+              << "  roundtrip <key> [size]    Create, Set, Get and verify a value\n"
+              << "  mcreate <prefix> <count> [size]  Batch Create and fill Buffers\n"
+              << "  mset <prefix>             Batch Set Buffers from mcreate\n"
+              << "  mget <prefix> <count> [size]  Batch Get and verify values\n"
+              << "  mroundtrip <prefix> <count> [size]  MCreate, MSet and MGet\n"
+              << "  parallel <op> <prefix> <count> <threads> [size]\n"
+              << "  del <key>                 Delete a published value\n"
+              << "  discard <key>             Release a pending Create Buffer without Set\n"
+              << "  pending                   List Buffers waiting for Set\n"
+              << "  sleep <ms>                Keep the client alive and wait\n"
+              << "  status                    Print cumulative counters\n"
+              << "  help                      Print shell commands\n"
+              << "  quit                      Destroy the client and exit\n";
 }
 
 uint32_t HashKey(const std::string &key)
@@ -256,32 +274,16 @@ void DeleteKey(KVClient &client, const std::string &key, int tid)
     }
 }
 
-bool CopyExpectedToDevice(const std::vector<uint8_t> &expected, DeviceBuffer &device, int tid, Summary &summary)
+bool CopyExpectedToCreateBuffer(const std::vector<uint8_t> &expected,
+                                const std::shared_ptr<datasystem::Buffer> &buffer, int tid)
 {
-    cudaError_t error = cudaSuccess;
-    const int64_t elapsed = MeasureUs([&] {
-        error = cudaMemcpy(device.Data(), expected.data(), expected.size(), cudaMemcpyHostToDevice);
-    });
-    if (!CheckCuda(error, tid, "expected H2D")) {
+    void *destination = buffer == nullptr ? nullptr : buffer->MutableData();
+    if (destination == nullptr || buffer->GetSize() != static_cast<int64_t>(expected.size())) {
+        Log(tid, "[HOST_COPY_FAIL] invalid Create Buffer");
         return false;
     }
-    ++summary.h2dOk;
-    Log(tid, "[H2D] phase=set_input size=", expected.size(), " elapsed_us=", elapsed);
-    return true;
-}
-
-bool CopyDeviceToCreateBuffer(DeviceBuffer &device, const std::shared_ptr<datasystem::Buffer> &buffer, int tid,
-                              Summary &summary)
-{
-    cudaError_t error = cudaSuccess;
-    const int64_t elapsed = MeasureUs([&] {
-        error = cudaMemcpy(buffer->MutableData(), device.Data(), buffer->GetSize(), cudaMemcpyDeviceToHost);
-    });
-    if (!CheckCuda(error, tid, "Create buffer D2H")) {
-        return false;
-    }
-    ++summary.d2hOk;
-    Log(tid, "[D2H] phase=create_buffer size=", buffer->GetSize(), " elapsed_us=", elapsed);
+    const int64_t elapsed = MeasureUs([&] { std::memcpy(destination, expected.data(), expected.size()); });
+    Log(tid, "[HOST_COPY] phase=create_buffer size=", expected.size(), " elapsed_us=", elapsed);
     return true;
 }
 
@@ -291,13 +293,6 @@ bool RunSetOne(KVClient &client, const Options &options, const std::string &key,
         DeleteKey(client, key, tid);
     }
     const auto expected = MakeExpectedData(key, options.valueSize);
-    DeviceBuffer device;
-    if (!CheckCuda(device.Allocate(expected.size()), tid, "cudaMalloc for Set")) {
-        return false;
-    }
-    if (!CopyExpectedToDevice(expected, device, tid, summary)) {
-        return false;
-    }
     std::shared_ptr<datasystem::Buffer> buffer;
     Status rc;
     const int64_t createUs = MeasureUs([&] { rc = client.Create(key, expected.size(), SetParam{}, buffer); });
@@ -306,7 +301,7 @@ bool RunSetOne(KVClient &client, const Options &options, const std::string &key,
         return false;
     }
     ++summary.createOk;
-    if (!CopyDeviceToCreateBuffer(device, buffer, tid, summary)) {
+    if (!CopyExpectedToCreateBuffer(expected, buffer, tid)) {
         return false;
     }
     const int64_t setUs = MeasureUs([&] { rc = client.Set(buffer); });
@@ -439,8 +434,467 @@ void PrintSummary(const Options &options, const Summary &summary, int64_t initUs
               << "result            : " << (summary.failed.load() == 0 ? "PASS" : "FAIL") << std::endl;
 }
 
+struct PendingBuffer {
+    std::shared_ptr<datasystem::Buffer> buffer;
+    uint64_t size = 0;
+};
+
+using PendingBufferMap = std::unordered_map<std::string, PendingBuffer>;
+using PendingBatchMap = std::unordered_map<std::string, std::vector<std::string>>;
+
+void PrintShellHelp()
+{
+    std::cout << "Commands:\n"
+              << "  create <key> [size]       Create and fill a Buffer, but do not Set it\n"
+              << "  set <key>                 Set a pending Buffer\n"
+              << "  get <key> [size]          Get and verify through GPU\n"
+              << "  roundtrip <key> [size]    Create, Set, Get and verify\n"
+              << "  mcreate <prefix> <count> [size]  MCreate and keep pending Buffers\n"
+              << "  mset <prefix>             MSet a pending batch\n"
+              << "  mget <prefix> <count> [size]  Batch Get and verify through GPU\n"
+              << "  mroundtrip <prefix> <count> [size]  MCreate, MSet and MGet\n"
+              << "  parallel <op> <prefix> <count> <threads> [size]\n"
+              << "                             op is set, get or roundtrip\n"
+              << "  del <key>                 Delete a published value\n"
+              << "  discard <key>             Release a pending Buffer without Set\n"
+              << "  pending                   List pending Buffers\n"
+              << "  sleep <ms>                Wait while keeping the client alive\n"
+              << "  status                    Print cumulative counters\n"
+              << "  help                      Print this help\n"
+              << "  quit                      Exit\n";
+}
+
+bool ParseCommandSize(std::istringstream &stream, uint64_t defaultSize, uint64_t &size)
+{
+    std::string value;
+    if (!(stream >> value)) {
+        size = defaultSize;
+        return true;
+    }
+    size = std::stoull(value);
+    return size > 0;
+}
+
+bool CreatePendingBuffer(KVClient &client, const Options &options, const std::string &key, uint64_t size,
+                         PendingBufferMap &pendingBuffers, Summary &summary)
+{
+    if (pendingBuffers.count(key) != 0) {
+        Log(0, "[CREATE_FAIL] key=", key, " already has a Buffer waiting for Set");
+        return false;
+    }
+    if (options.cleanupBefore) {
+        DeleteKey(client, key, 0);
+    }
+    const auto expected = MakeExpectedData(key, size);
+    std::shared_ptr<datasystem::Buffer> buffer;
+    Status rc;
+    const int64_t createUs = MeasureUs([&] { rc = client.Create(key, size, SetParam{}, buffer); });
+    Log(0, "[CREATE] key=", key, " size=", size, " rc=", rc.ToString(), " elapsed_us=", createUs);
+    if (rc.IsError() || buffer == nullptr) {
+        return false;
+    }
+    ++summary.createOk;
+    if (!CopyExpectedToCreateBuffer(expected, buffer, 0)) {
+        return false;
+    }
+    pendingBuffers.emplace(key, PendingBuffer{ std::move(buffer), size });
+    Log(0, "[PENDING] key=", key, " is waiting for Set");
+    return true;
+}
+
+bool SetPendingBuffer(KVClient &client, const std::string &key, PendingBufferMap &pendingBuffers, Summary &summary)
+{
+    auto entry = pendingBuffers.find(key);
+    if (entry == pendingBuffers.end()) {
+        Log(0, "[SET_FAIL] key=", key, " has no pending Create Buffer");
+        return false;
+    }
+    Status rc;
+    const int64_t setUs = MeasureUs([&] { rc = client.Set(entry->second.buffer); });
+    Log(0, "[SET] key=", key, " rc=", rc.ToString(), " elapsed_us=", setUs);
+    if (rc.IsError()) {
+        Log(0, "[PENDING] Set failed; Buffer is retained for retry, key=", key);
+        return false;
+    }
+    ++summary.setOk;
+    pendingBuffers.erase(entry);
+    return true;
+}
+
+void PrintPendingBuffers(const PendingBufferMap &pendingBuffers)
+{
+    std::cout << "[PENDING] count=" << pendingBuffers.size() << std::endl;
+    for (const auto &entry : pendingBuffers) {
+        std::cout << "  key=" << entry.first << " size=" << entry.second.size << std::endl;
+    }
+}
+
+void PrintPendingBatches(const PendingBatchMap &pendingBatches)
+{
+    std::cout << "[PENDING_BATCH] count=" << pendingBatches.size() << std::endl;
+    for (const auto &entry : pendingBatches) {
+        std::cout << "  prefix=" << entry.first << " buffers=" << entry.second.size() << std::endl;
+    }
+}
+
+bool ReadKeyAndSize(std::istringstream &stream, const Options &options, std::string &key, uint64_t &size)
+{
+    return static_cast<bool>(stream >> key) && ParseCommandSize(stream, options.valueSize, size);
+}
+
+bool RunShellDataCommand(const std::string &command, std::istringstream &stream, KVClient &client,
+                         const Options &options, PendingBufferMap &pendingBuffers, Summary &summary)
+{
+    std::string key;
+    uint64_t size = 0;
+    if (command == "set") {
+        return static_cast<bool>(stream >> key) && SetPendingBuffer(client, key, pendingBuffers, summary);
+    }
+    if (!ReadKeyAndSize(stream, options, key, size)) {
+        Log(0, "[COMMAND_ERROR] usage: ", command, " <key> [size]");
+        return false;
+    }
+    if (command == "create") {
+        return CreatePendingBuffer(client, options, key, size, pendingBuffers, summary);
+    }
+    Options commandOptions = options;
+    commandOptions.valueSize = size;
+    if (command == "get") {
+        return RunGetOne(client, commandOptions, key, 0, summary);
+    }
+    return RunSetOne(client, commandOptions, key, 0, summary)
+           && RunGetOne(client, commandOptions, key, 0, summary);
+}
+
+bool RunShellControlCommand(const std::string &command, std::istringstream &stream, KVClient &client,
+                            PendingBufferMap &pendingBuffers)
+{
+    if (command == "pending") {
+        PrintPendingBuffers(pendingBuffers);
+        return true;
+    }
+    std::string key;
+    if (command == "del") {
+        if (!(stream >> key)) {
+            Log(0, "[COMMAND_ERROR] usage: del <key>");
+            return false;
+        }
+        DeleteKey(client, key, 0);
+        return true;
+    }
+    if (command == "discard") {
+        if (!(stream >> key)) {
+            Log(0, "[COMMAND_ERROR] usage: discard <key>");
+            return false;
+        }
+        const size_t erased = pendingBuffers.erase(key);
+        Log(0, "[DISCARD] key=", key, " erased=", erased);
+        return erased != 0;
+    }
+    uint64_t waitMs = 0;
+    if (!(stream >> waitMs)) {
+        Log(0, "[COMMAND_ERROR] usage: sleep <ms>");
+        return false;
+    }
+    Log(0, "[SLEEP] begin, ms=", waitMs);
+    std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+    Log(0, "[SLEEP] end, ms=", waitMs);
+    return true;
+}
+
+std::vector<std::string> BuildBatchKeys(const std::string &prefix, int count)
+{
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (int index = 0; index < count; ++index) {
+        keys.emplace_back(prefix + "_" + std::to_string(index));
+    }
+    return keys;
+}
+
+bool ParseBatchArgs(std::istringstream &stream, const Options &options, std::string &prefix, int &count,
+                    uint64_t &size)
+{
+    return static_cast<bool>(stream >> prefix >> count) && count > 0
+           && ParseCommandSize(stream, options.valueSize, size);
+}
+
+bool FillBatchBuffers(const std::vector<std::string> &keys,
+                      const std::vector<std::shared_ptr<datasystem::Buffer>> &buffers, uint64_t size)
+{
+    if (keys.size() != buffers.size()) {
+        Log(0, "[MCREATE_FAIL] returned Buffer count mismatch: keys=", keys.size(), " buffers=", buffers.size());
+        return false;
+    }
+    for (size_t index = 0; index < keys.size(); ++index) {
+        if (buffers[index] == nullptr || buffers[index]->GetSize() != static_cast<int64_t>(size)) {
+            Log(0, "[MCREATE_FAIL] invalid Buffer, key=", keys[index]);
+            return false;
+        }
+        const auto expected = MakeExpectedData(keys[index], size);
+        if (!CopyExpectedToCreateBuffer(expected, buffers[index], 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MCreatePending(KVClient &client, const Options &options, const std::string &prefix, int count, uint64_t size,
+                    PendingBufferMap &pendingBuffers, PendingBatchMap &pendingBatches, Summary &summary)
+{
+    if (pendingBatches.count(prefix) != 0) {
+        Log(0, "[MCREATE_FAIL] prefix=", prefix, " already has a pending batch");
+        return false;
+    }
+    auto keys = BuildBatchKeys(prefix, count);
+    for (const auto &key : keys) {
+        if (pendingBuffers.count(key) != 0) {
+            Log(0, "[MCREATE_FAIL] key=", key, " already has a pending Buffer");
+            return false;
+        }
+        if (options.cleanupBefore) {
+            DeleteKey(client, key, 0);
+        }
+    }
+    std::vector<std::shared_ptr<datasystem::Buffer>> buffers;
+    std::vector<uint64_t> sizes(keys.size(), size);
+    Status rc;
+    const int64_t elapsed = MeasureUs([&] { rc = client.MCreate(keys, sizes, SetParam{}, buffers); });
+    Log(0, "[MCREATE] prefix=", prefix, " count=", count, " rc=", rc.ToString(), " elapsed_us=", elapsed);
+    if (rc.IsError() || !FillBatchBuffers(keys, buffers, size)) {
+        return false;
+    }
+    summary.createOk += count;
+    for (size_t index = 0; index < keys.size(); ++index) {
+        pendingBuffers.emplace(keys[index], PendingBuffer{ std::move(buffers[index]), size });
+    }
+    pendingBatches.emplace(prefix, std::move(keys));
+    return true;
+}
+
+bool MSetPending(KVClient &client, const std::string &prefix, PendingBufferMap &pendingBuffers,
+                 PendingBatchMap &pendingBatches, Summary &summary)
+{
+    auto batch = pendingBatches.find(prefix);
+    if (batch == pendingBatches.end()) {
+        Log(0, "[MSET_FAIL] prefix=", prefix, " has no pending MCreate batch");
+        return false;
+    }
+    std::vector<std::shared_ptr<datasystem::Buffer>> buffers;
+    buffers.reserve(batch->second.size());
+    for (const auto &key : batch->second) {
+        auto entry = pendingBuffers.find(key);
+        if (entry == pendingBuffers.end()) {
+            Log(0, "[MSET_FAIL] missing pending Buffer, key=", key);
+            return false;
+        }
+        buffers.emplace_back(entry->second.buffer);
+    }
+    Status rc;
+    const int64_t elapsed = MeasureUs([&] { rc = client.MSet(buffers); });
+    Log(0, "[MSET] prefix=", prefix, " count=", buffers.size(), " rc=", rc.ToString(), " elapsed_us=", elapsed);
+    if (rc.IsError()) {
+        return false;
+    }
+    summary.setOk += buffers.size();
+    for (const auto &key : batch->second) {
+        pendingBuffers.erase(key);
+    }
+    pendingBatches.erase(batch);
+    return true;
+}
+
+bool VerifyBatchGet(const std::vector<std::string> &keys, std::vector<Optional<ReadOnlyBuffer>> &buffers,
+                    uint64_t size, Summary &summary)
+{
+    if (keys.size() != buffers.size()) {
+        Log(0, "[MGET_FAIL] returned Buffer count mismatch: keys=", keys.size(), " buffers=", buffers.size());
+        return false;
+    }
+    for (size_t index = 0; index < keys.size(); ++index) {
+        if (!buffers[index] || buffers[index]->GetSize() != static_cast<int64_t>(size)) {
+            Log(0, "[MGET_FAIL] missing or invalid Buffer, key=", keys[index]);
+            return false;
+        }
+        ++summary.getOk;
+        const auto expected = MakeExpectedData(keys[index], size);
+        std::vector<uint8_t> actual(size);
+        if (!CopyReadBufferThroughGpu(*buffers[index], actual, 0, summary) || actual != expected) {
+            Log(0, "[VERIFY_FAIL] key=", keys[index], " data mismatch");
+            return false;
+        }
+        ++summary.verifyOk;
+    }
+    return true;
+}
+
+bool MGetBatch(KVClient &client, const Options &options, const std::string &prefix, int count, uint64_t size,
+               Summary &summary)
+{
+    const auto keys = BuildBatchKeys(prefix, count);
+    std::vector<Optional<ReadOnlyBuffer>> buffers;
+    Status rc;
+    const int64_t elapsed = MeasureUs([&] { rc = client.Get(keys, buffers, options.timeoutMs); });
+    Log(0, "[MGET] prefix=", prefix, " count=", count, " rc=", rc.ToString(), " elapsed_us=", elapsed);
+    return rc.IsOk() && VerifyBatchGet(keys, buffers, size, summary);
+}
+
+void RunParallelWorker(const std::shared_ptr<KVClient> &client, const Options &options, const std::string &operation,
+                       const std::string &prefix, int count, int tid, std::atomic<int> &next, Summary &summary)
+{
+    if (!CheckCuda(cudaSetDevice(options.gpuId), tid, "cudaSetDevice in parallel worker")) {
+        ++summary.failed;
+        return;
+    }
+    for (int index = next.fetch_add(1); index < count; index = next.fetch_add(1)) {
+        const std::string key = prefix + "_" + std::to_string(index);
+        Options commandOptions = options;
+        commandOptions.command = operation;
+        (void)RunOne(*client, commandOptions, key, tid, summary);
+    }
+}
+
+bool RunParallel(std::istringstream &stream, const std::shared_ptr<KVClient> &client, const Options &options,
+                 Summary &summary)
+{
+    std::string operation;
+    std::string prefix;
+    int count = 0;
+    int threadNum = 0;
+    uint64_t size = 0;
+    if (!(stream >> operation >> prefix >> count >> threadNum) || count <= 0 || threadNum <= 0
+        || !ParseCommandSize(stream, options.valueSize, size)
+        || (operation != "set" && operation != "get" && operation != "roundtrip")) {
+        Log(0, "[COMMAND_ERROR] usage: parallel <set|get|roundtrip> <prefix> <count> <threads> [size]");
+        return false;
+    }
+    Options commandOptions = options;
+    commandOptions.valueSize = size;
+    std::atomic<int> next{ 0 };
+    std::vector<std::thread> threads;
+    for (int index = 0; index < threadNum; ++index) {
+        threads.emplace_back(RunParallelWorker, client, std::cref(commandOptions), std::cref(operation),
+                             std::cref(prefix), count, index, std::ref(next), std::ref(summary));
+    }
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    return true;
+}
+
+bool RunShellBatchCommand(const std::string &command, std::istringstream &stream, KVClient &client,
+                          const Options &options, PendingBufferMap &pendingBuffers,
+                          PendingBatchMap &pendingBatches, Summary &summary)
+{
+    std::string prefix;
+    if (command == "mset") {
+        if (!(stream >> prefix)) {
+            Log(0, "[COMMAND_ERROR] usage: mset <prefix>");
+            return false;
+        }
+        return MSetPending(client, prefix, pendingBuffers, pendingBatches, summary);
+    }
+    int count = 0;
+    uint64_t size = 0;
+    if (!ParseBatchArgs(stream, options, prefix, count, size)) {
+        Log(0, "[COMMAND_ERROR] usage: ", command, " <prefix> <count> [size]");
+        return false;
+    }
+    if (command == "mcreate") {
+        return MCreatePending(client, options, prefix, count, size, pendingBuffers, pendingBatches, summary);
+    }
+    if (command == "mget") {
+        return MGetBatch(client, options, prefix, count, size, summary);
+    }
+    return MCreatePending(client, options, prefix, count, size, pendingBuffers, pendingBatches, summary)
+           && MSetPending(client, prefix, pendingBuffers, pendingBatches, summary)
+           && MGetBatch(client, options, prefix, count, size, summary);
+}
+
+bool IsBatchCommand(const std::string &command)
+{
+    return command == "mcreate" || command == "mset" || command == "mget" || command == "mroundtrip";
+}
+
+bool ExecuteShellCommand(const std::string &command, std::istringstream &stream,
+                         const std::shared_ptr<KVClient> &client, const Options &options,
+                         PendingBufferMap &pendingBuffers, PendingBatchMap &pendingBatches, Summary &summary,
+                         int64_t initUs)
+{
+    if (command == "help") {
+        PrintShellHelp();
+        return true;
+    }
+    if (command == "status") {
+        PrintSummary(options, summary, initUs);
+        PrintPendingBuffers(pendingBuffers);
+        PrintPendingBatches(pendingBatches);
+        return true;
+    }
+    if (command == "create" || command == "set" || command == "get" || command == "roundtrip") {
+        return RunShellDataCommand(command, stream, *client, options, pendingBuffers, summary);
+    }
+    if (IsBatchCommand(command)) {
+        return RunShellBatchCommand(command, stream, *client, options, pendingBuffers, pendingBatches, summary);
+    }
+    if (command == "parallel") {
+        return RunParallel(stream, client, options, summary);
+    }
+    if (command == "del" || command == "discard" || command == "pending" || command == "sleep") {
+        return RunShellControlCommand(command, stream, *client, pendingBuffers);
+    }
+    Log(0, "[COMMAND_ERROR] unknown command: ", command, "; enter help for usage");
+    return false;
+}
+
+int RunShell(const Options &options)
+{
+    int64_t initUs = 0;
+    auto client = InitClient(options, initUs);
+    if (client == nullptr) {
+        return 1;
+    }
+    if (!CheckCuda(cudaSetDevice(options.gpuId), 0, "cudaSetDevice")) {
+        return 1;
+    }
+    std::cout << "[INIT] rc=OK elapsed_us=" << initUs << " client=" << client.get() << std::endl;
+    PrintShellHelp();
+    Summary summary;
+    PendingBufferMap pendingBuffers;
+    PendingBatchMap pendingBatches;
+    std::string line;
+    while (std::cout << "async-pin> " && std::getline(std::cin, line)) {
+        std::istringstream stream(line);
+        std::string command;
+        if (!(stream >> command)) {
+            continue;
+        }
+        if (command == "quit" || command == "exit") {
+            break;
+        }
+        try {
+            const bool success = ExecuteShellCommand(command, stream, client, options, pendingBuffers,
+                                                     pendingBatches, summary, initUs);
+            if (!success) {
+                ++summary.failed;
+            }
+        } catch (const std::exception &error) {
+            ++summary.failed;
+            Log(0, "[COMMAND_ERROR] ", error.what());
+        }
+    }
+    PrintSummary(options, summary, initUs);
+    PrintPendingBuffers(pendingBuffers);
+    PrintPendingBatches(pendingBatches);
+    std::cout << "[EXIT] releasing pending Buffers and destroying KVClient" << std::endl;
+    return summary.failed.load() == 0 ? 0 : 2;
+}
+
 int Run(const Options &options)
 {
+    if (options.command == "shell") {
+        return RunShell(options);
+    }
     int64_t initUs = 0;
     auto client = InitClient(options, initUs);
     if (client == nullptr) {
