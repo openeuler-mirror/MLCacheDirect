@@ -57,6 +57,17 @@ target_compile_options(pipeline_h2d PRIVATE
     $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
 )
 
+add_executable(pipeline_async_pin_test pipeline_async_pin_test.cpp)
+target_include_directories(pipeline_async_pin_test PRIVATE
+    ${COMMON_HEADER}/
+)
+target_link_libraries(pipeline_async_pin_test PRIVATE
+    ${COMMON_LIB}
+)
+target_compile_options(pipeline_async_pin_test PRIVATE
+    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
+)
+
 
 #################### batch test util ##################
 
