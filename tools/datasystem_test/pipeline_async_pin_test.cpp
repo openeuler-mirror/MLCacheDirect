@@ -1,5 +1,6 @@
 #include "datasystem/kv_client.h"
 #include "datasystem/utils/connection.h"
+#include "datasystem/utils/service_discovery.h"
 
 #include <cuda_runtime.h>
 
@@ -17,9 +18,13 @@
 #include <vector>
 
 using datasystem::ConnectOptions;
+using datasystem::DataPlacementPolicy;
 using datasystem::KVClient;
 using datasystem::Optional;
 using datasystem::ReadOnlyBuffer;
+using datasystem::ServiceAffinityPolicy;
+using datasystem::ServiceDiscovery;
+using datasystem::ServiceDiscoveryOptions;
 using datasystem::SetParam;
 using datasystem::Status;
 
@@ -30,6 +35,9 @@ std::mutex g_logMutex;
 struct Options {
     std::string host;
     std::string command;
+    std::string etcdAddress;
+    std::string clusterName;
+    std::string hostIdEnvName;
     std::string keyPrefix = "async_pin";
     int port = 18481;
     int count = 1;
@@ -159,6 +167,12 @@ bool ApplyOption(const std::string &name, const std::string &value, Options &opt
         options.timeoutMs = std::stoi(value);
     } else if (name == "key_prefix") {
         options.keyPrefix = value;
+    } else if (name == "etcd_address") {
+        options.etcdAddress = value;
+    } else if (name == "cluster_name") {
+        options.clusterName = value;
+    } else if (name == "host_id_env_name") {
+        options.hostIdEnvName = value;
     } else {
         return ApplyBoolOption(name, value, options);
     }
@@ -167,12 +181,22 @@ bool ApplyOption(const std::string &name, const std::string &value, Options &opt
 
 bool ParseArgs(int argc, char **argv, Options &options)
 {
-    if (argc < 3) {
+    if (argc < 2) {
         return false;
     }
-    options.host = argv[1];
-    options.command = argv[2];
-    for (int i = 3; i < argc; ++i) {
+    int optionBegin = 0;
+    const std::string first = argv[1];
+    if (first == "set" || first == "get" || first == "roundtrip" || first == "shell") {
+        options.command = first;
+        optionBegin = 2;
+    } else if (argc >= 3) {
+        options.host = first;
+        options.command = argv[2];
+        optionBegin = 3;
+    } else {
+        return false;
+    }
+    for (int i = optionBegin; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "--help" || argument == "-h") {
             options.help = true;
@@ -192,7 +216,11 @@ bool ValidateOptions(const Options &options)
 {
     const bool validCommand = options.command == "set" || options.command == "get"
                               || options.command == "roundtrip" || options.command == "shell";
-    if (!validCommand || options.port <= 0 || options.port > 65535) {
+    const bool hasServiceDiscovery = !options.etcdAddress.empty() || !options.clusterName.empty();
+    const bool validConnection = hasServiceDiscovery
+                                     ? !options.etcdAddress.empty() && !options.clusterName.empty()
+                                     : !options.host.empty() && options.port > 0 && options.port <= 65535;
+    if (!validCommand || !validConnection) {
         return false;
     }
     return options.count > 0 && options.valueSize > 0 && options.threadNum > 0 && options.gpuId >= 0
@@ -201,8 +229,13 @@ bool ValidateOptions(const Options &options)
 
 void PrintUsage(const char *program)
 {
-    std::cout << "Usage: " << program << " <host> <set|get|roundtrip|shell> [options]\n"
+    std::cout << "Usage:\n"
+              << "  " << program << " <host> <set|get|roundtrip|shell> [options]\n"
+              << "  " << program << " <set|get|roundtrip|shell> --etcd_address=ADDR --cluster_name=NAME [options]\n"
               << "  --port=N                 Worker port, default 18481\n"
+              << "  --etcd_address=ADDR      ETCD address list for service discovery\n"
+              << "  --cluster_name=NAME      Datasystem cluster name for service discovery\n"
+              << "  --host_id_env_name=NAME  Environment variable containing the local host ID\n"
               << "  --count=N                Keys per thread, default 1\n"
               << "  --value_size=N           Bytes per value, default 3670016\n"
               << "  --key_prefix=TEXT        Key prefix, default async_pin\n"
@@ -400,10 +433,34 @@ void RunThread(const std::shared_ptr<KVClient> &client, const Options &options, 
 std::shared_ptr<KVClient> InitClient(const Options &options, int64_t &elapsedUs)
 {
     ConnectOptions connect;
-    connect.host = options.host;
-    connect.port = options.port;
     connect.deviceId = std::to_string(options.gpuId);
-    connect.enableLocalCache = options.enableLocalCache;
+    if (!options.etcdAddress.empty()) {
+        ServiceDiscoveryOptions discoveryOptions;
+        discoveryOptions.etcdAddress = options.etcdAddress;
+        discoveryOptions.clusterName = options.clusterName;
+        discoveryOptions.hostIdEnvName = options.hostIdEnvName;
+        discoveryOptions.affinityPolicy = ServiceAffinityPolicy::PREFERRED_SAME_NODE;
+        auto serviceDiscovery = std::make_shared<ServiceDiscovery>(discoveryOptions);
+        Status discoveryRc = serviceDiscovery->Init();
+        if (discoveryRc.IsError()) {
+            std::cerr << "[DISCOVERY_INIT_FAIL] " << discoveryRc.ToString() << std::endl;
+            return nullptr;
+        }
+        connect.enableLocalCache = false;
+        connect.enableCrossNodeConnection = true;
+        connect.dataPlacementPolicy = DataPlacementPolicy::PREFERRED_META_OWNER;
+        connect.serviceDiscovery = std::move(serviceDiscovery);
+        std::cout << "[DISCOVERY_INIT] rc=OK etcd_address=" << options.etcdAddress
+                  << " cluster_name=" << options.clusterName
+                  << " host_id_env_name=" << (options.hostIdEnvName.empty() ? "<empty>" : options.hostIdEnvName)
+                  << std::endl;
+        std::cout << "[CLIENT_CONFIG] enable_local_cache=false enable_cross_node_connection=true "
+                  << "data_placement_policy=PREFERRED_META_OWNER" << std::endl;
+    } else {
+        connect.host = options.host;
+        connect.port = options.port;
+        connect.enableLocalCache = options.enableLocalCache;
+    }
     auto client = std::make_shared<KVClient>(connect);
     Status rc;
     elapsedUs = MeasureUs([&] { rc = client->Init(); });
@@ -422,7 +479,14 @@ void PrintSummary(const Options &options, const Summary &summary, int64_t initUs
               << "threads           : " << options.threadNum << '\n'
               << "keys per thread   : " << options.count << '\n'
               << "value size        : " << options.valueSize << '\n'
-              << "enable local cache: " << std::boolalpha << options.enableLocalCache << '\n'
+              << "connection mode   : " << (options.etcdAddress.empty() ? "direct worker" : "service discovery")
+              << '\n'
+              << "service endpoint  : "
+              << (options.etcdAddress.empty() ? options.host : options.etcdAddress) << '\n'
+              << "cluster name      : "
+              << (options.etcdAddress.empty() ? "N/A" : options.clusterName) << '\n'
+              << "enable local cache: " << std::boolalpha
+              << (options.etcdAddress.empty() ? options.enableLocalCache : false) << '\n'
               << "init us           : " << initUs << '\n'
               << "create success    : " << summary.createOk.load() << '\n'
               << "set success       : " << summary.setOk.load() << '\n'

@@ -64,27 +64,58 @@ Examples:
 4. pin 完成前后，同一个常驻 KVClient 的单 key、批量和多线程请求均能正常执行。
 5. 真正的 MCreate、MSet、批量 Get(ReadOnlyBuffer) 接口功能。
 
-工具需要在带 GPU 和 CUDA Runtime 的设备上运行。第一个位置参数 host 是 client 初始化时连接的
-datasystem worker 地址，不是测试工具所在设备的本地 IP。例如 GPU 设备为 141.62.32.111、worker
-为 141.62.32.115 时，应在 111 上执行：
+工具需要在带 GPU 和 CUDA Runtime 的设备上运行。支持以下两种 Client 初始化方式：
+
+1. 服务发现模式：不指定 Worker IP，通过 ETCD 发现集群中的 Worker。该模式与客户真实使用方式一致，
+   推荐用于多 Worker 异步 Pin 测试。
+2. 直连模式：通过第一个位置参数指定一个 Worker，保留用于单 Worker 回归测试。
+
+服务发现模式示例：
+
+    ./pipeline_async_pin_test shell --etcd_address=141.62.32.115:12159 \
+        --cluster_name=zhaopai --host_id_env_name=POD_IP --gpu_id=0
+
+服务发现模式自动采用以下配置：
+
+    enableLocalCache = false
+    enableCrossNodeConnection = true
+    dataPlacementPolicy = PREFERRED_META_OWNER
+    ServiceDiscovery affinityPolicy = PREFERRED_SAME_NODE
+
+`--host_id_env_name` 填的是环境变量名称，不是 host ID 本身。需要按本机 Worker 启动时使用的
+`host_id_env_name` 设置同名环境变量，例如：
+
+    export POD_IP=141.62.32.111
+
+然后传入 `--host_id_env_name=POD_IP`。环境变量的值必须与 ETCD membership 中本机 Worker 的
+`hostId` 一致。同一台机器上的多个 Worker 应注册相同的 `hostId`；这样 ServiceDiscovery 才能把它们
+都识别为本机 Worker。该参数不填写时仍可通过 ETCD 发现 Worker，但无法基于 host ID 区分本机与远端
+Worker。
+
+直连模式下，第一个位置参数 host 是 client 初始化时连接的 Worker 地址，不是测试工具所在设备的本地
+IP。例如 GPU 设备为 141.62.32.111、Worker 为 141.62.32.115 时，应在 111 上执行：
 
     ./pipeline_async_pin_test 141.62.32.115 shell --port=18681 --gpu_id=0
 
 #### 启动格式
 
+    ./pipeline_async_pin_test <set|get|roundtrip|shell> --etcd_address=<addr> --cluster_name=<name> [options]
     ./pipeline_async_pin_test <host> <set|get|roundtrip|shell> [options]
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| host | 必填 | client 初始化时连接的 worker IP |
+| host | 直连模式必填 | client 初始化时连接的 Worker IP；服务发现模式不填写 |
 | --port | 18481 | worker 服务端口 |
+| --etcd_address | 无 | 服务发现模式必填，ETCD地址；多个地址使用逗号分隔 |
+| --cluster_name | 无 | 服务发现模式必填，datasystem集群名称 |
+| --host_id_env_name | 无 | 保存本机host ID的环境变量名；需要识别同机多个Worker时建议填写 |
 | --count | 1 | 普通模式下每个线程处理的 key 数 |
 | --thread | 1 | 普通模式线程数 |
 | --value_size | 3670016 | 默认 value 大小，单位为字节 |
 | --key_prefix | async_pin | 普通模式自动生成 key 时使用的前缀 |
 | --gpu_id | 0 | CUDA 设备编号 |
 | --timeout_ms | 60000 | Get 等待超时时间，单位为毫秒 |
-| --enable_local_cache | true | 设置 ConnectOptions.enableLocalCache |
+| --enable_local_cache | true | 直连模式的配置；服务发现模式固定为false |
 | --cleanup_before | true | Create 前删除同名旧对象 |
 | --delete_after | false | 普通模式和 parallel 模式完成后删除对象 |
 
@@ -134,7 +165,13 @@ roundtrip 对每个 key 完整执行 Create、Set、Get和数据校验：
 
 #### shell 常驻模式
 
-推荐使用 shell 模式验证异步 pin：
+推荐使用服务发现加 shell 常驻模式验证多 Worker 异步 Pin：
+
+    ./pipeline_async_pin_test shell --etcd_address=141.62.32.115:12159 \
+        --cluster_name=zhaopai --host_id_env_name=POD_IP --gpu_id=0 --value_size=3670016 \
+        --timeout_ms=60000 --cleanup_before=true
+
+如需验证原有单 Worker 直连方式：
 
     ./pipeline_async_pin_test 141.62.32.115 shell --port=18681 --gpu_id=0 \
         --value_size=3670016 --timeout_ms=60000 --enable_local_cache=false \
