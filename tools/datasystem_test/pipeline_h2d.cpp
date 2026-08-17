@@ -34,6 +34,15 @@ static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
     return syncErr != cudaSuccess ? syncErr : destroyErr;
 }
 
+static void CudaRegisterPinFuncs()
+{
+    CudaFuncs funcs;
+    funcs.hostRegister = reinterpret_cast<HostRegisterFunc>(cudaHostRegister);
+    funcs.hostUnregister = reinterpret_cast<HostUnregisterFunc>(cudaHostUnregister);
+    funcs.getErrorString = reinterpret_cast<GetErrorStringFunc>(cudaGetErrorString);
+    KVClient::RegisterCudaFuncs(funcs);
+}
+
 #define TLOG(tid, ...)                                                                                                 \
     do {                                                                                                               \
         static std::mutex print_mutex;                                                                                 \
@@ -718,6 +727,7 @@ void PrintUsage(const char *prog)
     std::cout << "  --thread=N or --thread N            : Number of concurrent threads (default: 1)" << std::endl;
     std::cout << "  --delete_value=true|false|1|0       : Delete keys after get (default: true)" << std::endl;
     std::cout << "  --gpu_id=N                         : GPU device ID to use (default: 0)" << std::endl;
+    std::cout << "  --pin=true|false|1|0               : Register CUDA host-memory funcs before KVClient Init (default: true)" << std::endl;
     std::cout << "  --enable_local_cache=true|false     : Enable local worker/cache path (default: true)" << std::endl;
     std::cout << "  --enable_client_direct_rh2d=true|false : Enable client-direct RH2D (default: false)" << std::endl;
     std::cout << "  --client_direct_thread_num=N      : Client-side pipeline H2D thread num (default: 32)" << std::endl;
@@ -755,6 +765,7 @@ struct CmdArgs {
     bool delete_value = true;
     std::string gpu_id_str = "0";
     int gpu_id = 0;
+    bool pin = true;
     bool help = false;
     bool enable_local_cache = true;
     bool enable_client_direct_rh2d = false;
@@ -795,6 +806,8 @@ CmdArgs ParseArgs(int argc, char *argv[])
                 args.thread_count = std::stoi(value);
             else if (key == "delete_value")
                 args.delete_value = ParseBool(value);
+            else if (key == "pin")
+                args.pin = ParseBool(value);
             else if (key == "gpu_id" || key == "gpu_num")
                 args.gpu_id_str = value;
             else if (key == "port")
@@ -839,6 +852,8 @@ CmdArgs ParseArgs(int argc, char *argv[])
                     args.thread_count = std::stoi(value);
                 else if (key == "delete_value")
                     args.delete_value = ParseBool(value);
+                else if (key == "pin")
+                    args.pin = ParseBool(value);
                 else if (key == "gpu_id")
                     args.gpu_id_str = value;
                 else if (key == "port")
@@ -906,6 +921,7 @@ int main(int argc, char *argv[])
               << "target GPU: " << args.gpu_id << ", "
               << "port: " << args.port << ", "
               << "command=" << args.cmd << ", "
+              << "pin=" << std::boolalpha << args.pin << ", "
               << "enable_local_cache=" << std::boolalpha << args.enable_local_cache << ", "
               << "enable_client_direct_rh2d=" << args.enable_client_direct_rh2d << ", "
               << "client_direct_thread_num=" << args.client_direct_thread_num << ", "
@@ -924,6 +940,9 @@ int main(int argc, char *argv[])
         connectOptions.clientDirectPipelineH2DThreadNum = args.client_direct_thread_num;
 
         auto sharedClient = std::make_shared<KVClient>(connectOptions);
+        if (args.pin) {
+            CudaRegisterPinFuncs();
+        }
         auto ret = sharedClient->Init();
         if (ret.IsError()) {
             std::cerr << "init client failed for host " << args.host << " port " << args.port

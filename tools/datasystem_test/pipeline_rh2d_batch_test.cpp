@@ -47,6 +47,21 @@ static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
 }
 #endif
 
+#ifdef USE_CUDA_MOCK
+static void CudaRegisterPinFuncs()
+{
+}
+#else
+static void CudaRegisterPinFuncs()
+{
+    CudaFuncs funcs;
+    funcs.hostRegister = reinterpret_cast<HostRegisterFunc>(cudaHostRegister);
+    funcs.hostUnregister = reinterpret_cast<HostUnregisterFunc>(cudaHostUnregister);
+    funcs.getErrorString = reinterpret_cast<GetErrorStringFunc>(cudaGetErrorString);
+    KVClient::RegisterCudaFuncs(funcs);
+}
+#endif
+
 std::mutex print_mutex;
 
 // Token bucket rate limiter
@@ -197,6 +212,7 @@ struct ClientOptions {
     bool enable_local_cache = true;
     bool enable_client_direct_rh2d = false;
     int client_direct_thread_num = 32;
+    bool pin = true;
 };
 
 class Barrier {
@@ -1454,6 +1470,7 @@ void PrintUsage(const char* prog) {
     std::cout << "  --host_id_env_name=NAME  Environment variable containing the local host ID" << std::endl;
     std::cout << "  --gpu_id=N        GPU device ID (default: 0)" << std::endl;
     std::cout << "  --verify=Y/N      Verify data (default: Y)" << std::endl;
+    std::cout << "  --pin=Y/N         Register CUDA host-memory funcs before KVClient Init (default: Y)" << std::endl;
     std::cout << "  --use_user_stream=Y/N  Use new MGetH2D interface (default: N)" << std::endl;
     std::cout << "  --enable_local_cache=Y/N  Enable local cache (default: Y)" << std::endl;
     std::cout << "  --enable_client_direct_rh2d=Y/N  Enable client-direct RH2D (default: N)" << std::endl;
@@ -1531,6 +1548,7 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             else if (key == "verify") args.verify_data = ParseBool(value);
             else if (key == "use_user_stream") args.use_user_stream = ParseBool(value);
             else if (key == "enable_local_cache") args.client_options.enable_local_cache = ParseBool(value);
+            else if (key == "pin") args.client_options.pin = ParseBool(value);
             else if (key == "enable_client_direct_rh2d") {
                 args.client_options.enable_client_direct_rh2d = ParseBool(value);
             }
@@ -1567,6 +1585,7 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                 else if (key == "verify") args.verify_data = ParseBool(value);
                 else if (key == "use_user_stream") args.use_user_stream = ParseBool(value);
                 else if (key == "enable_local_cache") args.client_options.enable_local_cache = ParseBool(value);
+                else if (key == "pin") args.client_options.pin = ParseBool(value);
                 else if (key == "enable_client_direct_rh2d") {
                     args.client_options.enable_client_direct_rh2d = ParseBool(value);
                 }
@@ -1624,6 +1643,9 @@ std::shared_ptr<KVClient> CreateClientForHost(const CmdArgs& args, const std::st
     connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
 
     auto sharedClient = std::make_shared<KVClient>(connectOptions);
+    if (args.client_options.pin) {
+        CudaRegisterPinFuncs();
+    }
     Status rc = sharedClient->Init();
     if (rc.IsError()) {
         std::cerr << prefix << " Failed to init " << name << ": " << rc.GetMsg() << std::endl;
@@ -2248,6 +2270,7 @@ int main(int argc, char* argv[]) {
               << (args.client_options.enable_client_direct_rh2d ? "Yes" : "No")
               << ", client_direct_thread_num: " << args.client_options.client_direct_thread_num
               << ", fast_transport_mem_size: " << args.client_options.fast_transport_mem_size
+              << ", pin: " << (args.client_options.pin ? "Yes" : "No")
               << ", Origin Get: " << (args.origin_get ? "Yes" : "No") << std::endl;
 
     std::shared_ptr<KVClient> sharedClient = CreateSharedClient(args);

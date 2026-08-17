@@ -42,6 +42,15 @@ static cudaError_t WaitAndDestroyH2DStream(cudaStream_t stream)
     return syncErr != cudaSuccess ? syncErr : destroyErr;
 }
 
+static void CudaRegisterPinFuncs()
+{
+    CudaFuncs funcs;
+    funcs.hostRegister = reinterpret_cast<HostRegisterFunc>(cudaHostRegister);
+    funcs.hostUnregister = reinterpret_cast<HostUnregisterFunc>(cudaHostUnregister);
+    funcs.getErrorString = reinterpret_cast<GetErrorStringFunc>(cudaGetErrorString);
+    KVClient::RegisterCudaFuncs(funcs);
+}
+
 std::vector<std::string> SplitString(const std::string &str, char delimiter)
 {
     std::vector<std::string> tokens;
@@ -574,8 +583,9 @@ class H2DFaultTest {
 public:
     // host: 本地 Worker (Get端，流程4/8)
     // remote_worker: 远程 Worker (Set端，流程6/7)，为空表示单机模式
-    H2DFaultTest(const std::string &host, const std::string &remote_worker = "", int port = 18481, int gpu_id = 0) :
-        host_(host), port_(port), gpu_id_(gpu_id), remote_worker_(remote_worker), mlcd_inject_(),
+    H2DFaultTest(const std::string &host, const std::string &remote_worker = "", int port = 18481, int gpu_id = 0,
+                 bool pin = true) :
+        host_(host), port_(port), gpu_id_(gpu_id), remote_worker_(remote_worker), pin_(pin), mlcd_inject_(),
         remote_inject_(remote_worker), is_cluster_(!remote_worker.empty())
     {
         ResetClient();
@@ -617,6 +627,9 @@ public:
         connectOptions.deviceId = std::to_string(gpu_id_);
 
         client_ = std::make_unique<KVClient>(connectOptions);
+        if (pin_) {
+            CudaRegisterPinFuncs();
+        }
         client_->Init();
     }
 
@@ -1168,6 +1181,7 @@ private:
     int port_;
     int gpu_id_;
     std::string remote_worker_;
+    bool pin_;
     std::unique_ptr<KVClient> client_;
     std::vector<std::pair<std::string, std::string>> data_;
     std::string base_value_prefix_ = "0";
@@ -1205,6 +1219,7 @@ void PrintUsage(const char *prog)
         << "  --thread=N or --thread N          : Accepted for pipeline_h2d compatibility; fault test runs serially"
         << std::endl;
     std::cout << "  --delete_value=true|false|1|0     : Delete keys after get (default: true)" << std::endl;
+    std::cout << "  --pin=true|false|1|0              : Register CUDA host-memory funcs before KVClient Init (default: true)" << std::endl;
     std::cout << "  --gpu_id=N or --gpu_id N          : GPU device ID to use (default: 0)" << std::endl;
     std::cout << "  --list                            : List all fault scenarios" << std::endl;
     std::cout << "  --help or -h                      : Show this help message" << std::endl;
@@ -1259,6 +1274,7 @@ struct CmdArgs {
     bool delete_value = true;
     std::string gpu_id_str = "0";
     int gpu_id = 0;
+    bool pin = true;
     bool help = false;
 };
 
@@ -1313,6 +1329,8 @@ CmdArgs ParseArgs(int argc, char *argv[])
                 args.thread_count = std::stoi(value);
             else if (key == "delete_value")
                 args.delete_value = ParseBool(value);
+            else if (key == "pin")
+                args.pin = ParseBool(value);
             else if (key == "gpu_id" || key == "gpu_num")
                 args.gpu_id_str = value;
             else if (key == "port")
@@ -1350,6 +1368,8 @@ CmdArgs ParseArgs(int argc, char *argv[])
                     args.thread_count = std::stoi(value);
                 else if (key == "delete_value")
                     args.delete_value = ParseBool(value);
+                else if (key == "pin")
+                    args.pin = ParseBool(value);
                 else if (key == "gpu_id" || key == "gpu_num")
                     args.gpu_id_str = value;
                 else if (key == "port")
@@ -1433,6 +1453,7 @@ int main(int argc, char *argv[])
     std::cout << "[Config] Local worker (Get): " << args.host << std::endl;
     std::cout << "[Config] Port: " << args.port << std::endl;
     std::cout << "[Config] GPU: " << args.gpu_id << std::endl;
+    std::cout << "[Config] Pin CUDA funcs: " << (args.pin ? "Yes" : "No") << std::endl;
     if (args.inject_delay_ms >= 0) {
         std::cout << "[Config] Inject delay override: " << args.inject_delay_ms << "ms" << std::endl;
     }
@@ -1466,7 +1487,7 @@ int main(int argc, char *argv[])
     };
 
     try {
-        H2DFaultTest tester(args.host, args.remote_worker, args.port, args.gpu_id);
+        H2DFaultTest tester(args.host, args.remote_worker, args.port, args.gpu_id, args.pin);
         tester.SetDataParams(args.value_prefix, args.keys, args.count, args.value_size, args.delete_value);
 
         // 检查故障注入可用性（如果需要）

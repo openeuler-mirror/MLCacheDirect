@@ -39,6 +39,7 @@ Options:
   --value_size=N or --value_size N    : Length of generated value (default: 8388608)
   --thread=N or --thread N            : Number of concurrent threads (default: 1)
   --delete_value=true|false|1|0       : Delete keys after get (default: true)
+  --pin=true|false|1|0                : Register CUDA host-memory funcs before KVClient Init (default: true)
   --gpu_id=N                         : GPU device ID to use (default: 0)
   --help or -h                        : Show this help message (can be placed anywhere)
 Examples:
