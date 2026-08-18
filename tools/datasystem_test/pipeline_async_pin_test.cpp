@@ -736,6 +736,21 @@ bool MCreatePending(KVClient &client, const Options &options, const std::string 
     return true;
 }
 
+void DiscardPendingBatch(const std::string &prefix, PendingBufferMap &pendingBuffers,
+                         PendingBatchMap &pendingBatches)
+{
+    auto batch = pendingBatches.find(prefix);
+    if (batch == pendingBatches.end()) {
+        return;
+    }
+    const size_t bufferCount = batch->second.size();
+    for (const auto &key : batch->second) {
+        pendingBuffers.erase(key);
+    }
+    pendingBatches.erase(batch);
+    Log(0, "[PENDING_BATCH_DISCARD] prefix=", prefix, " count=", bufferCount);
+}
+
 bool MSetPending(KVClient &client, const std::string &prefix, PendingBufferMap &pendingBuffers,
                  PendingBatchMap &pendingBatches, Summary &summary)
 {
@@ -870,9 +885,14 @@ bool RunShellBatchCommand(const std::string &command, std::istringstream &stream
     if (command == "mget") {
         return MGetBatch(client, options, prefix, count, size, summary);
     }
-    return MCreatePending(client, options, prefix, count, size, pendingBuffers, pendingBatches, summary)
-           && MSetPending(client, prefix, pendingBuffers, pendingBatches, summary)
-           && MGetBatch(client, options, prefix, count, size, summary);
+    if (!MCreatePending(client, options, prefix, count, size, pendingBuffers, pendingBatches, summary)) {
+        return false;
+    }
+    if (!MSetPending(client, prefix, pendingBuffers, pendingBatches, summary)) {
+        DiscardPendingBatch(prefix, pendingBuffers, pendingBatches);
+        return false;
+    }
+    return MGetBatch(client, options, prefix, count, size, summary);
 }
 
 bool IsBatchCommand(const std::string &command)

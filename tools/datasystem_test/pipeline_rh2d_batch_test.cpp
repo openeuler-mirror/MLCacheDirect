@@ -286,26 +286,55 @@ struct LatencyStats {
 };
 
 struct Stats {
-    double total_time_us;
-    int batch_count;
-    int key_count;
-    double get_time_us;
-    double h2d_time_us;
+    double total_time_us = 0;
+    int batch_count = 0;
+    int key_count = 0;
+    int success_batches = 0;
+    int failed_batches = 0;
+    int success_keys = 0;
+    int failed_keys = 0;
+    double get_time_us = 0;
+    double h2d_time_us = 0;
     LatencyStats latency_stats;
+    LatencyStats create_stats;
+    LatencyStats host_copy_stats;
+    LatencyStats set_stats;
+    LatencyStats get_stats;
+    LatencyStats h2d_stats;
+    LatencyStats del_stats;
 };
 
 // KPS mode statistics
 struct KpsOperationStats {
     std::atomic<int64_t> total_ops{0};
+    std::atomic<int64_t> create_ops{0};
     std::atomic<int64_t> set_ops{0};
     std::atomic<int64_t> get_ops{0};
     std::atomic<int64_t> del_ops{0};
     std::atomic<int64_t> failed_ops{0};
 
+    std::deque<double> create_latencies_us;
+    std::deque<double> host_copy_latencies_us;
     std::deque<double> set_latencies_us;
     std::deque<double> get_latencies_us;
     std::deque<double> del_latencies_us;
     mutable std::mutex latency_mutex;
+
+    void AddCreateLatency(double us) {
+        std::lock_guard<std::mutex> lock(latency_mutex);
+        create_latencies_us.push_back(us);
+        if (create_latencies_us.size() > 100000) {
+            create_latencies_us.pop_front();
+        }
+    }
+
+    void AddHostCopyLatency(double us) {
+        std::lock_guard<std::mutex> lock(latency_mutex);
+        host_copy_latencies_us.push_back(us);
+        if (host_copy_latencies_us.size() > 100000) {
+            host_copy_latencies_us.pop_front();
+        }
+    }
 
     void AddSetLatency(double us) {
         std::lock_guard<std::mutex> lock(latency_mutex);
@@ -336,6 +365,16 @@ struct KpsOperationStats {
         return std::vector<double>(set_latencies_us.begin(), set_latencies_us.end());
     }
 
+    std::vector<double> GetCreateLatencies() const {
+        std::lock_guard<std::mutex> lock(latency_mutex);
+        return std::vector<double>(create_latencies_us.begin(), create_latencies_us.end());
+    }
+
+    std::vector<double> GetHostCopyLatencies() const {
+        std::lock_guard<std::mutex> lock(latency_mutex);
+        return std::vector<double>(host_copy_latencies_us.begin(), host_copy_latencies_us.end());
+    }
+
     std::vector<double> GetGetLatencies() const {
         std::lock_guard<std::mutex> lock(latency_mutex);
         return std::vector<double>(get_latencies_us.begin(), get_latencies_us.end());
@@ -348,11 +387,14 @@ struct KpsOperationStats {
 
     void Reset() {
         total_ops = 0;
+        create_ops = 0;
         set_ops = 0;
         get_ops = 0;
         del_ops = 0;
         failed_ops = 0;
         std::lock_guard<std::mutex> lock(latency_mutex);
+        create_latencies_us.clear();
+        host_copy_latencies_us.clear();
         set_latencies_us.clear();
         get_latencies_us.clear();
         del_latencies_us.clear();
@@ -516,6 +558,54 @@ public:
 
     void SetBarrier(std::shared_ptr<Barrier> barrier) { barrier_ = barrier; }
 
+    bool CreateSetBatch(KVClient& write_client, int start, int end, std::vector<std::string>& keys,
+                        double& create_us, double& host_copy_us, double& set_us) {
+        keys.clear();
+        std::vector<uint64_t> sizes;
+        keys.reserve(end - start);
+        sizes.reserve(end - start);
+        for (int i = start; i < end; ++i) {
+            keys.push_back(data_[i].first);
+            sizes.push_back(data_[i].second.size());
+        }
+
+        CleanupBatch(write_client, keys);
+        std::vector<std::shared_ptr<Buffer>> buffers;
+        auto begin = std::chrono::steady_clock::now();
+        Status rc = write_client.MCreate(keys, sizes, SetParam{}, buffers);
+        create_us = ElapsedUs(begin);
+        if (rc.IsError() || buffers.size() != keys.size()) {
+            TLOG(thread_id_, "MCreate failed: " << rc.GetMsg() << ", buffers=" << buffers.size());
+            buffers.clear();
+            CleanupBatch(write_client, keys);
+            return false;
+        }
+
+        begin = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (buffers[i] == nullptr || buffers[i]->MutableData() == nullptr
+                || buffers[i]->GetSize() != static_cast<int64_t>(sizes[i])) {
+                TLOG(thread_id_, "MCreate returned invalid buffer for key " << keys[i]);
+                buffers.clear();
+                CleanupBatch(write_client, keys);
+                return false;
+            }
+            std::memcpy(buffers[i]->MutableData(), data_[start + i].second.data(), sizes[i]);
+        }
+        host_copy_us = ElapsedUs(begin);
+
+        begin = std::chrono::steady_clock::now();
+        rc = write_client.MSet(buffers);
+        set_us = ElapsedUs(begin);
+        if (rc.IsError()) {
+            TLOG(thread_id_, "MSet failed: " << rc.GetMsg());
+            buffers.clear();
+            CleanupBatch(write_client, keys);
+            return false;
+        }
+        return true;
+    }
+
     void SetSharedData(const std::vector<std::pair<std::string, std::string>>& data,
                        int start_idx, int end_idx) {
         data_.clear();
@@ -568,7 +658,8 @@ public:
         }
     }
 
-    void RunRh2DBatch(int batch, Stats& stats, bool use_user_stream = false) {
+    void RunRh2DBatch(int batch, Stats& stats, const std::shared_ptr<KVClient>& write_client,
+                      bool use_user_stream = false) {
         if (barrier_ && barrier_->Wait())
             return;
 
@@ -580,6 +671,7 @@ public:
 
         int total_keys = static_cast<int>(data_.size());
         int num_batches = total_keys / batch;
+        auto writeClient = write_client != nullptr ? write_client : client_;
 
         stats.total_time_us = 0;
         stats.batch_count = num_batches;
@@ -641,9 +733,22 @@ public:
 
             int start = round * batch;
             int end = std::min((round + 1) * batch, total_keys);
+            double create_us = 0;
+            double host_copy_us = 0;
+            double set_us = 0;
+            if (!CreateSetBatch(*writeClient, start, end, keys, create_us, host_copy_us, set_us)) {
+                stats.create_stats.AddLatency(create_us);
+                if (host_copy_us > 0) stats.host_copy_stats.AddLatency(host_copy_us);
+                if (set_us > 0) stats.set_stats.AddLatency(set_us);
+                ++stats.failed_batches;
+                stats.failed_keys += end - start;
+                continue;
+            }
+            stats.create_stats.AddLatency(create_us);
+            stats.host_copy_stats.AddLatency(host_copy_us);
+            stats.set_stats.AddLatency(set_us);
 
             for (int i = start; i < end; ++i) {
-                keys.push_back(data_[i].first);
                 void* dev_ptr = nullptr;
 
                 if (!verify_data_ && !preallocated_buffers.empty()) {
@@ -667,6 +772,9 @@ public:
                             WaitAndDestroyH2DStream(h2dStream);
                         }
 #endif
+                        stats.del_stats.AddLatency(CleanupBatch(*writeClient, keys));
+                        ++stats.failed_batches;
+                        stats.failed_keys += end - start;
                         return;
                     }
                     TLOG(thread_id_, "Allocated device memory for round " << round
@@ -701,12 +809,17 @@ public:
             auto end_time = std::chrono::high_resolution_clock::now();
 
             double duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-            stats.latency_stats.AddLatency(duration_us);
+            stats.get_stats.AddLatency(duration_us);
+            stats.latency_stats.AddLatency(create_us + host_copy_us + set_us + duration_us);
 
             if (ret == datasystem::Status::OK() && outFailedKeys.empty()) {
+                ++stats.success_batches;
+                stats.success_keys += end - start;
                 TLOG(thread_id_, "Round " << round << " MGetH2D success! Time: " << duration_us << " us"
                      << (use_user_stream ? " (with user stream)" : ""));
             } else {
+                ++stats.failed_batches;
+                stats.failed_keys += end - start;
                 TLOG(thread_id_, "Round " << round << " MGetH2D failed. Status: " << ret.GetMsg()
                      << ", Failed keys count: " << outFailedKeys.size());
                 if (!outFailedKeys.empty()) {
@@ -727,6 +840,7 @@ public:
                     cudaFree(chunk.pointer);
                 }
             }
+            stats.del_stats.AddLatency(CleanupBatch(*writeClient, keys));
         }
 
 #ifndef USE_CUDA_MOCK
@@ -744,7 +858,7 @@ public:
         stats.total_time_us = stats.latency_stats.total_time_us;
     }
 
-    void RunGetBatch(int batch, Stats& stats) {
+    void RunGetBatch(int batch, Stats& stats, const std::shared_ptr<KVClient>& write_client) {
         if (barrier_ && barrier_->Wait())
             return;
 
@@ -756,6 +870,7 @@ public:
 
         int total_keys = static_cast<int>(data_.size());
         int num_batches = total_keys / batch;
+        auto writeClient = write_client != nullptr ? write_client : client_;
 
         stats.total_time_us = 0;
         stats.get_time_us = 0;
@@ -788,9 +903,22 @@ public:
 
             int start = round * batch;
             int end = std::min((round + 1) * batch, total_keys);
+            double create_us = 0;
+            double host_copy_us = 0;
+            double set_us = 0;
+            if (!CreateSetBatch(*writeClient, start, end, keys, create_us, host_copy_us, set_us)) {
+                stats.create_stats.AddLatency(create_us);
+                if (host_copy_us > 0) stats.host_copy_stats.AddLatency(host_copy_us);
+                if (set_us > 0) stats.set_stats.AddLatency(set_us);
+                ++stats.failed_batches;
+                stats.failed_keys += end - start;
+                continue;
+            }
+            stats.create_stats.AddLatency(create_us);
+            stats.host_copy_stats.AddLatency(host_copy_us);
+            stats.set_stats.AddLatency(set_us);
 
             for (int i = start; i < end; ++i) {
-                keys.push_back(data_[i].first);
                 void* dev_ptr = nullptr;
 
                 if (!verify_data_ && !preallocated_ptrs.empty()) {
@@ -802,6 +930,9 @@ public:
                         TLOG(thread_id_, "cudaMalloc failed: " << cudaGetErrorString(err));
                         for (auto ptr : dev_ptrs) cudaFree(ptr);
                         for (auto ptr : preallocated_ptrs) cudaFree(ptr);
+                        stats.del_stats.AddLatency(CleanupBatch(*writeClient, keys));
+                        ++stats.failed_batches;
+                        stats.failed_keys += end - start;
                         return;
                     }
                 }
@@ -816,9 +947,14 @@ public:
 
             if (rc.IsError()) {
                 TLOG(thread_id_, "Round " << round << " Get failed: " << rc.GetMsg());
+                stats.get_stats.AddLatency(get_duration_us);
+                stats.latency_stats.AddLatency(create_us + host_copy_us + set_us + get_duration_us);
+                ++stats.failed_batches;
+                stats.failed_keys += end - start;
                 if (verify_data_) {
                     for (auto ptr : dev_ptrs) cudaFree(ptr);
                 }
+                stats.del_stats.AddLatency(CleanupBatch(*writeClient, keys));
                 continue;
             }
 
@@ -839,6 +975,12 @@ public:
             double total_duration_us = get_duration_us + h2d_duration_us;
 
             stats.latency_stats.AddLatencyWithBreakdown(total_duration_us, get_duration_us, h2d_duration_us);
+            stats.get_stats.AddLatency(get_duration_us);
+            stats.h2d_stats.AddLatency(h2d_duration_us);
+            stats.latency_stats.latencies_us.back() += create_us + host_copy_us + set_us;
+            stats.latency_stats.total_time_us += create_us + host_copy_us + set_us;
+            ++stats.success_batches;
+            stats.success_keys += end - start;
 
             TLOG(thread_id_, "Round " << round << " Get: " << get_duration_us << " us, H2D: " << h2d_duration_us << " us");
 
@@ -852,6 +994,7 @@ public:
                     cudaFree(ptr);
                 }
             }
+            stats.del_stats.AddLatency(CleanupBatch(*writeClient, keys));
         }
 
         // Free pre-allocated buffers
@@ -975,41 +1118,24 @@ public:
             // Randomly select starting index for batch
             int start_idx = key_dist(rng);
 
-            // ========== Phase 1: Batch Set ==========
+            // ========== Phase 1: Batch MCreate + MSet ==========
             std::vector<std::string> keys;
-            std::vector<std::string> values;
-            for (int i = 0; i < batch_size; ++i) {
-                keys.push_back(data_[start_idx + i].first);
-                values.push_back(data_[start_idx + i].second);
+            double create_us = 0;
+            double host_copy_us = 0;
+            double set_us = 0;
+            bool set_ok = CreateSetBatch(*writeClient, start_idx, start_idx + batch_size, keys,
+                                         create_us, host_copy_us, set_us);
+            kps_stats.AddCreateLatency(create_us);
+            kps_stats.create_ops += batch_size;
+            if (host_copy_us > 0) kps_stats.AddHostCopyLatency(host_copy_us);
+            if (set_us > 0 || set_ok) {
+                kps_stats.AddSetLatency(set_us);
+                kps_stats.set_ops += batch_size;
             }
 
-            auto set_start = std::chrono::high_resolution_clock::now();
-            std::vector<std::string> setFailedKeys;
-            Status setRc;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                Status s = writeClient->Set(keys[i], values[i]);
-                if (s.IsError()) {
-                    setFailedKeys.push_back(keys[i]);
-                    setRc = s;  // Keep last error
-                }
-            }
-            auto set_end = std::chrono::high_resolution_clock::now();
-            double set_us = std::chrono::duration_cast<std::chrono::microseconds>(set_end - set_start).count();
-            kps_stats.AddSetLatency(set_us);
-            kps_stats.set_ops += batch_size;
-            kps_stats.total_ops += batch_size;
-
-            if (setRc.IsError() || !setFailedKeys.empty()) {
+            if (!set_ok) {
                 kps_stats.failed_ops += batch_size;
-                TLOG(thread_id_, "Set failed: " << setRc.GetMsg()
-                     << ", failed keys count: " << setFailedKeys.size());
-                if (!setFailedKeys.empty()) {
-                    TLOG(thread_id_, "Set failed keys: ");
-                    for (const auto& key : setFailedKeys) {
-                        TLOG_NONL(thread_id_, "  " << key << std::endl);
-                    }
-                }
-                if (setRc.IsError()) continue;
+                continue;
             }
 
             // ========== Phase 2: Batch Get (MGetH2D or Get+H2D) ==========
@@ -1025,7 +1151,6 @@ public:
                 if (getRc.IsError()) {
                     kps_stats.failed_ops += batch_size;
                     kps_stats.get_ops += batch_size;
-                    kps_stats.total_ops += batch_size;
                     kps_stats.AddGetLatency(get_us);
                     TLOG(thread_id_, "Get failed: " << getRc.GetMsg());
                 } else {
@@ -1074,7 +1199,6 @@ public:
                     kps_stats.AddGetLatency(get_us);
 #endif
                     kps_stats.get_ops += batch_size;
-                    kps_stats.total_ops += batch_size;
                 }
             } else {
                 // Use MGetH2D
@@ -1116,6 +1240,7 @@ public:
                         }
                     }
                     kps_stats.failed_ops += batch_size;
+                    kps_stats.AddDelLatency(CleanupBatch(*writeClient, keys));
                     continue;
                 }
 #else
@@ -1150,7 +1275,6 @@ public:
                 double rh2d_us = std::chrono::duration_cast<std::chrono::microseconds>(rh2d_end - rh2d_start).count();
                 kps_stats.AddGetLatency(rh2d_us);  // Reuse get latency for rh2d
                 kps_stats.get_ops += batch_size;
-                kps_stats.total_ops += batch_size;
 
                 if (getRc.IsError() || !outFailedKeys.empty()) {
                     kps_stats.failed_ops += batch_size;
@@ -1177,14 +1301,7 @@ public:
             // ========== Phase 3: Batch Delete ==========
             auto del_start = std::chrono::high_resolution_clock::now();
             std::vector<std::string> delFailedKeys;
-            Status delRc;
-            for (const auto& key : keys) {
-                Status s = writeClient->Del(key);
-                if (s.IsError()) {
-                    delFailedKeys.push_back(key);
-                    delRc = s;  // Keep last error
-                }
-            }
+            Status delRc = writeClient->Del(keys, delFailedKeys);
             auto del_end = std::chrono::high_resolution_clock::now();
             double del_us = std::chrono::duration_cast<std::chrono::microseconds>(del_end - del_start).count();
             kps_stats.AddDelLatency(del_us);
@@ -1226,6 +1343,26 @@ public:
 
 private:
     std::vector<SizeConfig> value_size_configs_;
+
+    static double ElapsedUs(const std::chrono::steady_clock::time_point& begin) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - begin).count();
+    }
+
+    double CleanupBatch(KVClient& client, const std::vector<std::string>& keys) {
+        if (keys.empty()) {
+            return 0;
+        }
+        std::vector<std::string> failed_keys;
+        auto begin = std::chrono::steady_clock::now();
+        Status rc = client.Del(keys, failed_keys);
+        double elapsed_us = ElapsedUs(begin);
+        if (rc.IsError() && failed_keys.size() != keys.size()) {
+            TLOG(thread_id_, "Batch cleanup warning: " << rc.GetMsg()
+                 << ", failed keys=" << failed_keys.size());
+        }
+        return elapsed_us;
+    }
 
     void CheckDataBatch(int startIdx, const std::vector<Blob>& devShmChunks) {
 #ifdef USE_CUDA_MOCK
@@ -1312,6 +1449,9 @@ void PrintUsage(const char* prog) {
     std::cout << "  --remoteip=IP     Worker IP used for Set/Del KVCache (required)" << std::endl;
     std::cout << "  --localip=IP      Worker IP used for Get/MGetH2D client init (default: same as remoteip)" << std::endl;
     std::cout << "  --port=N          Server port (default: 18481)" << std::endl;
+    std::cout << "  --etcd_address=ADDR      ETCD address list for service discovery" << std::endl;
+    std::cout << "  --cluster_name=NAME      Datasystem cluster name for service discovery" << std::endl;
+    std::cout << "  --host_id_env_name=NAME  Environment variable containing the local host ID" << std::endl;
     std::cout << "  --gpu_id=N        GPU device ID (default: 0)" << std::endl;
     std::cout << "  --verify=Y/N      Verify data (default: Y)" << std::endl;
     std::cout << "  --use_user_stream=Y/N  Use new MGetH2D interface (default: N)" << std::endl;
@@ -1350,6 +1490,9 @@ struct CmdArgs {
     size_t value_size = 8388608;   // Legacy single size (used if valuesize_config empty)
     std::string remoteip;
     std::string localip;
+    std::string etcd_address;
+    std::string cluster_name;
+    std::string host_id_env_name;
     int port = 18481;
     int gpu_id = 0;
     bool verify_data = true;
@@ -1380,6 +1523,9 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
             else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
             else if (key == "remoteip") args.remoteip = value;
             else if (key == "localip") args.localip = value;
+            else if (key == "etcd_address") args.etcd_address = value;
+            else if (key == "cluster_name") args.cluster_name = value;
+            else if (key == "host_id_env_name") args.host_id_env_name = value;
             else if (key == "port") args.port = std::stoi(value);
             else if (key == "gpu_id") args.gpu_id = std::stoi(value);
             else if (key == "verify") args.verify_data = ParseBool(value);
@@ -1413,6 +1559,9 @@ CmdArgs ParseArgs(int argc, char* argv[]) {
                 else if (key == "valuesize" || key == "value_size") args.valuesize_config = value;
                 else if (key == "remoteip") args.remoteip = value;
                 else if (key == "localip") args.localip = value;
+                else if (key == "etcd_address") args.etcd_address = value;
+                else if (key == "cluster_name") args.cluster_name = value;
+                else if (key == "host_id_env_name") args.host_id_env_name = value;
                 else if (key == "port") args.port = std::stoi(value);
                 else if (key == "gpu_id") args.gpu_id = std::stoi(value);
                 else if (key == "verify") args.verify_data = ParseBool(value);
@@ -1486,6 +1635,42 @@ std::shared_ptr<KVClient> CreateClientForHost(const CmdArgs& args, const std::st
 }
 
 std::shared_ptr<KVClient> CreateSharedClient(const CmdArgs& args) {
+    if (!args.etcd_address.empty()) {
+        if (!SetCudaDeviceBeforeClientInit(args.gpu_id, "[Main]")) {
+            return nullptr;
+        }
+        ServiceDiscoveryOptions discovery_options;
+        discovery_options.etcdAddress = args.etcd_address;
+        discovery_options.clusterName = args.cluster_name;
+        discovery_options.hostIdEnvName = args.host_id_env_name;
+        discovery_options.affinityPolicy = ServiceAffinityPolicy::PREFERRED_SAME_NODE;
+        auto discovery = std::make_shared<ServiceDiscovery>(discovery_options);
+        Status rc = discovery->Init();
+        if (rc.IsError()) {
+            std::cerr << "[Main] Service discovery init failed: " << rc.GetMsg() << std::endl;
+            return nullptr;
+        }
+
+        ConnectOptions options;
+        options.deviceId = std::to_string(args.gpu_id);
+        options.fastTransportMemSize = args.client_options.fast_transport_mem_size;
+        options.enableLocalCache = false;
+        options.enableCrossNodeConnection = true;
+        options.dataPlacementPolicy = DataPlacementPolicy::PREFERRED_META_OWNER;
+        options.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
+        options.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
+        options.serviceDiscovery = std::move(discovery);
+        auto client = std::make_shared<KVClient>(options);
+        rc = client->Init();
+        if (rc.IsError()) {
+            std::cerr << "[Main] Failed to init service-discovery KVClient: " << rc.GetMsg() << std::endl;
+            return nullptr;
+        }
+        std::cout << "[Main] Service-discovery KVClient initialized: etcd=" << args.etcd_address
+                  << ", cluster=" << args.cluster_name << ", enable_local_cache=false"
+                  << ", enable_cross_node_connection=true, placement=PREFERRED_META_OWNER" << std::endl;
+        return client;
+    }
     return CreateClientForHost(args, args.localip, "Shared KVClient", "[Main]");
 }
 
@@ -1550,6 +1735,32 @@ void PrintLatencyStats(const LatencyStats& stats, const std::string& prefix = ""
     std::cout << prefix << "  MAX:     " << std::setw(10) << (stats.GetMax() / 1000.0) << " ms" << std::endl;
 }
 
+void PrintPhaseLatency(const std::string& name, const LatencyStats& stats, const std::string& prefix = "") {
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << prefix << name << " (us): avg=" << stats.GetAvg()
+              << ", P50=" << stats.GetPercentile(50.0)
+              << ", P90=" << stats.GetP90()
+              << ", P95=" << stats.GetP95()
+              << ", P99=" << stats.GetP99()
+              << ", MAX=" << stats.GetMax() << std::endl;
+}
+
+void PrintPhaseStats(const Stats& stats, const std::string& prefix = "") {
+    PrintPhaseLatency("MCreate", stats.create_stats, prefix);
+    PrintPhaseLatency("Host copy", stats.host_copy_stats, prefix);
+    PrintPhaseLatency("MSet", stats.set_stats, prefix);
+    PrintPhaseLatency("Get/MGetH2D", stats.get_stats, prefix);
+    if (!stats.h2d_stats.latencies_us.empty()) {
+        PrintPhaseLatency("H2D", stats.h2d_stats, prefix);
+    }
+    PrintPhaseLatency("Del", stats.del_stats, prefix);
+}
+
+void MergeLatencyStats(const LatencyStats& source, LatencyStats& target) {
+    target.latencies_us.insert(target.latencies_us.end(), source.latencies_us.begin(), source.latencies_us.end());
+    target.total_time_us += source.total_time_us;
+}
+
 // Calculate percentile from a vector of latencies
 double CalculatePercentile(const std::vector<double>& latencies, double percentile) {
     if (latencies.empty()) return 0;
@@ -1576,23 +1787,44 @@ void PrintKpsStats(const KpsOperationStats& stats, double interval_s, const std:
     double del_kps = interval_s > 0 ? stats.del_ops.load() / interval_s : 0;
 
     std::cout << std::fixed << std::setprecision(1);
-    std::cout << prefix << "Actual KPS: " << actual_kps
+    std::cout << prefix << "Actual business KPS: " << actual_kps
               << " (set: " << set_kps
               << ", get: " << get_kps
               << ", del: " << del_kps << ")" << std::endl;
 
-    std::cout << prefix << "Total ops: " << stats.total_ops.load()
-              << " (set: " << stats.set_ops.load()
+    std::cout << prefix << "Completed keys: " << stats.total_ops.load()
+              << " (create: " << stats.create_ops.load()
+              << ", set: " << stats.set_ops.load()
               << ", get: " << stats.get_ops.load()
               << ", del: " << stats.del_ops.load()
               << ", failed: " << stats.failed_ops.load() << ")" << std::endl;
 
     // Get latencies for percentile calculation
+    std::vector<double> create_lats = stats.GetCreateLatencies();
+    std::vector<double> copy_lats = stats.GetHostCopyLatencies();
     std::vector<double> set_lats = stats.GetSetLatencies();
     std::vector<double> get_lats = stats.GetGetLatencies();
     std::vector<double> del_lats = stats.GetDelLatencies();
 
     std::cout << std::fixed << std::setprecision(3);
+    auto print_latency = [&](const std::string& name, const std::vector<double>& latencies) {
+        std::cout << prefix << name << " latency (us): ";
+        if (latencies.empty()) {
+            std::cout << "N/A" << std::endl;
+            return;
+        }
+        double sum = 0;
+        for (double latency : latencies) {
+            sum += latency;
+        }
+        std::cout << "avg=" << sum / latencies.size()
+                  << ", P50=" << CalculatePercentile(latencies, 50.0)
+                  << ", P90=" << CalculatePercentile(latencies, 90.0)
+                  << ", P95=" << CalculatePercentile(latencies, 95.0)
+                  << ", P99=" << CalculatePercentile(latencies, 99.0) << std::endl;
+    };
+    print_latency("MCreate", create_lats);
+    print_latency("Host copy", copy_lats);
     std::cout << prefix << "Set latency (us): ";
     if (!set_lats.empty()) {
         std::cout << "avg=" << (CalculatePercentile(set_lats, 50.0))
@@ -1628,7 +1860,8 @@ void PrintKpsStats(const KpsOperationStats& stats, double interval_s, const std:
 }
 
 void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string, std::string>>& all_data,
-                    const std::shared_ptr<KVClient>& sharedClient) {
+                    const std::shared_ptr<KVClient>& sharedClient,
+                    const std::shared_ptr<KVClient>& writeClient) {
     int keys_per_thread = args.count / args.thread_count;
     if (sharedClient == nullptr) {
         return;
@@ -1643,7 +1876,8 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
     auto main_start = std::chrono::high_resolution_clock::now();
 
     for (int tid = 0; tid < args.thread_count; ++tid) {
-        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier, sharedClient]() {
+        threads.emplace_back([tid, &args, &all_data, keys_per_thread, &thread_stats, barrier,
+                              sharedClient, writeClient]() {
             RemoteH2DTest test(sharedClient, tid, args.gpu_id, args.verify_data);
             test.SetBarrier(barrier);
 
@@ -1653,9 +1887,9 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 
             Stats stats;
             if (args.cmd == "rh2d") {
-                test.RunRh2DBatch(args.batch, stats, args.use_user_stream);
+                test.RunRh2DBatch(args.batch, stats, writeClient, args.use_user_stream);
             } else if (args.cmd == "get") {
-                test.RunGetBatch(args.batch, stats);
+                test.RunGetBatch(args.batch, stats, writeClient);
             }
             thread_stats[tid] = stats;
         });
@@ -1679,6 +1913,7 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 
     // Aggregate all latencies for overall statistics
     LatencyStats overall_stats;
+    Stats aggregate_stats;
     double sum_get_time_us = 0;
     double sum_h2d_time_us = 0;
 
@@ -1690,6 +1925,16 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
         overall_stats.total_time_us += s.total_time_us;
         overall_stats.batch_count += s.batch_count;
         overall_stats.key_count += s.key_count;
+        aggregate_stats.success_batches += s.success_batches;
+        aggregate_stats.failed_batches += s.failed_batches;
+        aggregate_stats.success_keys += s.success_keys;
+        aggregate_stats.failed_keys += s.failed_keys;
+        MergeLatencyStats(s.create_stats, aggregate_stats.create_stats);
+        MergeLatencyStats(s.host_copy_stats, aggregate_stats.host_copy_stats);
+        MergeLatencyStats(s.set_stats, aggregate_stats.set_stats);
+        MergeLatencyStats(s.get_stats, aggregate_stats.get_stats);
+        MergeLatencyStats(s.h2d_stats, aggregate_stats.h2d_stats);
+        MergeLatencyStats(s.del_stats, aggregate_stats.del_stats);
 
         if (args.cmd == "get") {
             sum_get_time_us += s.get_time_us;
@@ -1699,6 +1944,7 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
         std::cout << "[T" << tid << "] Keys: " << s.key_count
                   << ", Batches: " << s.batch_count << std::endl;
         PrintLatencyStats(s.latency_stats, "[T" + std::to_string(tid) + "] ");
+        PrintPhaseStats(s, "[T" + std::to_string(tid) + "] ");
         if (args.cmd == "get") {
             double avg_get_us = s.batch_count > 0 ? s.get_time_us / s.batch_count : 0;
             double avg_h2d_us = s.batch_count > 0 ? s.h2d_time_us / s.batch_count : 0;
@@ -1712,6 +1958,11 @@ void RunMultiThread(const CmdArgs& args, const std::vector<std::pair<std::string
 
     std::cout << "==================== Overall ====================" << std::endl;
     PrintLatencyStats(overall_stats, "");
+    PrintPhaseStats(aggregate_stats, "");
+    std::cout << "Successful batches/keys: " << aggregate_stats.success_batches << "/"
+              << aggregate_stats.success_keys << std::endl;
+    std::cout << "Failed batches/keys: " << aggregate_stats.failed_batches << "/"
+              << aggregate_stats.failed_keys << std::endl;
 
     double overall_qps = overall_stats.total_time_us > 0 ? (overall_stats.key_count * 1000000.0 / overall_stats.total_time_us) : 0;
     std::cout << "Overall QPS: " << std::fixed << std::setprecision(1) << overall_qps << " keys/s" << std::endl;
@@ -1733,13 +1984,15 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
         return;
     }
     std::shared_ptr<KVClient> remoteClient = sharedClient;
-    if (args.remoteip != args.localip) {
+    if (args.etcd_address.empty() && args.remoteip != args.localip) {
         remoteClient = CreateClientForHost(args, args.remoteip, "KPS remote KVClient", "[Main]");
         if (remoteClient == nullptr) {
             return;
         }
-    } else {
+    } else if (args.etcd_address.empty()) {
         std::cout << "[Main] Reusing shared KVClient for KPS Set/Del because remoteip == localip" << std::endl;
+    } else {
+        std::cout << "[Main] Reusing service-discovery KVClient for all KPS phases" << std::endl;
     }
 
     auto barrier = std::make_shared<Barrier>(args.thread_count);
@@ -1790,6 +2043,7 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
             if (interval_s <= 0) continue;
 
             int64_t current_ops = kps_stats.total_ops.load();
+            int64_t current_create_ops = kps_stats.create_ops.load();
             int64_t current_set_ops = kps_stats.set_ops.load();
             int64_t current_get_ops = kps_stats.get_ops.load();
             int64_t current_del_ops = kps_stats.del_ops.load();
@@ -1800,15 +2054,30 @@ void RunKpsMultiThread(const CmdArgs& args, const std::vector<std::pair<std::str
             std::cout << std::endl;
             std::cout << "=================== [" << std::fixed << std::setprecision(1) << total_s << "s] ===================" << std::endl;
             std::cout << "[Stats] Interval KPS: " << std::fixed << std::setprecision(1) << interval_kps << " ops/s" << std::endl;
-            std::cout << "[Stats] Total ops: " << current_ops << " (set: " << current_set_ops
+            std::cout << "[Stats] Completed keys: " << current_ops << " (create: " << current_create_ops
+                      << ", set: " << current_set_ops
                       << ", get: " << current_get_ops << ", del: " << current_del_ops << ")" << std::endl;
 
             // Print latency percentiles for the interval
+            std::vector<double> create_lats = kps_stats.GetCreateLatencies();
+            std::vector<double> copy_lats = kps_stats.GetHostCopyLatencies();
             std::vector<double> set_lats = kps_stats.GetSetLatencies();
             std::vector<double> get_lats = kps_stats.GetGetLatencies();
             std::vector<double> del_lats = kps_stats.GetDelLatencies();
 
             std::cout << std::fixed << std::setprecision(2);
+            if (!create_lats.empty()) {
+                std::cout << "[Stats] MCreate latency (us): P50=" << CalculatePercentile(create_lats, 50.0)
+                          << ", P90=" << CalculatePercentile(create_lats, 90.0)
+                          << ", P95=" << CalculatePercentile(create_lats, 95.0)
+                          << ", P99=" << CalculatePercentile(create_lats, 99.0) << std::endl;
+            }
+            if (!copy_lats.empty()) {
+                std::cout << "[Stats] Host copy latency (us): P50=" << CalculatePercentile(copy_lats, 50.0)
+                          << ", P90=" << CalculatePercentile(copy_lats, 90.0)
+                          << ", P95=" << CalculatePercentile(copy_lats, 95.0)
+                          << ", P99=" << CalculatePercentile(copy_lats, 99.0) << std::endl;
+            }
             if (!set_lats.empty()) {
                 std::cout << "[Stats] Set latency (us): P50=" << CalculatePercentile(set_lats, 50.0)
                           << ", P90=" << CalculatePercentile(set_lats, 90.0)
@@ -1883,13 +2152,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (args.remoteip.empty()) {
-        std::cerr << "Error: --remoteip is required" << std::endl;
+    const bool use_discovery = !args.etcd_address.empty() || !args.cluster_name.empty();
+    if (use_discovery && (args.etcd_address.empty() || args.cluster_name.empty())) {
+        std::cerr << "Error: --etcd_address and --cluster_name must be specified together" << std::endl;
         PrintUsage(argv[0]);
         return 1;
     }
 
-    if (args.localip.empty()) {
+    if (!use_discovery && args.remoteip.empty()) {
+        std::cerr << "Error: --remoteip is required in direct-worker mode" << std::endl;
+        PrintUsage(argv[0]);
+        return 1;
+    }
+
+    if (!use_discovery && args.localip.empty()) {
         args.localip = args.remoteip;
     }
 
@@ -1958,8 +2234,13 @@ int main(int argc, char* argv[]) {
     if (args.cmd == "kps") {
         std::cout << "[Main] Target KPS: " << args.kps << ", Duration: " << args.duration << "s" << std::endl;
     }
-    std::cout << "[Main] RemoteIP: " << args.remoteip << ", LocalIP: " << args.localip
-              << ", Port: " << args.port << ", GPU: " << args.gpu_id << std::endl;
+    if (use_discovery) {
+        std::cout << "[Main] Discovery: etcd=" << args.etcd_address << ", cluster=" << args.cluster_name
+                  << ", host_id_env_name=" << args.host_id_env_name << ", GPU: " << args.gpu_id << std::endl;
+    } else {
+        std::cout << "[Main] RemoteIP: " << args.remoteip << ", LocalIP: " << args.localip
+                  << ", Port: " << args.port << ", GPU: " << args.gpu_id << std::endl;
+    }
     std::cout << "[Main] Verify Data: " << (args.verify_data ? "Yes" : "No")
               << ", Use User Stream: " << (args.use_user_stream ? "Yes" : "No") << std::endl;
     std::cout << "[Main] enable_local_cache: " << (args.client_options.enable_local_cache ? "Yes" : "No")
@@ -2026,27 +2307,17 @@ int main(int argc, char* argv[]) {
     }
 
     std::shared_ptr<KVClient> remoteClient = sharedClient;
-    if (args.remoteip != args.localip) {
+    if (!use_discovery && args.remoteip != args.localip) {
         remoteClient = CreateClientForHost(args, args.remoteip, "Remote KVClient", "[Main]");
         if (remoteClient == nullptr) {
             return 1;
         }
-    } else {
+    } else if (!use_discovery) {
         std::cout << "[Main] Reusing shared KVClient for Set/Del because remoteip == localip" << std::endl;
+    } else {
+        std::cout << "[Main] Reusing service-discovery KVClient for Create/Set/Get/Del" << std::endl;
     }
 
-    std::cout << "[Main] Setting data through remote KVClient connected to "
-              << args.remoteip << ":" << args.port << "..." << std::endl;
-    if (!SetAllData(*remoteClient, all_data, "[Main]")) {
-        return 1;
-    }
-
-    RunMultiThread(args, all_data, sharedClient);
-
-    std::cout << "[Main] Deleting data through remote KVClient connected to "
-              << args.remoteip << ":" << args.port << "..." << std::endl;
-    if (!DeleteAllData(*remoteClient, all_data, "[Main]")) {
-        return 1;
-    }
+    RunMultiThread(args, all_data, sharedClient, remoteClient);
     return 0;
 }
