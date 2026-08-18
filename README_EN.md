@@ -56,7 +56,7 @@ Core responsibilities:
 Notes:
 
 - Core library code in the root directory has no dependencies on the CUDA runtime.
-- `tools/datasystem_test/pipeline_h2d.cpp` is an upper-level integration test case. It still utilizes `cudaMalloc/cudaMemcpy` to validate the new paradigm where the upper layer independently handles host-to-device (H2D) transfers.
+- `tools/datasystem_test/pipeline_h2d.cpp` is an upper-level integration test case. It still utilizes `cudaMalloc/cudaMemcpy` to validate the new paradigm where the upper layer independently handles host-to-device (H2D) transfers (h2d-style commands), plus batch preload/pull and KPS benchmarking (batch-style commands).
 
 ---
 

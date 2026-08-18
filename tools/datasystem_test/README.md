@@ -3,7 +3,11 @@
 ## 代码说明
 
 ### pipeline_h2d
-`pipeline_h2d.cpp` 是正常功能/性能联调用例，主要面向手工验证 Set、MGetH2D、普通 Get + cudaMemcpy、批量 H2D、多线程并发这些路径。
+`pipeline_h2d.cpp` 是合并后的联调用例，涵盖：
+- h2d 风格命令（`set`、`mgeth2d`、`batchget`、`originget`）：确定性数据（value_prefix / keys / value_size），单 host，
+  手工验证 Set、MGetH2D、普通 Get + cudaMemcpy、批量 H2D、多线程并发。
+- batch 风格命令（`rh2d`、`get`、`kps`）：随机/缓存数据，remoteip 预置 + localip 拉取，
+  `get` 统一为批量 Get + H2D 语义，`kps` 为持续 set-get-del 压测。
 
 ### pipeline_async_pin_test
 `pipeline_async_pin_test.cpp` 用于验证 datasystem 异步 CUDA Host Memory Pin 场景。工具支持普通一次性测试和
@@ -26,32 +30,69 @@ make
 
 ### pipeline_h2d
 
+支持两种调用风格，第一个位置参数决定风格：
+
 ```
-Usage: ./pipeline_h2d <host> [options] [command]
+# h2d 风格（<host> 开头，兼容原 pipeline_h2d 用法）
+Usage: ./pipeline_h2d <host> [options] <command>
   host    : Server IP address (required, positional)
-  command : set | get | mgeth2d | batchget | originget
-Options:
+  command : set | mgeth2d | batchget | originget
+
+# batch 风格（已知命令开头）
+Usage: ./pipeline_h2d <command> [options]
+  command : rh2d | get | kps
+```
+
+命令说明：
+
+| 命令 | 语义 |
+| --- | --- |
+| set | h2d 风格：对确定性生成的 key 执行 Set |
+| mgeth2d | h2d 风格：单次 MGetH2D（支持 --delete_value） |
+| batchget | h2d 风格：批量 MGetH2D（不 Del，要求 count % batch == 0） |
+| originget | h2d 风格：普通 Get + cudaMemcpy（支持 --delete_value） |
+| rh2d | batch 风格：remoteip 预置数据，localip 批量 MGetH2D |
+| get | batch 风格：remoteip 预置数据，localip 批量 Get + H2D |
+| kps | batch 风格：持续 set-get-del 压测 |
+
+选项：
+
+```
   --port=N or --port N            : Server port (default: 18481)
   --count=N or --count N          : Number of keys per thread (default: 10)
-  --batch=N or --batch N          : Batch size for batchget (default: 10)
+  --batch=N or --batch N          : Batch size for batchget/batch 命令 (default: 10)
   --value_prefix=X or --value_prefix X  : Base prefix for value (default: 0)
   --keys=k1,k2... or --keys k1,k2     : Comma-separated custom key list
   --value_size=N or --value_size N    : Length of generated value (default: 8388608)
   --thread=N or --thread N            : Number of concurrent threads (default: 1)
-  --delete_value=true|false|1|0       : Delete keys after get (default: true)
+  --delete_value=true|false|1|0       : Delete keys after mgeth2d/originget (default: true; batchget 忽略)
   --pin=true|false|1|0                : Register CUDA host-memory funcs before KVClient Init (default: true)
   --gpu_id=N                         : GPU device ID to use (default: 0)
-  --help or -h                        : Show this help message (can be placed anywhere)
+  --remoteip=IP                       : Worker IP used for Set/Del (batch 命令必填)
+  --localip=IP                        : Worker IP used for client init (default: same as remoteip)
+  --valuesize=CFG                     : Value size config (batch 命令，size1:num1,size2:num2)
+  --verify=Y/N                        : Verify data (default: Y)
+  --use_user_stream=Y/N               : Use new MGetH2D interface (default: N)
+  --kps=N                             : Target KPS for kps mode
+  --duration=N                        : Duration in seconds for kps mode
+  --help or -h                        : Show this help message
+```
+
 Examples:
+
+```
+  # h2d 风格：188 set，189 mgeth2d（单次 MGetH2D）
   ./pipeline_h2d 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4
-  ./pipeline_h2d 141.61.91.189 --port=18581 get --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false
-  ./pipeline_h2d 141.61.91.188 --port=18581 set --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4
+  ./pipeline_h2d 141.61.91.189 --port=18581 mgeth2d --keys 123,456 --count 4 --value_prefix a --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false
+  # h2d 风格：originget（普通 Get + cudaMemcpy）
   ./pipeline_h2d 141.61.91.189 --port=18581 originget --keys 123,456 --count 4 --value_prefix b --value_size 8388608 --gpu_id 0 --thread 4 --delete_value false
+  # batch 风格：批量 MGetH2D
+  ./pipeline_h2d rh2d --count=100 --batch=10 --thread=4 --valuesize=1048576 --remoteip=192.168.1.100 --localip=192.168.1.101
 ```
 
 #### 限制
 
-+ set 与 get 的参数需保持一致
++ h2d 风格的 set 与 get（mgeth2d/origininget/batchget）参数需保持一致。
 
 ### pipeline_async_pin_test
 

@@ -56,7 +56,7 @@
 说明：
 
 - 根目录下的库代码 **不依赖 CUDA runtime**。
-- `tools/datasystem_test/pipeline_h2d.cpp` 是上层联调用例，里面仍然会使用 `cudaMalloc/cudaMemcpy`，用于验证“上层自己完成 H2D”的新模式。
+- `tools/datasystem_test/pipeline_h2d.cpp` 是上层联调用例，里面仍然会使用 `cudaMalloc/cudaMemcpy`，用于验证“上层自己完成 H2D”的新模式（h2d 风格命令）以及批量预置/拉取与 KPS 压测（batch 风格命令）。
 
 ---
 
