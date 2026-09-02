@@ -1,5 +1,6 @@
 #include "datasystem/kv_client.h"
 #include "datasystem/utils/connection.h"
+#include "datasystem/utils/service_discovery.h"
 #include "pipeline_rh2d_batch_data.h"
 #include <iomanip>
 #include <vector>
@@ -248,6 +249,8 @@ struct RunStats {
     OpStats set;
     OpStats get;
     OpStats del;
+    OpStats create;    // MCreate phase of the batch Set (create + host copy + set breakdown)
+    OpStats host_copy; // host-memory copy into the MCreate buffers
 
     int64_t TotalOps() const { return set.ops.load() + get.ops.load() + del.ops.load(); }
     int64_t TotalFailed() const { return set.failed.load() + get.failed.load() + del.failed.load(); }
@@ -274,6 +277,8 @@ struct RunStats {
                   << ", failed: " << TotalFailed() << ")" << std::endl;
 
         // Get latencies for percentile calculation
+        std::vector<double> create_lats = create.GetLatencies();
+        std::vector<double> copy_lats = host_copy.GetLatencies();
         std::vector<double> set_lats = set.GetLatencies();
         std::vector<double> get_lats = get.GetLatencies();
         std::vector<double> del_lats = del.GetLatencies();
@@ -292,6 +297,8 @@ struct RunStats {
             }
             std::cout << std::endl;
         };
+        print_latency_line("MCreate latency (us): ", create_lats);
+        print_latency_line("Host copy latency (us): ", copy_lats);
         print_latency_line("Set latency (us): ", set_lats);
         print_latency_line("Get latency (us): ", get_lats);
         print_latency_line("Del latency (us): ", del_lats);
@@ -336,6 +343,9 @@ public:
         std::cout << "  --localip=IP        Worker IP used for Get/MGetH2D client init (default: same as remoteip)" << std::endl;
         std::cout << "  --port=N            Server port (default: 18481)" << std::endl;
         std::cout << "  --gpu_id=N          GPU device ID (default: 0)" << std::endl;
+        std::cout << "  --etcd_address=ADDR      ETCD address list for service discovery (optional)" << std::endl;
+        std::cout << "  --cluster_name=NAME      Datasystem cluster name for service discovery" << std::endl;
+        std::cout << "  --host_id_env_name=NAME  Environment variable holding the local host ID" << std::endl;
         std::cout << std::endl;
 
         std::cout << "  --delete_value=Y/N  Delete the keys after mgeth2d/originget (default: Y)" << std::endl;
@@ -393,6 +403,11 @@ public:
         // --remoteip / --localip / --port / --gpu_id
         TMAIN("remoteip: " << remoteip << ", localip: " << localip
               << ", port: " << port << ", gpu_id: " << gpu_id);
+        // --etcd_address / --cluster_name / --host_id_env_name
+        if (!etcd_address.empty()) {
+            TMAIN("etcd_address: " << etcd_address << ", cluster_name: " << cluster_name
+                  << ", host_id_env_name: " << host_id_env_name);
+        }
         // --verify / --delete_value / --pin / --use_user_stream
         TMAIN("verify: " << (verify_data ? "Yes" : "No")
               << ", delete_value: " << (delete_value ? "Yes" : "No")
@@ -420,6 +435,9 @@ public:
     std::string cmd;
     std::string remoteip;
     std::string localip;
+    std::string etcd_address;    // --etcd_address: ETCD list for service discovery (optional)
+    std::string cluster_name;    // --cluster_name: datasystem cluster name (with etcd)
+    std::string host_id_env_name;  // --host_id_env_name: env var holding the local host ID
 
     int port = 18481;
     int gpu_id = 0;
@@ -520,8 +538,8 @@ public:
             PrintUsage();
             return -1;
         }
-        if (remoteip.empty() && localip.empty()) {
-            TERROR("--remoteip or --localip is required");
+        if (remoteip.empty() && localip.empty() && etcd_address.empty()) {
+            TERROR("--remoteip, --localip, or --etcd_address is required");
             PrintUsage();
             return -1;
         }
@@ -585,6 +603,9 @@ private:
         else if (key == "delete_value") delete_value = ParseBoolH2D(value);
         else if (key == "remoteip") remoteip = value;
         else if (key == "localip") localip = value;
+        else if (key == "etcd_address") etcd_address = value;
+        else if (key == "cluster_name") cluster_name = value;
+        else if (key == "host_id_env_name") host_id_env_name = value;
         else if (key == "port") port = std::stoi(value);
         else if (key == "gpu_id" || key == "gpu_num") gpu_id = std::stoi(value);
         else if (key == "verify") verify_data = ParseBool(value);
@@ -990,12 +1011,13 @@ public:
         return 0;
     }
 
-    // Set: writes every key of the batch, timing the whole batch as one latency sample.
-    // Returns false when any key failed (the kps loop then skips the Get/Del of this
-    // iteration); the set command additionally prints the key list.
+    // Set: writes every key of the batch via per-key client.Set, timing the whole batch as one
+    // latency sample. Used by the set/mgeth2d/origininget commands. Returns false when any
+    // key failed (the kps loop then skips the Get/Del of this iteration); the set command
+    // additionally prints the key list.
     int Set(KVClient& client, const rh2d_batch_data::Data& batch,
              RunStats& stats, int round, bool emit_keys = false) {
-        auto start = std::chrono::high_resolution_clock::now();
+        auto start = std::chrono::steady_clock::now();
         int failed = 0;
         for (const auto& kv : batch) {
             Status rc = client.Set(kv.first, kv.second);
@@ -1004,7 +1026,7 @@ public:
                 TLOG(t_idx_, rc.GetMsg());
             }
         }
-        auto end = std::chrono::high_resolution_clock::now();
+        auto end = std::chrono::steady_clock::now();
         double us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
         stats.set.AddLatency(us);
         stats.set.ops += static_cast<int64_t>(batch.size());
@@ -1027,6 +1049,76 @@ public:
             TLOG(t_idx_, oss.str());
         }
         return failed == 0 ? 0 : -1;
+    }
+
+    // Mset: writes every key of the batch via MCreate + host copy + MSet, timing each phase
+    // (create/host-copy/set) into the matching per-phase stats. Used by the get/rh2d
+    // commands. Returns false when any key failed.
+    int Mset(KVClient& client, const rh2d_batch_data::Data& batch,
+             RunStats& stats, int round, bool emit_keys = false) {
+        std::vector<std::string> keys;
+        std::vector<uint64_t> sizes;
+        keys.reserve(batch.size());
+        sizes.reserve(batch.size());
+        for (const auto& kv : batch) {
+            keys.push_back(kv.first);
+            sizes.push_back(kv.second.size());
+        }
+
+        auto create_start = std::chrono::steady_clock::now();
+        std::vector<std::shared_ptr<Buffer>> buffers;
+        Status rc = client.MCreate(keys, sizes, SetParam{}, buffers);
+        double create_us = ElapsedUs(create_start);
+        stats.create.AddLatency(create_us);
+        stats.create.ops += static_cast<int64_t>(batch.size());
+        if (rc.IsError() || buffers.size() != keys.size()) {
+            stats.set.failed += static_cast<int64_t>(batch.size());
+            TLOG(t_idx_, "MCreate failed: " << rc.GetMsg() << ", buffers=" << buffers.size());
+            return -1;
+        }
+
+        auto copy_start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (buffers[i] == nullptr || buffers[i]->MutableData() == nullptr
+                || buffers[i]->GetSize() != static_cast<int64_t>(sizes[i])) {
+                stats.set.failed += static_cast<int64_t>(batch.size());
+                TLOG(t_idx_, "MCreate returned invalid buffer for key " << keys[i]);
+                return -1;
+            }
+            std::memcpy(buffers[i]->MutableData(), batch[i].second.data(), sizes[i]);
+        }
+        double copy_us = ElapsedUs(copy_start);
+        stats.host_copy.AddLatency(copy_us);
+        stats.host_copy.ops += static_cast<int64_t>(batch.size());
+
+        auto set_start = std::chrono::steady_clock::now();
+        rc = client.MSet(buffers);
+        double set_us = ElapsedUs(set_start);
+        stats.set.AddLatency(set_us);
+        stats.set.ops += static_cast<int64_t>(batch.size());
+        if (rc.IsError()) {
+            stats.set.failed += static_cast<int64_t>(batch.size());
+            TLOG(t_idx_, "MSet failed: " << rc.GetMsg());
+            return -1;
+        }
+
+        if (emit_keys) {
+            std::ostringstream oss;
+            std::string rlabel = round >= 0 ? ("Round " + std::to_string(round) + " ") : "";
+            oss << rlabel << "MSet keys " << batch.size() << ": ";
+            const size_t print_num = 5;
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (i + 1 > print_num) {
+                    oss << ", ... (" << (batch.size() - print_num) << " more)";
+                    break;
+                }
+                if (i > 0)
+                    oss << ", ";
+                oss << batch[i].first;
+            }
+            TLOG(t_idx_, oss.str());
+        }
+        return 0;
     }
 
     // MGetH2D: single batched H2D read into (reused or per-batch) CUDA buffers, timing the
@@ -1195,6 +1287,12 @@ public:
 
 private:
 
+    // Microseconds elapsed since `begin`.
+    static double ElapsedUs(const std::chrono::steady_clock::time_point& begin) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - begin).count();
+    }
+
     // Allocates the destination CUDA buffers for a batch read (MGetH2D or Get+H2D). Both
     // verification modes share the pre-allocated pool: one buffer per key, sized
     // max_value_size_+1, reused across rounds and freed once by Cleanup(). out[i].size
@@ -1314,7 +1412,7 @@ private:
 
 enum class ClientRole { Local, Remote };
 
-enum class OpKind { Set, MGetH2D, GetH2D, Del };
+enum class OpKind { Set, MSet, MGetH2D, GetH2D, Del };
 
 // One step of a workload. sync_before/sync_after place a barrier around the op so the
 // multi-stage barrier layouts of the h2d commands are preserved.
@@ -1455,7 +1553,14 @@ private:
         }
         switch (op.kind) {
         case OpKind::Set:
+            // set/mgeth2d/origininget write per-key via client.Set.
             if (ops->Set(*client, batch, stats, round, op.emit_keys) != 0 && skip_rest) {
+                *skip_rest = true;
+            }
+            break;
+        case OpKind::MSet:
+            // get/rh2d write batch via MCreate + MSet through the remote client.
+            if (ops->Mset(*client, batch, stats, round, op.emit_keys) != 0 && skip_rest) {
                 *skip_rest = true;
             }
             break;
@@ -1594,6 +1699,12 @@ private:
             shared->set.failed += cur.set.failed - last.set.failed;
             shared->set.AddLatency(cur.set.latency.total_time_us - last.set.latency.total_time_us);
         }
+        if (cur.create.ops > last.create.ops) {
+            shared->create.AddLatency(cur.create.latency.total_time_us - last.create.latency.total_time_us);
+        }
+        if (cur.host_copy.ops > last.host_copy.ops) {
+            shared->host_copy.AddLatency(cur.host_copy.latency.total_time_us - last.host_copy.latency.total_time_us);
+        }
         if (cur.get.ops > last.get.ops) {
             int64_t d_ops = cur.get.ops - last.get.ops;
             shared->get.ops += d_ops;
@@ -1676,35 +1787,69 @@ public:
     }
 
 private:
-    // Builds and initializes a KVClient connected to `host`, reporting progress via
-    // `prefix`/`name`.
+    // Builds and initializes a KVClient. With --etcd_address the client is created through
+    // service discovery (host is ignored); otherwise it connects directly to `host`.
+    // Reports progress via `prefix`/`name`.
     std::shared_ptr<KVClient> CreateClient(const std::string& host, const std::string& name,
                                            const std::string& prefix) {
         if (CudaSetDevice(args.gpu_id, prefix) != 0) {
             return nullptr;
         }
-        ConnectOptions connectOptions;
-        connectOptions.host = host;
-        connectOptions.port = args.port;
-        connectOptions.accessKey = "";
-        connectOptions.secretKey = "";
-        connectOptions.deviceId = std::to_string(args.gpu_id);
-        connectOptions.fastTransportMemSize = args.client_options.fast_transport_mem_size;
-        connectOptions.enableLocalCache = args.client_options.enable_local_cache;
-        connectOptions.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
-        connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
-
-        auto sharedClient = std::make_shared<KVClient>(connectOptions);
         if (args.client_options.pin) {
             CudaRegisterPinFuncs();
         }
+
+        std::shared_ptr<KVClient> sharedClient;
+        if (!args.etcd_address.empty()) {
+            ServiceDiscoveryOptions discovery_options;
+            discovery_options.etcdAddress = args.etcd_address;
+            discovery_options.clusterName = args.cluster_name;
+            discovery_options.hostIdEnvName = args.host_id_env_name;
+            discovery_options.affinityPolicy = ServiceAffinityPolicy::PREFERRED_SAME_NODE;
+            auto discovery = std::make_shared<ServiceDiscovery>(discovery_options);
+            Status drc = discovery->Init();
+            if (drc.IsError()) {
+                TERROR(prefix << " Service discovery init failed: " << drc.GetMsg());
+                return nullptr;
+            }
+
+            ConnectOptions connectOptions;
+            connectOptions.deviceId = std::to_string(args.gpu_id);
+            connectOptions.fastTransportMemSize = args.client_options.fast_transport_mem_size;
+            connectOptions.enableLocalCache = false;
+            connectOptions.enableCrossNodeConnection = true;
+            connectOptions.dataPlacementPolicy = DataPlacementPolicy::PREFERRED_META_OWNER;
+            connectOptions.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
+            connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
+            connectOptions.serviceDiscovery = std::move(discovery);
+            sharedClient = std::make_shared<KVClient>(connectOptions);
+        } else {
+            ConnectOptions connectOptions;
+            connectOptions.host = host;
+            connectOptions.port = args.port;
+            connectOptions.accessKey = "";
+            connectOptions.secretKey = "";
+            connectOptions.deviceId = std::to_string(args.gpu_id);
+            connectOptions.fastTransportMemSize = args.client_options.fast_transport_mem_size;
+            connectOptions.enableLocalCache = args.client_options.enable_local_cache;
+            connectOptions.enableClientDirectPipelineH2D = args.client_options.enable_client_direct_rh2d;
+            connectOptions.clientDirectPipelineH2DThreadNum = args.client_options.client_direct_thread_num;
+            sharedClient = std::make_shared<KVClient>(connectOptions);
+        }
+
         Status rc = sharedClient->Init();
         if (rc.IsError()) {
             TERROR(prefix << " Failed to init " << name << ": " << rc.GetMsg());
             return nullptr;
         }
-        TMAIN(name << " initialized once: " << sharedClient.get() << ", ip=" << host
-              << ", port=" << args.port << ", gpu_id=" << args.gpu_id);
+        if (!args.etcd_address.empty()) {
+            TMAIN(name << " initialized via service discovery: " << sharedClient.get()
+                  << ", etcd=" << args.etcd_address << ", cluster=" << args.cluster_name
+                  << ", gpu_id=" << args.gpu_id);
+        } else {
+            TMAIN(name << " initialized once: " << sharedClient.get() << ", ip=" << host
+                  << ", port=" << args.port << ", gpu_id=" << args.gpu_id);
+        }
         return sharedClient;
     }
 
@@ -1728,14 +1873,14 @@ private:
                 w.loop_ops.push_back(Op{OpKind::Del, ClientRole::Local});
             }
         } else if (args.cmd == "rh2d") {
-            // Set → MGetH2D → Del all run each round, matching the kps orchestration so each
-            // round's Set (round-stamped keys) is written before the local read and deleted
+            // MSet → MGetH2D → Del all run each round, matching the kps orchestration so each
+            // round's MSet (round-stamped keys) is written before the local read and deleted
             // afterwards.
-            w.loop_ops.push_back(Op{OpKind::Set, ClientRole::Remote});
+            w.loop_ops.push_back(Op{OpKind::MSet, ClientRole::Remote});
             w.loop_ops.push_back(Op{OpKind::MGetH2D, ClientRole::Local});
             w.loop_ops.push_back(Op{OpKind::Del, ClientRole::Remote});
         } else if (args.cmd == "get") {
-            w.loop_ops.push_back(Op{OpKind::Set, ClientRole::Remote});
+            w.loop_ops.push_back(Op{OpKind::MSet, ClientRole::Remote});
             w.loop_ops.push_back(Op{OpKind::GetH2D, ClientRole::Local});
             w.loop_ops.push_back(Op{OpKind::Del, ClientRole::Remote});
         }
