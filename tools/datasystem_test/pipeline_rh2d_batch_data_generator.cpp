@@ -105,7 +105,7 @@ int Generate(const Args &args, const std::vector<rh2d_batch_data::SizeConfig> &c
     int progressInterval = std::max(1, args.count / 20);
     rh2d_batch_data::Data data;
     std::cout << "Generating " << args.count << " key-value pairs for " << path << std::endl;
-    rh2d_batch_data::Generate(args.count, args.batch, configs, data, [&](size_t generated) {
+    rh2d_batch_data::Generate(args.count, args.batch, configs, "", "", 0, 0, data, [&](size_t generated) {
         if (generated % progressInterval == 0 || generated == static_cast<size_t>(args.count)) {
             std::cout << "Generate progress: " << generated * 100 / args.count << "% (" << generated << "/"
                       << args.count << ")" << std::endl;

@@ -234,20 +234,49 @@ inline bool LoadCompatible(const std::string &signature, size_t expectedCount, s
     return loaded;
 }
 
+// Builds the per-key tag used by Generate for both the key and the value segment:
+// `prefix + i + "T" + t_idx`. `prefix` is the --key_prefix/--value_prefix argument (empty when
+// not given); `i` is the key index, `t_idx` the worker thread index.
+inline std::string BuildTag(const std::string &prefix, int i, int t_idx)
+{
+    return prefix + std::to_string(i) + "_T" + std::to_string(t_idx);
+}
+
+// Generates a single batch of `count` records for one worker thread (t_idx). The key is
+// `round_len` placeholder bytes + key_prefix + i + "_T" + t_idx and the value is the same
+// round placeholder followed by the deterministic pattern
+// `##########|v|random16|v|random16...` where each segment `v` is
+// value_prefix + i + "_T" + t_idx + "S" + value_size. Value sizes come from `configs`
+// (mixed sizes repeat per batch). The round placeholder lets the caller stamp a per-round
+// value (e.g. a timestamp/round counter) into the key and value prefixes and reuse the
+// batch template across rounds without regenerating the data.
 template <typename ProgressCallback>
-inline void Generate(int count, int batch, const std::vector<SizeConfig> &configs, Data &data,
-                     ProgressCallback reportProgress)
+inline void Generate(int count, int batch, const std::vector<SizeConfig> &configs,
+                     const std::string &key_prefix, const std::string &value_prefix,
+                     int t_idx, size_t round_len, Data &data, ProgressCallback reportProgress)
 {
     data.clear();
     data.reserve(count);
+    std::string round_placeholder(round_len, ' ');
     int numBatches = count / batch;
     for (int batchIndex = 0; batchIndex < numBatches; ++batchIndex) {
         int allocated = 0;
         for (const auto &config : configs) {
             int itemCount = config.count == -1 ? batch - allocated : std::min(config.count, batch - allocated);
             for (int index = 0; index < itemCount; ++index) {
-                std::string key = "key_" + std::to_string(data.size()) + "_" + GenerateRandomString(8);
-                data.emplace_back(std::move(key), GenerateRandomString(config.size));
+                int i = batchIndex * batch + allocated + index;
+                std::string key = round_placeholder + BuildTag(key_prefix, i, t_idx);
+                std::string segment = BuildTag(value_prefix, i, t_idx) + "S" + std::to_string(config.size);
+                std::string value = round_placeholder;
+                value.reserve(config.size + round_len);
+                value += "##########";
+                while (value.size() < config.size + round_len) {
+                    value += "|" + segment + "|" + GenerateRandomString(16);
+                }
+                if (value.size() > config.size + round_len) {
+                    value.resize(config.size + round_len);
+                }
+                data.emplace_back(std::move(key), std::move(value));
                 reportProgress(data.size());
             }
             allocated += itemCount;

@@ -46,17 +46,6 @@ endif()
 
 #################### feature test util ##################
 
-add_executable(pipeline_h2d pipeline_h2d.cpp)
-target_include_directories(pipeline_h2d PRIVATE
-    ${COMMON_HEADER}/
-)
-target_link_libraries(pipeline_h2d PRIVATE 
-    ${COMMON_LIB}
-)
-target_compile_options(pipeline_h2d PRIVATE
-    $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
-)
-
 add_executable(pipeline_async_pin_test pipeline_async_pin_test.cpp)
 target_include_directories(pipeline_async_pin_test PRIVATE
     ${COMMON_HEADER}/
@@ -71,19 +60,19 @@ target_compile_options(pipeline_async_pin_test PRIVATE
 
 #################### batch test util ##################
 
-add_executable(pipeline_rh2d_batch_test pipeline_rh2d_batch_test.cpp)
-target_include_directories(pipeline_rh2d_batch_test PRIVATE
+add_executable(pipeline_h2d pipeline_h2d.cpp)
+target_include_directories(pipeline_h2d PRIVATE
     ${COMMON_HEADER}/
     $<$<BOOL:${USE_CUDA_MOCK}>:${CMAKE_CURRENT_SOURCE_DIR}/../../mock>
 )
-target_link_libraries(pipeline_rh2d_batch_test PRIVATE
+target_link_libraries(pipeline_h2d PRIVATE
     ${COMMON_LIB}
 )
 if(USE_CUDA_MOCK)
-    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_CUDA_MOCK)
-    target_compile_definitions(pipeline_rh2d_batch_test PRIVATE USE_URMA_MOCK)
+    target_compile_definitions(pipeline_h2d PRIVATE USE_CUDA_MOCK)
+    target_compile_definitions(pipeline_h2d PRIVATE USE_URMA_MOCK)
 endif()
-target_compile_options(pipeline_rh2d_batch_test PRIVATE
+target_compile_options(pipeline_h2d PRIVATE
     $<$<CONFIG:Debug>:-O0;-g;-fno-omit-frame-pointer>;-Wall
 )
 

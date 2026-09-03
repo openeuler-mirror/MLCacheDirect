@@ -28,6 +28,15 @@ using datasystem::ServiceDiscoveryOptions;
 using datasystem::SetParam;
 using datasystem::Status;
 
+static void CudaRegisterPinFuncs()
+{
+    datasystem::CudaFuncs funcs;
+    funcs.hostRegister = reinterpret_cast<datasystem::HostRegisterFunc>(cudaHostRegister);
+    funcs.hostUnregister = reinterpret_cast<datasystem::HostUnregisterFunc>(cudaHostUnregister);
+    funcs.getErrorString = reinterpret_cast<datasystem::GetErrorStringFunc>(cudaGetErrorString);
+    KVClient::RegisterCudaFuncs(funcs);
+}
+
 namespace {
 
 std::mutex g_logMutex;
@@ -48,6 +57,7 @@ struct Options {
     bool enableLocalCache = true;
     bool cleanupBefore = true;
     bool deleteAfter = false;
+    bool pin = true;
     bool help = false;
 };
 
@@ -141,6 +151,9 @@ bool ApplyBoolOption(const std::string &name, const std::string &value, Options 
 {
     if (name == "enable_local_cache") {
         return ParseBool(value, options.enableLocalCache);
+    }
+    if (name == "pin") {
+        return ParseBool(value, options.pin);
     }
     if (name == "cleanup_before") {
         return ParseBool(value, options.cleanupBefore);
@@ -243,6 +256,7 @@ void PrintUsage(const char *program)
               << "  --thread=N               Concurrent threads, default 1\n"
               << "  --timeout_ms=N           Get timeout, default 60000\n"
               << "  --enable_local_cache=B   Local-cache mode, default true\n"
+              << "  --pin=B                  Register CUDA host-memory funcs before KVClient Init, default true\n"
               << "  --cleanup_before=B       Delete keys before Set, default true\n"
               << "  --delete_after=B         Delete keys after test, default false\n"
               << "\nShell commands:\n"
@@ -462,6 +476,9 @@ std::shared_ptr<KVClient> InitClient(const Options &options, int64_t &elapsedUs)
         connect.enableLocalCache = options.enableLocalCache;
     }
     auto client = std::make_shared<KVClient>(connect);
+    if (options.pin) {
+        CudaRegisterPinFuncs();
+    }
     Status rc;
     elapsedUs = MeasureUs([&] { rc = client->Init(); });
     if (rc.IsError()) {
@@ -487,6 +504,7 @@ void PrintSummary(const Options &options, const Summary &summary, int64_t initUs
               << (options.etcdAddress.empty() ? "N/A" : options.clusterName) << '\n'
               << "enable local cache: " << std::boolalpha
               << (options.etcdAddress.empty() ? options.enableLocalCache : false) << '\n'
+              << "pin               : " << std::boolalpha << options.pin << '\n'
               << "init us           : " << initUs << '\n'
               << "create success    : " << summary.createOk.load() << '\n'
               << "set success       : " << summary.setOk.load() << '\n'
