@@ -375,6 +375,7 @@ void PrintUsage(const char *program)
               << "  mroundtrip <prefix> <count> [size]  MCreate, D2H, MSet, MGet and H2D\n"
               << "  parallel <op> <prefix> <request_count> <threads> [size] [batch_size]\n"
               << "  qps <op> <prefix> <qps> <time_seconds> <threads> [size] [batch_size]\n"
+              << "      qps-only ops get_only/mget_only repeatedly Get exact keys without H2D or preparation\n"
               << "  del <key>                 Delete a published value\n"
               << "  discard <key>             Release a pending Create Buffer without Set\n"
               << "  pending                   List Buffers waiting for Set\n"
@@ -767,7 +768,8 @@ void PrintShellHelp()
               << "  mroundtrip <prefix> <count> [size]  MCreate, D2H, MSet, MGet and H2D\n"
               << "  parallel <op> <prefix> <request_count> <threads> [size] [batch_size]\n"
               << "  qps <op> <prefix> <qps> <time_seconds> <threads> [size] [batch_size]\n"
-              << "                             op: create_set/mcreate_set/get/mget/roundtrip/mroundtrip\n"
+              << "                             op: create_set/mcreate_set/get/get_only/mget/mget_only/roundtrip/mroundtrip\n"
+              << "                             get_only/mget_only repeat exact keys without H2D or preparation\n"
               << "  del <key>                 Delete a published value\n"
               << "  discard <key>             Release a pending Buffer without Set\n"
               << "  pending                   List pending Buffers\n"
@@ -963,6 +965,27 @@ bool GetAndLoadOne(KVClient &client, const Options &options, const std::string &
     if (options.deleteAfter) {
         DeleteKey(client, key, tid);
     }
+    return true;
+}
+
+bool GetOnlyOne(KVClient &client, const Options &options, const std::string &key, uint64_t size, int tid,
+                Summary &summary, LatencySamples *samples = nullptr, bool quiet = false)
+{
+    Optional<ReadOnlyBuffer> buffer;
+    Status rc;
+    const int64_t getUs = MeasureUs([&] { rc = client.Get(key, buffer, options.timeoutMs); });
+    if (!quiet) {
+        Log(tid, "[GET_ONLY] key=", key, " rc=", rc.ToString(), " elapsed_us=", getUs);
+    }
+    if (rc.IsError() || !buffer || buffer->ImmutableData() == nullptr
+        || buffer->GetSize() != static_cast<int64_t>(size)) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[GET_ONLY_FAIL] key=", key, " rc=", rc.ToString(), " has_buffer=", static_cast<bool>(buffer),
+            " expected_size=", size, " actual_size=", buffer ? buffer->GetSize() : -1);
+        return false;
+    }
+    AddLatency(samples, "get", getUs);
+    ++summary.getOk;
     return true;
 }
 
@@ -1310,6 +1333,48 @@ bool MGetAndLoad(KVClient &client, const Options &options, const std::string &ba
     return true;
 }
 
+bool MGetOnly(KVClient &client, const Options &options, const std::string &batchPrefix, int batchSize, uint64_t size,
+              int tid, Summary &summary, LatencySamples *samples = nullptr, bool quiet = false)
+{
+    const auto keys = BuildBatchKeys(batchPrefix, batchSize);
+    std::vector<Optional<ReadOnlyBuffer>> buffers;
+    Status rc;
+    const int64_t getUs = MeasureUs([&] { rc = client.Get(keys, buffers, options.timeoutMs); });
+    if (!quiet) {
+        Log(tid, "[MGET_ONLY] prefix=", batchPrefix, " count=", batchSize, " rc=", rc.ToString(),
+            " elapsed_us=", getUs);
+    }
+    if (rc.IsError() || buffers.size() != keys.size()) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[MGET_ONLY_FAIL] prefix=", batchPrefix, " rc=", rc.ToString(), " expected_buffers=", keys.size(),
+            " actual_buffers=", buffers.size());
+        return false;
+    }
+    size_t missingCount = 0;
+    size_t nullDataCount = 0;
+    size_t sizeMismatchCount = 0;
+    for (const auto &buffer : buffers) {
+        if (!buffer) {
+            ++missingCount;
+        } else if (buffer->ImmutableData() == nullptr) {
+            ++nullDataCount;
+        } else if (buffer->GetSize() != static_cast<int64_t>(size)) {
+            ++sizeMismatchCount;
+        }
+    }
+    const size_t invalidCount = missingCount + nullDataCount + sizeMismatchCount;
+    if (invalidCount != 0) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[MGET_ONLY_FAIL] prefix=", batchPrefix, " count=", batchSize, " invalid_buffers=", invalidCount,
+            " missing=", missingCount, " null_data=", nullDataCount, " size_mismatch=", sizeMismatchCount,
+            " batch_rc=", rc.ToString());
+        return false;
+    }
+    AddLatency(samples, "get", getUs);
+    summary.getOk += batchSize;
+    return true;
+}
+
 bool MRoundtrip(KVClient &client, const Options &options, const std::string &batchPrefix, int batchSize,
                 uint64_t size, int tid, GpuResources &resources, PendingBufferMap &pendingBuffers,
                 PendingBatchMap &pendingBatches, Summary &summary, LatencySamples *samples = nullptr,
@@ -1356,6 +1421,11 @@ bool IsSupportedWorkloadOperation(const std::string &operation)
            || operation == "mget" || operation == "roundtrip" || operation == "mroundtrip";
 }
 
+bool IsSupportedQpsOperation(const std::string &operation)
+{
+    return IsSupportedWorkloadOperation(operation) || operation == "get_only" || operation == "mget_only";
+}
+
 bool IsBatchWorkloadOperation(const std::string &operation)
 {
     return !operation.empty() && operation.front() == 'm';
@@ -1363,11 +1433,14 @@ bool IsBatchWorkloadOperation(const std::string &operation)
 
 bool OperationNeedsGpu(const std::string &operation)
 {
-    return IsSupportedWorkloadOperation(operation);
+    return operation != "get_only" && operation != "mget_only" && IsSupportedWorkloadOperation(operation);
 }
 
 std::string RequestPrefix(const WorkloadSpec &spec, int64_t requestIndex)
 {
+    if (spec.operation == "get_only" || spec.operation == "mget_only") {
+        return spec.prefix;
+    }
     if (spec.legacyKeysPerThread > 0) {
         return spec.prefix + "_T" + std::to_string(requestIndex / spec.legacyKeysPerThread) + "_"
                + std::to_string(requestIndex % spec.legacyKeysPerThread);
@@ -1472,9 +1545,13 @@ bool ExecuteWorkloadRequest(const std::shared_ptr<KVClient> &client, const Optio
     } else if (spec.operation == "get") {
         success = GetAndLoadOne(*client, options, requestPrefix, spec.size, tid, *resources, summary, &samples,
                                 quiet);
+    } else if (spec.operation == "get_only") {
+        success = GetOnlyOne(*client, options, requestPrefix, spec.size, tid, summary, &samples, quiet);
     } else if (spec.operation == "mget") {
         success = MGetAndLoad(*client, options, requestPrefix, spec.batchSize, spec.size, tid, *resources, summary,
                               &samples, quiet);
+    } else if (spec.operation == "mget_only") {
+        success = MGetOnly(*client, options, requestPrefix, spec.batchSize, spec.size, tid, summary, &samples, quiet);
     } else if (spec.operation == "roundtrip") {
         success = RoundtripOne(*client, options, requestPrefix, spec.size, tid, *resources, pendingBuffers,
                                summary, &samples, quiet);
@@ -1603,7 +1680,7 @@ bool ParseQpsSpec(std::istringstream &stream, const Options &options, WorkloadSp
 {
     if (!(stream >> spec.operation >> spec.prefix >> spec.qps >> spec.timeSeconds >> spec.threadNum)
         || spec.qps <= 0 || spec.timeSeconds <= 0 || spec.threadNum <= 0
-        || !IsSupportedWorkloadOperation(spec.operation) || !ParseCommandSize(stream, options.valueSize, spec.size)) {
+        || !IsSupportedQpsOperation(spec.operation) || !ParseCommandSize(stream, options.valueSize, spec.size)) {
         return false;
     }
     spec.batchSize = IsBatchWorkloadOperation(spec.operation) ? options.count : 1;
@@ -1626,17 +1703,21 @@ bool RunQps(std::istringstream &stream, const std::shared_ptr<KVClient> &client,
 {
     WorkloadSpec spec;
     if (!ParseQpsSpec(stream, options, spec)) {
-        Log(0, "[COMMAND_ERROR] usage: qps <create_set|mcreate_set|get|mget|roundtrip|mroundtrip> "
+        Log(0, "[COMMAND_ERROR] usage: qps <create_set|mcreate_set|get|get_only|mget|mget_only|roundtrip|mroundtrip> "
                "<prefix> <qps> <time_seconds> <threads> [size] [batch_size]");
         return false;
     }
+    const bool needsGpu = OperationNeedsGpu(spec.operation);
     std::vector<GpuResources> resourcePool;
-    if (!InitializeGpuResourcePool(resourcePool, options, spec.threadNum, static_cast<size_t>(spec.batchSize),
-                                   spec.size)) {
+    if (needsGpu
+        && !InitializeGpuResourcePool(resourcePool, options, spec.threadNum, static_cast<size_t>(spec.batchSize),
+                                      spec.size)) {
         Log(0, "[QPS_FAIL] shared CUDA resource initialization failed");
         return false;
     }
-    if (!PrepareWorkload(client, options, spec, resourcePool.front(), pendingBuffers, pendingBatches)) {
+    GpuResources unusedResources;
+    GpuResources &prepareResources = needsGpu ? resourcePool.front() : unusedResources;
+    if (!PrepareWorkload(client, options, spec, prepareResources, pendingBuffers, pendingBatches)) {
         return false;
     }
 
@@ -1653,9 +1734,8 @@ bool RunQps(std::istringstream &stream, const std::shared_ptr<KVClient> &client,
     std::vector<std::thread> threads;
     for (int tid = 0; tid < spec.threadNum; ++tid) {
         threads.emplace_back([&, tid] {
-            // Use the shared stream/context selected during main-thread initialization. Each worker
-            // still owns a distinct source/destination buffer set in resourcePool[tid].
-            const bool initialized = CheckCuda(cudaSetDevice(options.gpuId), tid, "cudaSetDevice worker");
+            // GPU workloads use the shared stream/context created by the main thread and distinct buffers per worker.
+            const bool initialized = !needsGpu || CheckCuda(cudaSetDevice(options.gpuId), tid, "cudaSetDevice worker");
             {
                 std::lock_guard<std::mutex> lock(readyMutex);
                 initializeFailed = initializeFailed || !initialized;
