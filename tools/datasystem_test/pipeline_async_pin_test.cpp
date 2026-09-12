@@ -4,19 +4,12 @@
 
 #include <cuda_runtime.h>
 
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstddef>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -28,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -80,12 +72,6 @@ namespace {
 std::mutex g_logMutex;
 
 constexpr const char *kDatasystemPinFlag = "DATASYSTEM_PIN_FLAG";
-constexpr size_t kMaxRemoteCommandLength = 4096;
-
-std::string RemoteCommandSocketPath(pid_t pid)
-{
-    return "/tmp/pipeline_async_pin_test." + std::to_string(getuid()) + "." + std::to_string(pid) + ".sock";
-}
 
 struct Options {
     std::string host;
@@ -203,173 +189,6 @@ void Log(int tid, Args &&...args)
     (stream << ... << args);
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::cout << "[T" << tid << "] " << stream.str() << std::endl;
-}
-
-bool BuildUnixSocketAddress(const std::string &path, sockaddr_un &address, socklen_t &addressLength)
-{
-    if (path.size() >= sizeof(address.sun_path)) {
-        return false;
-    }
-    std::memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
-    addressLength = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
-    return true;
-}
-
-class RemoteCommandServer {
-public:
-    ~RemoteCommandServer()
-    {
-        Stop();
-    }
-
-    bool Start()
-    {
-        path_ = RemoteCommandSocketPath(getpid());
-        sockaddr_un address;
-        socklen_t addressLength = 0;
-        if (!BuildUnixSocketAddress(path_, address, addressLength)) {
-            Log(0, "[REMOTE_CONTROL_FAIL] socket path is too long: ", path_);
-            return false;
-        }
-        fd_ = socket(AF_UNIX, SOCK_DGRAM, 0);
-        if (fd_ < 0) {
-            Log(0, "[REMOTE_CONTROL_FAIL] socket failed: ", std::strerror(errno));
-            return false;
-        }
-        struct stat fileStat;
-        if (lstat(path_.c_str(), &fileStat) == 0) {
-            if (!S_ISSOCK(fileStat.st_mode)) {
-                Log(0, "[REMOTE_CONTROL_FAIL] cannot replace socket path: ", path_);
-                Stop();
-                return false;
-            }
-            if (unlink(path_.c_str()) != 0) {
-                Log(0, "[REMOTE_CONTROL_FAIL] unlink stale socket failed: ", std::strerror(errno));
-                Stop();
-                return false;
-            }
-        } else if (errno != ENOENT) {
-            Log(0, "[REMOTE_CONTROL_FAIL] lstat failed: ", std::strerror(errno));
-            Stop();
-            return false;
-        }
-        if (bind(fd_, reinterpret_cast<const sockaddr *>(&address), addressLength) != 0) {
-            Log(0, "[REMOTE_CONTROL_FAIL] bind socket failed: ", std::strerror(errno));
-            Stop();
-            return false;
-        }
-        ownsPath_ = true;
-        if (chmod(path_.c_str(), S_IRUSR | S_IWUSR) != 0) {
-            Log(0, "[REMOTE_CONTROL_FAIL] chmod socket failed: ", std::strerror(errno));
-            Stop();
-            return false;
-        }
-        return true;
-    }
-
-    void Stop()
-    {
-        if (fd_ >= 0) {
-            close(fd_);
-            fd_ = -1;
-        }
-        if (ownsPath_) {
-            (void)unlink(path_.c_str());
-            ownsPath_ = false;
-        }
-        path_.clear();
-    }
-
-    int Fd() const
-    {
-        return fd_;
-    }
-
-    const std::string &Path() const
-    {
-        return path_;
-    }
-
-    bool Receive(std::string &command)
-    {
-        char buffer[kMaxRemoteCommandLength + 1];
-        const ssize_t bytes = recv(fd_, buffer, sizeof(buffer), 0);
-        if (bytes < 0) {
-            Log(0, "[REMOTE_CONTROL_FAIL] receive failed: ", std::strerror(errno));
-            return false;
-        }
-        if (static_cast<size_t>(bytes) > kMaxRemoteCommandLength) {
-            Log(0, "[REMOTE_CONTROL_FAIL] command exceeds ", kMaxRemoteCommandLength, " bytes");
-            return false;
-        }
-        command.assign(buffer, static_cast<size_t>(bytes));
-        return !command.empty();
-    }
-
-private:
-    int fd_ = -1;
-    std::string path_;
-    bool ownsPath_ = false;
-};
-
-int SendRemoteCommand(int argc, char **argv)
-{
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " send <pid> <command...>" << std::endl;
-        return 1;
-    }
-    pid_t pid = 0;
-    try {
-        size_t parsedLength = 0;
-        const std::string pidText = argv[2];
-        const long long parsedPid = std::stoll(pidText, &parsedLength);
-        if (parsedLength != pidText.size() || parsedPid <= 0
-            || parsedPid > static_cast<long long>(std::numeric_limits<pid_t>::max())) {
-            throw std::out_of_range("pid");
-        }
-        pid = static_cast<pid_t>(parsedPid);
-    } catch (const std::exception &) {
-        std::cerr << "Invalid target pid: " << argv[2] << std::endl;
-        return 1;
-    }
-    std::ostringstream commandStream;
-    for (int i = 3; i < argc; ++i) {
-        if (i > 3) {
-            commandStream << ' ';
-        }
-        commandStream << argv[i];
-    }
-    std::string command = commandStream.str();
-    if (command.empty() || command.size() > kMaxRemoteCommandLength
-        || command.find_first_of("\r\n") != std::string::npos) {
-        std::cerr << "Remote command must be a single non-empty line shorter than " << kMaxRemoteCommandLength
-                  << " bytes" << std::endl;
-        return 1;
-    }
-    const std::string path = RemoteCommandSocketPath(pid);
-    sockaddr_un address;
-    socklen_t addressLength = 0;
-    if (!BuildUnixSocketAddress(path, address, addressLength)) {
-        std::cerr << "Remote socket path is too long: " << path << std::endl;
-        return 1;
-    }
-    const int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        std::cerr << "Create remote socket failed: " << std::strerror(errno) << std::endl;
-        return 1;
-    }
-    const ssize_t bytes = sendto(fd, command.data(), command.size(), MSG_NOSIGNAL | MSG_DONTWAIT,
-                                 reinterpret_cast<const sockaddr *>(&address), addressLength);
-    if (bytes != static_cast<ssize_t>(command.size())) {
-        std::cerr << "Send command to process " << pid << " failed: " << std::strerror(errno) << std::endl;
-        close(fd);
-        return 1;
-    }
-    close(fd);
-    std::cout << "Command submitted to process " << pid << std::endl;
-    return 0;
 }
 
 template <typename Func>
@@ -526,7 +345,6 @@ bool ValidateOptions(const Options &options)
 void PrintUsage(const char *program)
 {
     std::cout << "Usage:\n"
-              << "  " << program << " send <pid> <command...>\n"
               << "  " << program << " <host> <create_set|get|roundtrip|shell> [options]\n"
               << "  " << program
               << " <create_set|get|roundtrip|shell> --coordinator_address=ADDR [--cluster_name=NAME] [options]\n"
@@ -2049,44 +1867,6 @@ bool ExecuteShellCommand(const std::string &command, std::istringstream &stream,
     return false;
 }
 
-void PrintShellPrompt()
-{
-    std::lock_guard<std::mutex> lock(g_logMutex);
-    std::cout << "async-pin> " << std::flush;
-}
-
-void ExecuteShellLine(const std::string &line, bool remote, const std::shared_ptr<KVClient> &client,
-                      const Options &options, PendingBufferMap &pendingBuffers, PendingBatchMap &pendingBatches,
-                      Summary &summary, int64_t initUs, bool &exitRequested)
-{
-    std::istringstream stream(line);
-    std::string command;
-    if (!(stream >> command)) {
-        return;
-    }
-    if (remote) {
-        Log(0, "[REMOTE_COMMAND] ", line);
-    }
-    if (command == "quit" || command == "exit") {
-        exitRequested = true;
-        return;
-    }
-    bool success = false;
-    try {
-        success = ExecuteShellCommand(command, stream, client, options, pendingBuffers, pendingBatches, summary,
-                                      initUs);
-        if (!success) {
-            ++summary.failed;
-        }
-    } catch (const std::exception &error) {
-        ++summary.failed;
-        Log(0, "[COMMAND_ERROR] ", error.what());
-    }
-    if (remote) {
-        Log(0, "[REMOTE_COMMAND_DONE] success=", success);
-    }
-}
-
 int RunShell(const Options &options)
 {
     int64_t initUs = 0;
@@ -2102,78 +1882,27 @@ int RunShell(const Options &options)
     Summary summary;
     PendingBufferMap pendingBuffers;
     PendingBatchMap pendingBatches;
-    RemoteCommandServer remoteServer;
-    if (remoteServer.Start()) {
-        Log(0, "[REMOTE_CONTROL] pid=", getpid(), " socket=", remoteServer.Path());
-        Log(0, "[REMOTE_CONTROL] usage: pipeline_async_pin_test send ", getpid(), " <command...>");
-    }
-    std::string stdinBuffer;
-    bool exitRequested = false;
-    PrintShellPrompt();
-    while (!exitRequested) {
-        pollfd inputs[2] = { { STDIN_FILENO, POLLIN, 0 }, { remoteServer.Fd(), POLLIN, 0 } };
-        const nfds_t inputCount = remoteServer.Fd() >= 0 ? 2 : 1;
-        const int ready = poll(inputs, inputCount, -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            Log(0, "[SHELL_FAIL] poll failed: ", std::strerror(errno));
+    std::string line;
+    while (std::cout << "async-pin> " && std::getline(std::cin, line)) {
+        std::istringstream stream(line);
+        std::string command;
+        if (!(stream >> command)) {
+            continue;
+        }
+        if (command == "quit" || command == "exit") {
             break;
         }
-        if (inputs[0].revents & (POLLIN | POLLHUP)) {
-            char buffer[1024];
-            const ssize_t bytes = read(STDIN_FILENO, buffer, sizeof(buffer));
-            if (bytes > 0) {
-                stdinBuffer.append(buffer, static_cast<size_t>(bytes));
-                size_t lineEnd = 0;
-                while (!exitRequested && (lineEnd = stdinBuffer.find('\n')) != std::string::npos) {
-                    std::string line = stdinBuffer.substr(0, lineEnd);
-                    stdinBuffer.erase(0, lineEnd + 1);
-                    if (!line.empty() && line.back() == '\r') {
-                        line.pop_back();
-                    }
-                    ExecuteShellLine(line, false, client, options, pendingBuffers, pendingBatches, summary, initUs,
-                                     exitRequested);
-                    if (!exitRequested) {
-                        PrintShellPrompt();
-                    }
-                }
-            } else if (bytes == 0) {
-                if (!stdinBuffer.empty()) {
-                    ExecuteShellLine(stdinBuffer, false, client, options, pendingBuffers, pendingBatches, summary,
-                                     initUs, exitRequested);
-                }
-                break;
-            } else if (errno != EINTR) {
-                Log(0, "[SHELL_FAIL] read stdin failed: ", std::strerror(errno));
-                break;
+        try {
+            const bool success = ExecuteShellCommand(command, stream, client, options, pendingBuffers,
+                                                     pendingBatches, summary, initUs);
+            if (!success) {
+                ++summary.failed;
             }
-        }
-        if (inputs[0].revents & (POLLERR | POLLNVAL)) {
-            Log(0, "[SHELL_FAIL] stdin poll error, revents=", inputs[0].revents);
-            break;
-        }
-        if (!exitRequested && inputCount == 2 && (inputs[1].revents & POLLIN)) {
-            std::string line;
-            if (remoteServer.Receive(line)) {
-                {
-                    std::lock_guard<std::mutex> lock(g_logMutex);
-                    std::cout << std::endl;
-                }
-                ExecuteShellLine(line, true, client, options, pendingBuffers, pendingBatches, summary, initUs,
-                                 exitRequested);
-                if (!exitRequested) {
-                    PrintShellPrompt();
-                }
-            }
-        }
-        if (inputCount == 2 && (inputs[1].revents & (POLLERR | POLLNVAL))) {
-            Log(0, "[REMOTE_CONTROL_FAIL] socket poll error, revents=", inputs[1].revents);
-            remoteServer.Stop();
+        } catch (const std::exception &error) {
+            ++summary.failed;
+            Log(0, "[COMMAND_ERROR] ", error.what());
         }
     }
-    remoteServer.Stop();
     PrintSummary(options, summary, initUs);
     PrintPendingBuffers(pendingBuffers);
     PrintPendingBatches(pendingBatches);
@@ -2213,9 +1942,6 @@ int Run(const Options &options)
 
 int main(int argc, char **argv)
 {
-    if (argc >= 2 && std::string(argv[1]) == "send") {
-        return SendRemoteCommand(argc, argv);
-    }
     Options options;
     try {
         if (!ParseArgs(argc, argv, options) || options.help || !ValidateOptions(options)) {
