@@ -1353,7 +1353,7 @@ bool MGetOnly(KVClient &client, const Options &options, const std::string &batch
     size_t missingCount = 0;
     size_t nullDataCount = 0;
     size_t sizeMismatchCount = 0;
-    for (const auto &buffer : buffers) {
+    for (auto &buffer : buffers) {
         if (!buffer) {
             ++missingCount;
         } else if (buffer->ImmutableData() == nullptr) {
