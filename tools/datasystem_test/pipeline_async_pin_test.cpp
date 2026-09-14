@@ -182,6 +182,38 @@ private:
     cudaStream_t stream_ = nullptr;
 };
 
+class CudaCompletionEvent {
+public:
+    CudaCompletionEvent() = default;
+    CudaCompletionEvent(const CudaCompletionEvent &) = delete;
+    CudaCompletionEvent &operator=(const CudaCompletionEvent &) = delete;
+
+    ~CudaCompletionEvent()
+    {
+        if (event_ != nullptr) {
+            (void)cudaEventDestroy(event_);
+        }
+    }
+
+    cudaError_t Create()
+    {
+        return cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
+    }
+
+    cudaError_t Record(void *stream)
+    {
+        return cudaEventRecord(event_, reinterpret_cast<cudaStream_t>(stream));
+    }
+
+    cudaError_t Synchronize() const
+    {
+        return cudaEventSynchronize(event_);
+    }
+
+private:
+    cudaEvent_t event_ = nullptr;
+};
+
 template <typename... Args>
 void Log(int tid, Args &&...args)
 {
@@ -416,6 +448,7 @@ bool CheckCuda(cudaError_t error, int tid, const std::string &operation)
 
 struct GpuResources {
     std::shared_ptr<CudaStream> stream;
+    std::unique_ptr<CudaCompletionEvent> completionEvent;
     std::vector<std::unique_ptr<DeviceBuffer>> sourceBuffers;
     std::vector<std::unique_ptr<DeviceBuffer>> destinationBuffers;
 
@@ -435,6 +468,10 @@ struct GpuResources {
             return false;
         }
         stream = sharedStream;
+        completionEvent = std::make_unique<CudaCompletionEvent>();
+        if (!CheckCuda(completionEvent->Create(), tid, "cudaEventCreateWithFlags completion")) {
+            return false;
+        }
         sourceBuffers.reserve(count);
         destinationBuffers.reserve(count);
         for (size_t index = 0; index < count; ++index) {
@@ -670,7 +707,7 @@ bool SubmitCudaCopy(KVClient &client, void *dst, const void *src, uint64_t size,
 
 bool RunCudaTransfer(KVClient &client, GpuResources &resources, const std::vector<void *> &hostAddresses,
                      const std::vector<uint64_t> &sizes, bool d2h, bool pin, int tid, const std::string &phase,
-                     LatencySamples *samples, bool quiet, TransferTiming &timing)
+                     LatencySamples *samples, bool quiet, TransferTiming &timing, const std::string &requestKey)
 {
     if (hostAddresses.size() != sizes.size() || hostAddresses.size() > resources.sourceBuffers.size()) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
@@ -690,11 +727,38 @@ bool RunCudaTransfer(KVClient &client, GpuResources &resources, const std::vecto
             }
         }
     });
+    cudaError_t eventError = cudaSuccess;
+    const auto eventRecordUs = MeasureUs([&] {
+        eventError = resources.completionEvent->Record(resources.stream->Data());
+    });
     cudaError_t syncError = cudaSuccess;
-    timing.syncUs = MeasureUs([&] { syncError = resources.stream->Synchronize(); });
+    timing.syncUs = MeasureUs([&] {
+        // Fence even a partially submitted batch before releasing its host buffers.
+        if (eventError == cudaSuccess) {
+            eventError = resources.completionEvent->Synchronize();
+        }
+        if (eventError != cudaSuccess) {
+            syncError = resources.stream->Synchronize();
+        }
+    });
     timing.totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - totalBegin)
                          .count();
+    constexpr int64_t cudaSlowThresholdUs = 500000;
+    if (timing.totalUs > cudaSlowThresholdUs) {
+        const auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t bytes = 0;
+        for (const auto size : sizes) {
+            bytes += size;
+        }
+        Log(tid, "[CUDA_SLOW] timestamp_ms=", timestampMs, " key_prefix=", requestKey,
+            " phase=", phase, " direction=", d2h ? "D2H" : "H2D",
+            " api=", pin ? "DsCudaMemcpyAsync" : "cudaMemcpyAsync", " stream=", resources.stream->Data(),
+            " buffers=", sizes.size(), " bytes=", bytes, " enqueue_us=", timing.enqueueUs,
+            " event_record_us=", eventRecordUs, " wait_us=", timing.syncUs, " total_us=", timing.totalUs,
+            " event_rc=", static_cast<int>(eventError), " sync_rc=", static_cast<int>(syncError));
+    }
     if (pin && copyStatus.IsError()) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
         Log(tid, "[CUDA_ERROR] operation=", phase, " detail=", copyStatus.ToString());
@@ -704,7 +768,9 @@ bool RunCudaTransfer(KVClient &client, GpuResources &resources, const std::vecto
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
         return false;
     }
-    if (!CheckCuda(syncError, tid, phase + " synchronize")) {
+    const bool eventOk = CheckCuda(eventError, tid, phase + " completion event");
+    const bool syncOk = CheckCuda(syncError, tid, phase + " fallback synchronize");
+    if (!eventOk || !syncOk) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
         return false;
     }
@@ -847,7 +913,7 @@ bool CreateAndUnloadOne(KVClient &client, const Options &options, const std::str
     std::vector<void *> addresses{ buffer->MutableData() };
     TransferTiming timing;
     if (!RunCudaTransfer(client, resources, addresses, { size }, true, options.pin, tid, "create", samples, quiet,
-                         timing)) {
+                         timing, key)) {
         return false;
     }
     ++summary.d2hOk;
@@ -947,7 +1013,7 @@ bool GetAndLoadOne(KVClient &client, const Options &options, const std::string &
     std::vector<void *> addresses{ const_cast<void *>(buffer->ImmutableData()) };
     TransferTiming timing;
     if (!RunCudaTransfer(client, resources, addresses, { size }, false, options.pin, tid, "get", samples, quiet,
-                         timing)) {
+                         timing, key)) {
         return false;
     }
     ++summary.h2dOk;
@@ -1140,7 +1206,7 @@ bool MCreateAndUnload(KVClient &client, const Options &options, const std::strin
     summary.createOk += batchSize;
     TransferTiming timing;
     if (!RunCudaTransfer(client, resources, addresses, sizes, true, options.pin, tid, "mcreate", samples, quiet,
-                         timing)) {
+                         timing, batchPrefix)) {
         return false;
     }
     summary.d2hOk += batchSize;
@@ -1306,7 +1372,7 @@ bool MGetAndLoad(KVClient &client, const Options &options, const std::string &ba
     summary.getOk += batchSize;
     TransferTiming timing;
     if (!RunCudaTransfer(client, resources, addresses, sizes, false, options.pin, tid, "mget", samples, quiet,
-                         timing)) {
+                         timing, batchPrefix)) {
         return false;
     }
     summary.h2dOk += batchSize;
