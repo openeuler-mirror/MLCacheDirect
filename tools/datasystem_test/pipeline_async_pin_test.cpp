@@ -197,7 +197,7 @@ public:
 
     cudaError_t Create()
     {
-        return cudaEventCreateWithFlags(&event_, cudaEventDisableTiming | cudaEventBlockingSync);
+        return cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
     }
 
     cudaError_t Record(void *stream)
