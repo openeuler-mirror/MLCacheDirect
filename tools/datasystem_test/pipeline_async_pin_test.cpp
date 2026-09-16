@@ -4,11 +4,13 @@
 
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -68,6 +70,8 @@ static void CudaRegisterPinFuncs()
 namespace {
 
 std::mutex g_logMutex;
+
+constexpr const char *kDatasystemPinFlag = "DATASYSTEM_PIN_FLAG";
 
 struct Options {
     std::string host;
@@ -176,6 +180,38 @@ public:
 
 private:
     cudaStream_t stream_ = nullptr;
+};
+
+class CudaCompletionEvent {
+public:
+    CudaCompletionEvent() = default;
+    CudaCompletionEvent(const CudaCompletionEvent &) = delete;
+    CudaCompletionEvent &operator=(const CudaCompletionEvent &) = delete;
+
+    ~CudaCompletionEvent()
+    {
+        if (event_ != nullptr) {
+            (void)cudaEventDestroy(event_);
+        }
+    }
+
+    cudaError_t Create()
+    {
+        return cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
+    }
+
+    cudaError_t Record(void *stream)
+    {
+        return cudaEventRecord(event_, reinterpret_cast<cudaStream_t>(stream));
+    }
+
+    cudaError_t Synchronize() const
+    {
+        return cudaEventSynchronize(event_);
+    }
+
+private:
+    cudaEvent_t event_ = nullptr;
 };
 
 template <typename... Args>
@@ -358,7 +394,7 @@ void PrintUsage(const char *program)
               << "  --thread=N               Concurrent threads, default 1\n"
               << "  --timeout_ms=N           Get timeout, default 60000\n"
               << "  --enable_local_cache=B   Local-cache mode, default true\n"
-              << "  --pin=B                  Register CUDA host-memory funcs before KVClient Init, default true\n"
+              << "  --pin=B                  true: pin + DsCudaMemcpyAsync; false: no pin + raw cudaMemcpyAsync; default true\n"
               << "  --cleanup_before=B       Delete keys before Set, default true\n"
               << "  --delete_after=B         Delete keys after test, default false\n"
               << "  --verify=B               Verify copied data, default false\n"
@@ -371,6 +407,7 @@ void PrintUsage(const char *program)
               << "  mroundtrip <prefix> <count> [size]  MCreate, D2H, MSet, MGet and H2D\n"
               << "  parallel <op> <prefix> <request_count> <threads> [size] [batch_size]\n"
               << "  qps <op> <prefix> <qps> <time_seconds> <threads> [size] [batch_size]\n"
+              << "      qps-only ops get_only/mget_only repeatedly Get exact keys without H2D or preparation\n"
               << "  del <key>                 Delete a published value\n"
               << "  discard <key>             Release a pending Create Buffer without Set\n"
               << "  pending                   List Buffers waiting for Set\n"
@@ -411,6 +448,7 @@ bool CheckCuda(cudaError_t error, int tid, const std::string &operation)
 
 struct GpuResources {
     std::shared_ptr<CudaStream> stream;
+    std::unique_ptr<CudaCompletionEvent> completionEvent;
     std::vector<std::unique_ptr<DeviceBuffer>> sourceBuffers;
     std::vector<std::unique_ptr<DeviceBuffer>> destinationBuffers;
 
@@ -430,6 +468,10 @@ struct GpuResources {
             return false;
         }
         stream = sharedStream;
+        completionEvent = std::make_unique<CudaCompletionEvent>();
+        if (!CheckCuda(completionEvent->Create(), tid, "cudaEventCreateWithFlags completion")) {
+            return false;
+        }
         sourceBuffers.reserve(count);
         destinationBuffers.reserve(count);
         for (size_t index = 0; index < count; ++index) {
@@ -519,10 +561,20 @@ std::shared_ptr<KVClient> InitClient(const Options &options, int64_t &elapsedUs)
         connect.port = options.port;
         connect.enableLocalCache = options.enableLocalCache;
     }
-    auto client = std::make_shared<KVClient>(connect);
+    const char *pinFlag = options.pin ? "1" : "0";
+    if (setenv(kDatasystemPinFlag, pinFlag, 1) != 0) {
+        std::cerr << "[CUDA_CONFIG_FAIL] set " << kDatasystemPinFlag << "=" << pinFlag
+                  << " failed, error=" << std::strerror(errno) << std::endl;
+        return nullptr;
+    }
+    std::cout << "[CUDA_CONFIG] " << kDatasystemPinFlag << "=" << pinFlag
+              << " host_memory_pin=" << std::boolalpha << options.pin
+              << " copy_api=" << (options.pin ? "DsCudaMemcpyAsync" : "cudaMemcpyAsync")
+              << " cross_fragment_split=" << options.pin << std::endl;
     if (options.pin) {
         CudaRegisterPinFuncs();
     }
+    auto client = std::make_shared<KVClient>(connect);
     Status rc;
     elapsedUs = MeasureUs([&] { rc = client->Init(); });
     if (rc.IsError()) {
@@ -557,6 +609,8 @@ void PrintSummary(const Options &options, const Summary &summary, int64_t initUs
               << (options.coordinatorAddress.empty() && options.etcdAddress.empty() ? options.enableLocalCache : false)
               << '\n'
               << "pin               : " << std::boolalpha << options.pin << '\n'
+              << "copy api          : " << (options.pin ? "DsCudaMemcpyAsync" : "cudaMemcpyAsync") << '\n'
+              << "fragment split    : " << std::boolalpha << options.pin << '\n'
               << "verify            : " << std::boolalpha << options.verify << '\n'
               << "init us           : " << initUs << '\n'
               << "create success    : " << summary.createOk.load() << '\n'
@@ -637,9 +691,23 @@ bool PrepareGpuSources(GpuResources &resources, const std::vector<std::string> &
     return CheckCuda(resources.stream->Synchronize(), tid, "prepare verification source synchronize");
 }
 
-bool RunDsTransfer(KVClient &client, GpuResources &resources, const std::vector<void *> &hostAddresses,
-                   const std::vector<uint64_t> &sizes, bool d2h, int tid, const std::string &phase,
-                   LatencySamples *samples, bool quiet, TransferTiming &timing)
+bool SubmitCudaCopy(KVClient &client, void *dst, const void *src, uint64_t size, bool d2h, bool pin, void *stream,
+                    Status &copyStatus, cudaError_t &copyError)
+{
+    if (pin) {
+        copyStatus = client.DsCudaMemcpyAsync(
+            dst, src, size,
+            d2h ? datasystem::DsCudaMemcpyKind::DEVICE_TO_HOST : datasystem::DsCudaMemcpyKind::HOST_TO_DEVICE, stream);
+        return copyStatus.IsOk();
+    }
+    copyError = cudaMemcpyAsync(dst, src, size, d2h ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
+                                reinterpret_cast<cudaStream_t>(stream));
+    return copyError == cudaSuccess;
+}
+
+bool RunCudaTransfer(KVClient &client, GpuResources &resources, const std::vector<void *> &hostAddresses,
+                     const std::vector<uint64_t> &sizes, bool d2h, bool pin, int tid, const std::string &phase,
+                     LatencySamples *samples, bool quiet, TransferTiming &timing, const std::string &requestKey)
 {
     if (hostAddresses.size() != sizes.size() || hostAddresses.size() > resources.sourceBuffers.size()) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
@@ -647,31 +715,62 @@ bool RunDsTransfer(KVClient &client, GpuResources &resources, const std::vector<
         return false;
     }
     Status copyStatus;
+    cudaError_t copyError = cudaSuccess;
     const auto totalBegin = std::chrono::steady_clock::now();
     timing.enqueueUs = MeasureUs([&] {
         for (size_t index = 0; index < hostAddresses.size(); ++index) {
             void *dst = d2h ? hostAddresses[index] : resources.destinationBuffers[index]->Data();
             const void *src = d2h ? resources.sourceBuffers[index]->Data() : hostAddresses[index];
-            copyStatus = client.DsCudaMemcpyAsync(
-                dst, src, sizes[index],
-                d2h ? datasystem::DsCudaMemcpyKind::DEVICE_TO_HOST : datasystem::DsCudaMemcpyKind::HOST_TO_DEVICE,
-                resources.stream->Data());
-            if (copyStatus.IsError()) {
+            if (!SubmitCudaCopy(client, dst, src, sizes[index], d2h, pin, resources.stream->Data(), copyStatus,
+                                copyError)) {
                 break;
             }
         }
     });
+    cudaError_t eventError = cudaSuccess;
+    const auto eventRecordUs = MeasureUs([&] {
+        eventError = resources.completionEvent->Record(resources.stream->Data());
+    });
     cudaError_t syncError = cudaSuccess;
-    timing.syncUs = MeasureUs([&] { syncError = resources.stream->Synchronize(); });
+    timing.syncUs = MeasureUs([&] {
+        // Fence even a partially submitted batch before releasing its host buffers.
+        if (eventError == cudaSuccess) {
+            eventError = resources.completionEvent->Synchronize();
+        }
+        if (eventError != cudaSuccess) {
+            syncError = resources.stream->Synchronize();
+        }
+    });
     timing.totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - totalBegin)
                          .count();
-    if (copyStatus.IsError()) {
+    constexpr int64_t cudaSlowThresholdUs = 500000;
+    if (timing.totalUs > cudaSlowThresholdUs) {
+        const auto timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t bytes = 0;
+        for (const auto size : sizes) {
+            bytes += size;
+        }
+        Log(tid, "[CUDA_SLOW] timestamp_ms=", timestampMs, " key_prefix=", requestKey,
+            " phase=", phase, " direction=", d2h ? "D2H" : "H2D",
+            " api=", pin ? "DsCudaMemcpyAsync" : "cudaMemcpyAsync", " stream=", resources.stream->Data(),
+            " buffers=", sizes.size(), " bytes=", bytes, " enqueue_us=", timing.enqueueUs,
+            " event_record_us=", eventRecordUs, " wait_us=", timing.syncUs, " total_us=", timing.totalUs,
+            " event_rc=", static_cast<int>(eventError), " sync_rc=", static_cast<int>(syncError));
+    }
+    if (pin && copyStatus.IsError()) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
         Log(tid, "[CUDA_ERROR] operation=", phase, " detail=", copyStatus.ToString());
         return false;
     }
-    if (!CheckCuda(syncError, tid, phase + " synchronize")) {
+    if (!pin && !CheckCuda(copyError, tid, phase + " enqueue")) {
+        AddStageFailure(samples, d2h ? "d2h" : "h2d");
+        return false;
+    }
+    const bool eventOk = CheckCuda(eventError, tid, phase + " completion event");
+    const bool syncOk = CheckCuda(syncError, tid, phase + " fallback synchronize");
+    if (!eventOk || !syncOk) {
         AddStageFailure(samples, d2h ? "d2h" : "h2d");
         return false;
     }
@@ -679,8 +778,8 @@ bool RunDsTransfer(KVClient &client, GpuResources &resources, const std::vector<
     AddLatency(samples, stage, timing.totalUs);
     if (!quiet) {
         Log(tid, "[CUDA_COPY] phase=", phase, " direction=", d2h ? "D2H" : "H2D",
-            " buffers=", hostAddresses.size(), " enqueue_us=", timing.enqueueUs, " sync_us=", timing.syncUs,
-            " total_us=", timing.totalUs);
+            " api=", pin ? "DsCudaMemcpyAsync" : "cudaMemcpyAsync", " buffers=", hostAddresses.size(),
+            " enqueue_us=", timing.enqueueUs, " sync_us=", timing.syncUs, " total_us=", timing.totalUs);
     }
     return true;
 }
@@ -735,7 +834,8 @@ void PrintShellHelp()
               << "  mroundtrip <prefix> <count> [size]  MCreate, D2H, MSet, MGet and H2D\n"
               << "  parallel <op> <prefix> <request_count> <threads> [size] [batch_size]\n"
               << "  qps <op> <prefix> <qps> <time_seconds> <threads> [size] [batch_size]\n"
-              << "                             op: create_set/mcreate_set/get/mget/roundtrip/mroundtrip\n"
+              << "                             op: create_set/mcreate_set/get/get_only/mget/mget_only/roundtrip/mroundtrip\n"
+              << "                             get_only/mget_only repeat exact keys without H2D or preparation\n"
               << "  del <key>                 Delete a published value\n"
               << "  discard <key>             Release a pending Buffer without Set\n"
               << "  pending                   List pending Buffers\n"
@@ -812,7 +912,8 @@ bool CreateAndUnloadOne(KVClient &client, const Options &options, const std::str
     ++summary.createOk;
     std::vector<void *> addresses{ buffer->MutableData() };
     TransferTiming timing;
-    if (!RunDsTransfer(client, resources, addresses, { size }, true, tid, "create", samples, quiet, timing)) {
+    if (!RunCudaTransfer(client, resources, addresses, { size }, true, options.pin, tid, "create", samples, quiet,
+                         timing, key)) {
         return false;
     }
     ++summary.d2hOk;
@@ -911,7 +1012,8 @@ bool GetAndLoadOne(KVClient &client, const Options &options, const std::string &
     ++summary.getOk;
     std::vector<void *> addresses{ const_cast<void *>(buffer->ImmutableData()) };
     TransferTiming timing;
-    if (!RunDsTransfer(client, resources, addresses, { size }, false, tid, "get", samples, quiet, timing)) {
+    if (!RunCudaTransfer(client, resources, addresses, { size }, false, options.pin, tid, "get", samples, quiet,
+                         timing, key)) {
         return false;
     }
     ++summary.h2dOk;
@@ -929,6 +1031,27 @@ bool GetAndLoadOne(KVClient &client, const Options &options, const std::string &
     if (options.deleteAfter) {
         DeleteKey(client, key, tid);
     }
+    return true;
+}
+
+bool GetOnlyOne(KVClient &client, const Options &options, const std::string &key, uint64_t size, int tid,
+                Summary &summary, LatencySamples *samples = nullptr, bool quiet = false)
+{
+    Optional<ReadOnlyBuffer> buffer;
+    Status rc;
+    const int64_t getUs = MeasureUs([&] { rc = client.Get(key, buffer, options.timeoutMs); });
+    if (!quiet) {
+        Log(tid, "[GET_ONLY] key=", key, " rc=", rc.ToString(), " elapsed_us=", getUs);
+    }
+    if (rc.IsError() || !buffer || buffer->ImmutableData() == nullptr
+        || buffer->GetSize() != static_cast<int64_t>(size)) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[GET_ONLY_FAIL] key=", key, " rc=", rc.ToString(), " has_buffer=", static_cast<bool>(buffer),
+            " expected_size=", size, " actual_size=", buffer ? buffer->GetSize() : -1);
+        return false;
+    }
+    AddLatency(samples, "get", getUs);
+    ++summary.getOk;
     return true;
 }
 
@@ -1082,7 +1205,8 @@ bool MCreateAndUnload(KVClient &client, const Options &options, const std::strin
     AddLatency(samples, "create", createUs);
     summary.createOk += batchSize;
     TransferTiming timing;
-    if (!RunDsTransfer(client, resources, addresses, sizes, true, tid, "mcreate", samples, quiet, timing)) {
+    if (!RunCudaTransfer(client, resources, addresses, sizes, true, options.pin, tid, "mcreate", samples, quiet,
+                         timing, batchPrefix)) {
         return false;
     }
     summary.d2hOk += batchSize;
@@ -1247,7 +1371,8 @@ bool MGetAndLoad(KVClient &client, const Options &options, const std::string &ba
     AddLatency(samples, "get", getUs);
     summary.getOk += batchSize;
     TransferTiming timing;
-    if (!RunDsTransfer(client, resources, addresses, sizes, false, tid, "mget", samples, quiet, timing)) {
+    if (!RunCudaTransfer(client, resources, addresses, sizes, false, options.pin, tid, "mget", samples, quiet,
+                         timing, batchPrefix)) {
         return false;
     }
     summary.h2dOk += batchSize;
@@ -1271,6 +1396,48 @@ bool MGetAndLoad(KVClient &client, const Options &options, const std::string &ba
             DeleteKey(client, key, tid);
         }
     }
+    return true;
+}
+
+bool MGetOnly(KVClient &client, const Options &options, const std::string &batchPrefix, int batchSize, uint64_t size,
+              int tid, Summary &summary, LatencySamples *samples = nullptr, bool quiet = false)
+{
+    const auto keys = BuildBatchKeys(batchPrefix, batchSize);
+    std::vector<Optional<ReadOnlyBuffer>> buffers;
+    Status rc;
+    const int64_t getUs = MeasureUs([&] { rc = client.Get(keys, buffers, options.timeoutMs); });
+    if (!quiet) {
+        Log(tid, "[MGET_ONLY] prefix=", batchPrefix, " count=", batchSize, " rc=", rc.ToString(),
+            " elapsed_us=", getUs);
+    }
+    if (rc.IsError() || buffers.size() != keys.size()) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[MGET_ONLY_FAIL] prefix=", batchPrefix, " rc=", rc.ToString(), " expected_buffers=", keys.size(),
+            " actual_buffers=", buffers.size());
+        return false;
+    }
+    size_t missingCount = 0;
+    size_t nullDataCount = 0;
+    size_t sizeMismatchCount = 0;
+    for (auto &buffer : buffers) {
+        if (!buffer) {
+            ++missingCount;
+        } else if (buffer->ImmutableData() == nullptr) {
+            ++nullDataCount;
+        } else if (buffer->GetSize() != static_cast<int64_t>(size)) {
+            ++sizeMismatchCount;
+        }
+    }
+    const size_t invalidCount = missingCount + nullDataCount + sizeMismatchCount;
+    if (invalidCount != 0) {
+        AddStageFailure(samples, "get");
+        Log(tid, "[MGET_ONLY_FAIL] prefix=", batchPrefix, " count=", batchSize, " invalid_buffers=", invalidCount,
+            " missing=", missingCount, " null_data=", nullDataCount, " size_mismatch=", sizeMismatchCount,
+            " batch_rc=", rc.ToString());
+        return false;
+    }
+    AddLatency(samples, "get", getUs);
+    summary.getOk += batchSize;
     return true;
 }
 
@@ -1320,6 +1487,11 @@ bool IsSupportedWorkloadOperation(const std::string &operation)
            || operation == "mget" || operation == "roundtrip" || operation == "mroundtrip";
 }
 
+bool IsSupportedQpsOperation(const std::string &operation)
+{
+    return IsSupportedWorkloadOperation(operation) || operation == "get_only" || operation == "mget_only";
+}
+
 bool IsBatchWorkloadOperation(const std::string &operation)
 {
     return !operation.empty() && operation.front() == 'm';
@@ -1327,11 +1499,14 @@ bool IsBatchWorkloadOperation(const std::string &operation)
 
 bool OperationNeedsGpu(const std::string &operation)
 {
-    return IsSupportedWorkloadOperation(operation);
+    return operation != "get_only" && operation != "mget_only" && IsSupportedWorkloadOperation(operation);
 }
 
 std::string RequestPrefix(const WorkloadSpec &spec, int64_t requestIndex)
 {
+    if (spec.operation == "get_only" || spec.operation == "mget_only") {
+        return spec.prefix;
+    }
     if (spec.legacyKeysPerThread > 0) {
         return spec.prefix + "_T" + std::to_string(requestIndex / spec.legacyKeysPerThread) + "_"
                + std::to_string(requestIndex % spec.legacyKeysPerThread);
@@ -1436,9 +1611,13 @@ bool ExecuteWorkloadRequest(const std::shared_ptr<KVClient> &client, const Optio
     } else if (spec.operation == "get") {
         success = GetAndLoadOne(*client, options, requestPrefix, spec.size, tid, *resources, summary, &samples,
                                 quiet);
+    } else if (spec.operation == "get_only") {
+        success = GetOnlyOne(*client, options, requestPrefix, spec.size, tid, summary, &samples, quiet);
     } else if (spec.operation == "mget") {
         success = MGetAndLoad(*client, options, requestPrefix, spec.batchSize, spec.size, tid, *resources, summary,
                               &samples, quiet);
+    } else if (spec.operation == "mget_only") {
+        success = MGetOnly(*client, options, requestPrefix, spec.batchSize, spec.size, tid, summary, &samples, quiet);
     } else if (spec.operation == "roundtrip") {
         success = RoundtripOne(*client, options, requestPrefix, spec.size, tid, *resources, pendingBuffers,
                                summary, &samples, quiet);
@@ -1567,7 +1746,7 @@ bool ParseQpsSpec(std::istringstream &stream, const Options &options, WorkloadSp
 {
     if (!(stream >> spec.operation >> spec.prefix >> spec.qps >> spec.timeSeconds >> spec.threadNum)
         || spec.qps <= 0 || spec.timeSeconds <= 0 || spec.threadNum <= 0
-        || !IsSupportedWorkloadOperation(spec.operation) || !ParseCommandSize(stream, options.valueSize, spec.size)) {
+        || !IsSupportedQpsOperation(spec.operation) || !ParseCommandSize(stream, options.valueSize, spec.size)) {
         return false;
     }
     spec.batchSize = IsBatchWorkloadOperation(spec.operation) ? options.count : 1;
@@ -1590,17 +1769,21 @@ bool RunQps(std::istringstream &stream, const std::shared_ptr<KVClient> &client,
 {
     WorkloadSpec spec;
     if (!ParseQpsSpec(stream, options, spec)) {
-        Log(0, "[COMMAND_ERROR] usage: qps <create_set|mcreate_set|get|mget|roundtrip|mroundtrip> "
+        Log(0, "[COMMAND_ERROR] usage: qps <create_set|mcreate_set|get|get_only|mget|mget_only|roundtrip|mroundtrip> "
                "<prefix> <qps> <time_seconds> <threads> [size] [batch_size]");
         return false;
     }
+    const bool needsGpu = OperationNeedsGpu(spec.operation);
     std::vector<GpuResources> resourcePool;
-    if (!InitializeGpuResourcePool(resourcePool, options, spec.threadNum, static_cast<size_t>(spec.batchSize),
-                                   spec.size)) {
+    if (needsGpu
+        && !InitializeGpuResourcePool(resourcePool, options, spec.threadNum, static_cast<size_t>(spec.batchSize),
+                                      spec.size)) {
         Log(0, "[QPS_FAIL] shared CUDA resource initialization failed");
         return false;
     }
-    if (!PrepareWorkload(client, options, spec, resourcePool.front(), pendingBuffers, pendingBatches)) {
+    GpuResources unusedResources;
+    GpuResources &prepareResources = needsGpu ? resourcePool.front() : unusedResources;
+    if (!PrepareWorkload(client, options, spec, prepareResources, pendingBuffers, pendingBatches)) {
         return false;
     }
 
@@ -1617,9 +1800,8 @@ bool RunQps(std::istringstream &stream, const std::shared_ptr<KVClient> &client,
     std::vector<std::thread> threads;
     for (int tid = 0; tid < spec.threadNum; ++tid) {
         threads.emplace_back([&, tid] {
-            // Use the shared stream/context selected during main-thread initialization. Each worker
-            // still owns a distinct source/destination buffer set in resourcePool[tid].
-            const bool initialized = CheckCuda(cudaSetDevice(options.gpuId), tid, "cudaSetDevice worker");
+            // GPU workloads use the shared stream/context created by the main thread and distinct buffers per worker.
+            const bool initialized = !needsGpu || CheckCuda(cudaSetDevice(options.gpuId), tid, "cudaSetDevice worker");
             {
                 std::lock_guard<std::mutex> lock(readyMutex);
                 initializeFailed = initializeFailed || !initialized;
